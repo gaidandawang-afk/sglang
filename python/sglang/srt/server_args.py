@@ -465,6 +465,16 @@ class ServerArgs:
     sleep_on_idle: bool = False
     use_ray: bool = False
     custom_sigquit_handler: Optional[Callable] = None
+    enable_fault_tolerance: bool = False
+    fault_tolerance_recovery_timeout_sec: int = 60
+    fault_tolerance_comm_abort_timeout_sec: int = 30
+    fault_tolerance_sentinel_cmd_timeout_sec: int = 10
+    fault_tolerance_sentinel_heartbeat_interval_sec: float = 1.0
+    fault_tolerance_sentinel_heartbeat_timeout_sec: float = 10.0
+    fault_tolerance_default_pause_mode: str = "retract"
+    fault_tolerance_hard_pause_on_fault: bool = True
+    fault_tolerance_reinit_dist_on_retry: bool = True
+    shutdown_on_fault_tolerance_failure: bool = False
 
     # Logging
     log_level: str = "info"
@@ -5145,6 +5155,69 @@ class ServerArgs:
             "--custom-sigquit-handler",
             help="Register a custom sigquit handler so you can do additional cleanup after the server is shutdown. This is only available for Engine, not for CLI.",
         )
+        parser.add_argument(
+            "--enable-fault-tolerance",
+            action="store_true",
+            default=ServerArgs.enable_fault_tolerance,
+            help="Enable the scheduler fault-tolerance framework.",
+        )
+        parser.add_argument(
+            "--fault-tolerance-recovery-timeout-sec",
+            type=int,
+            default=ServerArgs.fault_tolerance_recovery_timeout_sec,
+            help="Timeout in seconds for fault-tolerance retry recovery.",
+        )
+        parser.add_argument(
+            "--fault-tolerance-comm-abort-timeout-sec",
+            type=int,
+            default=ServerArgs.fault_tolerance_comm_abort_timeout_sec,
+            help="Timeout in seconds for fault-tolerance communication abort.",
+        )
+        parser.add_argument(
+            "--fault-tolerance-sentinel-cmd-timeout-sec",
+            type=int,
+            default=ServerArgs.fault_tolerance_sentinel_cmd_timeout_sec,
+            help="Timeout in seconds for scheduler FaultSentinel commands.",
+        )
+        parser.add_argument(
+            "--fault-tolerance-sentinel-heartbeat-interval-sec",
+            type=float,
+            default=ServerArgs.fault_tolerance_sentinel_heartbeat_interval_sec,
+            help="Heartbeat interval in seconds for scheduler FaultSentinel.",
+        )
+        parser.add_argument(
+            "--fault-tolerance-sentinel-heartbeat-timeout-sec",
+            type=float,
+            default=ServerArgs.fault_tolerance_sentinel_heartbeat_timeout_sec,
+            help="Main-loop heartbeat timeout in seconds before FaultSentinel reports a stall.",
+        )
+        parser.add_argument(
+            "--fault-tolerance-default-pause-mode",
+            type=str,
+            choices=["abort", "retract", "in_place"],
+            default=ServerArgs.fault_tolerance_default_pause_mode,
+            help="Default pause_generation mode used by fault tolerance pause.",
+        )
+        parser.add_argument(
+            "--disable-fault-tolerance-hard-pause-on-fault",
+            action="store_false",
+            dest="fault_tolerance_hard_pause_on_fault",
+            default=ServerArgs.fault_tolerance_hard_pause_on_fault,
+            help="Disable automatic hard pause after a scheduler fault is reported.",
+        )
+        parser.add_argument(
+            "--disable-fault-tolerance-reinit-dist-on-retry",
+            action="store_false",
+            dest="fault_tolerance_reinit_dist_on_retry",
+            default=ServerArgs.fault_tolerance_reinit_dist_on_retry,
+            help="Disable distributed environment reinitialization in default retry params.",
+        )
+        parser.add_argument(
+            "--shutdown-on-fault-tolerance-failure",
+            action="store_true",
+            default=ServerArgs.shutdown_on_fault_tolerance_failure,
+            help="Terminate the instance when fault-tolerance abort/retry fails.",
+        )
 
         # Logging
         parser.add_argument(
@@ -7729,6 +7802,9 @@ class PortArgs:
     # The ipc filename for Scheduler to send metrics
     metrics_ipc_name: str
 
+    # The ipc filename for SentinelManager/FaultSentinel control messages
+    fault_tolerance_ipc_name: str
+
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
 
@@ -7759,6 +7835,7 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                fault_tolerance_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
             )
         else:
@@ -7774,6 +7851,7 @@ class PortArgs:
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_port = port_base + 3
+            fault_tolerance_port = port_base + 5
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
@@ -7789,6 +7867,9 @@ class PortArgs:
                     wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_port, "metrics_port")
+                    wait_port_available(
+                        fault_tolerance_port, "fault_tolerance_port"
+                    )
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
@@ -7810,6 +7891,9 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=NetworkAddress(dist_init_host, rpc_port).to_tcp(),
                 metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),
+                fault_tolerance_ipc_name=NetworkAddress(
+                    dist_init_host, fault_tolerance_port
+                ).to_tcp(),
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
             )
 

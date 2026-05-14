@@ -179,10 +179,13 @@ class SubprocessWatchdog:
         processes: List[Process],
         process_names: Optional[List[str]] = None,
         interval: float = 1.0,
+        fault_tolerance_manager: Optional[object] = None,
     ):
         self._processes = processes
         self._names = process_names or [f"process_{i}" for i in range(len(processes))]
         self._interval = interval
+        self._fault_tolerance_manager = fault_tolerance_manager
+        self._reported_pids = set()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -211,6 +214,18 @@ class SubprocessWatchdog:
     def _check_processes(self) -> bool:
         for proc, name in zip(self._processes, self._names):
             if proc.is_alive() or proc.exitcode == 0:
+                continue
+
+            if self._fault_tolerance_manager is not None:
+                if proc.pid not in self._reported_pids:
+                    self._reported_pids.add(proc.pid)
+                    logger.error(
+                        f"Subprocess {name} (pid={proc.pid}) exited "
+                        f"with code {proc.exitcode}. Reporting to fault tolerance."
+                    )
+                    self._fault_tolerance_manager.mark_component_exited(
+                        name, proc.pid, proc.exitcode
+                    )
                 continue
 
             logger.error(

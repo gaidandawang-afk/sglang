@@ -434,4 +434,9 @@ def run_detokenizer_process(
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
         if manager is not None:
             manager.maybe_clear_socket_mapping()
-        parent_process.send_signal(signal.SIGQUIT)
+        if server_args.enable_fault_tolerance:
+            logger.error(
+                "Fault tolerance is enabled; not sending SIGQUIT from detokenizer."
+            )
+        else:
+            parent_process.send_signal(signal.SIGQUIT)

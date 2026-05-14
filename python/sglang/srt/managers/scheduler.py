@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import os
+import queue
 import signal
 import sys
 import time
@@ -67,6 +68,14 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.fault_tolerance.command import (
+    SentinelCommand,
+    SentinelCommandResult,
+    SentinelCommandType,
+)
+from sglang.srt.fault_tolerance.exceptions import SchedulerTerminateRequested
+from sglang.srt.fault_tolerance.sentinel import FaultSentinel
+from sglang.srt.fault_tolerance.state import ComponentState, FaultEvent
 from sglang.srt.layers.attention.mamba.ops import (
     initialize_mamba_selective_state_update_backend,
 )
@@ -497,7 +506,40 @@ class Scheduler(
         # Init the grammar backend for constrained generation
         self.grammar_manager = GrammarManager(self)
 
+        # Init fault tolerance sentinel after all runtime state is available.
+        self.init_fault_tolerance(port_args)
+
         self.is_initializing = False
+
+    def init_fault_tolerance(self, port_args: PortArgs):
+        self.fault_sentinel: Optional[FaultSentinel] = None
+        self.fault_tolerance_recovery_queue = None
+        self.fault_tolerance_recovery_ok = False
+        if not self.server_args.enable_fault_tolerance:
+            return
+
+        self.fault_tolerance_recovery_queue = queue.Queue()
+        scheduler_id = self._fault_tolerance_scheduler_id()
+        self.fault_sentinel = FaultSentinel(
+            scheduler=self,
+            manager_addr=port_args.fault_tolerance_ipc_name,
+            scheduler_id=scheduler_id,
+            heartbeat_interval_sec=(
+                self.server_args.fault_tolerance_sentinel_heartbeat_interval_sec
+            ),
+            heartbeat_timeout_sec=(
+                self.server_args.fault_tolerance_sentinel_heartbeat_timeout_sec
+            ),
+        )
+        self.fault_sentinel.start()
+
+    def _fault_tolerance_scheduler_id(self) -> int:
+        dp_rank = self.dp_rank or 0
+        return (
+            ((dp_rank * self.pp_size + self.pp_rank) * self.tp_size + self.tp_rank)
+            * max(1, self.attn_cp_size)
+            + self.attn_cp_rank
+        )
 
     def init_zbal_on_npu(self):
         if _is_npu:
@@ -1531,7 +1573,37 @@ class Scheduler(
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         with self.device_module.StreamContext(self.schedule_stream):
-            dispatch_event_loop(self)
+            if self.server_args.enable_fault_tolerance:
+                self._run_event_loop_with_fault_tolerance()
+            else:
+                dispatch_event_loop(self)
+
+    def _run_event_loop_with_fault_tolerance(self) -> None:
+        while True:
+            try:
+                dispatch_event_loop(self)
+                return
+            except SchedulerTerminateRequested:
+                raise
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                logger.exception("Scheduler exception captured by fault tolerance")
+                event = FaultEvent.from_exception(
+                    exc,
+                    origin="scheduler",
+                    scheduler_id=self._fault_tolerance_scheduler_id(),
+                    rank=self.tp_rank,
+                    metadata={
+                        "pp_rank": self.pp_rank,
+                        "dp_rank": self.dp_rank,
+                        "attn_cp_rank": self.attn_cp_rank,
+                    },
+                )
+                self._engine_paused = True
+                if self.fault_sentinel is not None:
+                    self.fault_sentinel.report_fault_from_main_loop(event)
+                self.enter_fault_parked_state(event)
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1541,6 +1613,7 @@ class Scheduler(
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self._fault_tolerance_maybe_process_recovery_request()
                 continue
 
             # Get the next batch to run
@@ -1577,6 +1650,7 @@ class Scheduler(
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self._fault_tolerance_maybe_process_recovery_request()
                 continue
 
             # Get the next batch to run
@@ -1657,6 +1731,9 @@ class Scheduler(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+
+        if self.fault_sentinel is not None:
+            self.fault_sentinel.feed_main_loop_heartbeat()
 
         if self.recv_skipper is not None:
             last_forward_mode = (
@@ -3718,6 +3795,187 @@ class Scheduler(
             )
         self._engine_paused = False
 
+    def fault_tolerance_submit_command(
+        self, cmd: SentinelCommand
+    ) -> SentinelCommandResult:
+        if self.fault_tolerance_recovery_queue is None:
+            return SentinelCommandResult(
+                command_id=cmd.command_id,
+                scheduler_id=self._fault_tolerance_scheduler_id(),
+                success=False,
+                state=ComponentState.WAITING_OPERATOR.value,
+                message="Fault tolerance recovery queue is not initialized.",
+            )
+
+        result_queue: "queue.Queue[SentinelCommandResult]" = queue.Queue(maxsize=1)
+        self.fault_tolerance_recovery_queue.put((cmd, result_queue))
+        try:
+            return result_queue.get(timeout=cmd.timeout_sec)
+        except queue.Empty:
+            return SentinelCommandResult(
+                command_id=cmd.command_id,
+                scheduler_id=self._fault_tolerance_scheduler_id(),
+                success=False,
+                state=ComponentState.UNRESPONSIVE.value,
+                message=f"Scheduler main loop did not process {cmd.command.value}.",
+            )
+
+    def _fault_tolerance_maybe_process_recovery_request(self) -> bool:
+        if self.fault_tolerance_recovery_queue is None:
+            return False
+        try:
+            cmd, result_queue = self.fault_tolerance_recovery_queue.get_nowait()
+        except queue.Empty:
+            return False
+
+        result = self._fault_tolerance_process_command_on_main_loop(cmd)
+        result_queue.put(result)
+        return True
+
+    def enter_fault_parked_state(self, event: FaultEvent):
+        logger.error(
+            "Scheduler enters fault parked state after event %s: %s",
+            event.event_id,
+            event.message,
+        )
+        self.fault_tolerance_prepare_retry({"clear_running_batch": True})
+        while True:
+            if self.fault_tolerance_recovery_queue is None:
+                time.sleep(1)
+                continue
+            if self.fault_sentinel is not None:
+                self.fault_sentinel.feed_main_loop_heartbeat()
+            try:
+                cmd, result_queue = self.fault_tolerance_recovery_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            result = self._fault_tolerance_process_command_on_main_loop(cmd)
+            result_queue.put(result)
+            if (
+                cmd.command == SentinelCommandType.RESUME
+                and result.success
+                and self.fault_tolerance_recovery_ok
+            ):
+                self._engine_paused = False
+                return
+            if cmd.command == SentinelCommandType.TERMINATE:
+                raise SchedulerTerminateRequested()
+
+    def _fault_tolerance_process_command_on_main_loop(
+        self, cmd: SentinelCommand
+    ) -> SentinelCommandResult:
+        try:
+            if cmd.command == SentinelCommandType.PREPARE_RETRY:
+                self.fault_tolerance_prepare_retry(cmd.params)
+                return self._fault_tolerance_command_result(
+                    cmd, True, ComponentState.RECOVERING, "Scheduler prepared retry."
+                )
+
+            if cmd.command == SentinelCommandType.RETRY_REINIT:
+                self.fault_tolerance_prepare_retry(cmd.params)
+                recovery_result = self.fault_sentinel.recovery.cleanup_distributed()
+                if recovery_result.success and cmd.params.get(
+                    "reinit_distributed",
+                    self.server_args.fault_tolerance_reinit_dist_on_retry,
+                ):
+                    recovery_result = (
+                        self.fault_sentinel.recovery.reinit_distributed_on_main_thread(
+                            cmd.params
+                        )
+                    )
+                self.fault_tolerance_recovery_ok = recovery_result.success
+                return self._fault_tolerance_command_result(
+                    cmd,
+                    recovery_result.success,
+                    (
+                        ComponentState.RECOVERING
+                        if recovery_result.success
+                        else ComponentState.WAITING_OPERATOR
+                    ),
+                    recovery_result.message,
+                    recovery_result.to_dict(),
+                )
+
+            if cmd.command == SentinelCommandType.HEALTH_CHECK:
+                recovery_result = self.fault_sentinel.recovery.health_check(
+                    cmd.timeout_sec
+                )
+                self.fault_tolerance_recovery_ok = recovery_result.success
+                return self._fault_tolerance_command_result(
+                    cmd,
+                    recovery_result.success,
+                    (
+                        ComponentState.RECOVERING
+                        if recovery_result.success
+                        else ComponentState.WAITING_OPERATOR
+                    ),
+                    recovery_result.message,
+                    recovery_result.to_dict(),
+                )
+
+            if cmd.command == SentinelCommandType.RESUME:
+                if not self.fault_tolerance_recovery_ok:
+                    return self._fault_tolerance_command_result(
+                        cmd,
+                        False,
+                        ComponentState.WAITING_OPERATOR,
+                        "Recovery has not completed successfully.",
+                    )
+                self._engine_paused = False
+                return self._fault_tolerance_command_result(
+                    cmd, True, ComponentState.HEALTHY, "Scheduler resumed."
+                )
+
+            if cmd.command == SentinelCommandType.TERMINATE:
+                return self._fault_tolerance_command_result(
+                    cmd, True, ComponentState.WAITING_OPERATOR, "Terminate requested."
+                )
+
+            return self._fault_tolerance_command_result(
+                cmd,
+                False,
+                ComponentState.WAITING_OPERATOR,
+                f"Unsupported main-loop command {cmd.command.value}.",
+            )
+        except Exception as exc:
+            logger.exception("Fault tolerance main-loop command failed")
+            return self._fault_tolerance_command_result(
+                cmd, False, ComponentState.WAITING_OPERATOR, str(exc)
+            )
+
+    def fault_tolerance_prepare_retry(self, params: Dict[str, Any]):
+        self._engine_paused = True
+        clear_running_batch = params.get("clear_running_batch", True)
+        if clear_running_batch:
+            self.fault_tolerance_cleanup_runtime_state()
+        self.fault_tolerance_recovery_ok = False
+
+    def fault_tolerance_cleanup_runtime_state(self):
+        self.cur_batch = None
+        self.last_batch = None
+        self.chunked_req = None
+        if hasattr(self, "result_queue"):
+            self.result_queue.clear()
+        self.waiting_queue.clear()
+        self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+
+    def _fault_tolerance_command_result(
+        self,
+        cmd: SentinelCommand,
+        success: bool,
+        state: ComponentState,
+        message: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> SentinelCommandResult:
+        return SentinelCommandResult(
+            command_id=cmd.command_id,
+            scheduler_id=self._fault_tolerance_scheduler_id(),
+            success=success,
+            state=state.value,
+            message=message,
+            details=details or {},
+        )
+
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
     ) -> LoadLoRAAdapterReqOutput:
@@ -4043,9 +4301,30 @@ def run_scheduler_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
-        parent_process.send_signal(signal.SIGQUIT)
+        if server_args.enable_fault_tolerance:
+            if scheduler is not None and scheduler.fault_sentinel is not None:
+                event = FaultEvent.create(
+                    origin="scheduler_process",
+                    scheduler_id=scheduler._fault_tolerance_scheduler_id(),
+                    rank=tp_rank,
+                    fault_type="process_exception",
+                    exception_type=None,
+                    message="Scheduler top-level exception escaped event loop.",
+                    traceback=traceback,
+                    requires_hard_pause=True,
+                )
+                scheduler.fault_sentinel.report_fault_from_main_loop(event)
+                time.sleep(1)
+            else:
+                logger.error(
+                    "Fault tolerance is enabled but scheduler sentinel is unavailable."
+                )
+        else:
+            parent_process.send_signal(signal.SIGQUIT)
     finally:
         if scheduler is not None:
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler._shutdown_fpm()
+            if scheduler.fault_sentinel is not None:
+                scheduler.fault_sentinel.stop()

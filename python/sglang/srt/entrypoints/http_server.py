@@ -58,6 +58,7 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from pydantic import BaseModel, Field
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -108,6 +109,8 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.fault_tolerance.manager import SentinelManager
+from sglang.srt.fault_tolerance.middleware import FaultToleranceAdmissionMiddleware
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
@@ -191,6 +194,7 @@ class _GlobalState:
     tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
     template_manager: TemplateManager
     scheduler_info: Dict
+    sentinel_manager: Optional[SentinelManager] = None
 
 
 _global_state: Optional[_GlobalState] = None
@@ -203,6 +207,12 @@ def set_global_state(global_state: _GlobalState):
 
 def get_global_state() -> _GlobalState:
     return _global_state
+
+
+def _get_sentinel_manager() -> Optional[SentinelManager]:
+    if _global_state is None:
+        return None
+    return _global_state.sentinel_manager
 
 
 async def _init_granian_worker() -> ServerArgs:
@@ -411,6 +421,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(
+    FaultToleranceAdmissionMiddleware,
+    manager_getter=_get_sentinel_manager,
+)
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -500,6 +514,12 @@ async def validate_json_request(raw_request: Request):
 
 
 ##### Native API endpoints #####
+
+
+class FaultToleranceApplyRequest(BaseModel):
+    fault_tolerance_instruction: str
+    fault_tolerance_timeout: Optional[int] = None
+    fault_tolerance_params: Dict[str, Any] = Field(default_factory=dict)
 
 
 @app.get("/health")
@@ -1477,6 +1497,36 @@ async def continue_generation(obj: ContinueGenerationReqInput, request: Request)
     )
 
 
+@app.get("/fault_tolerance/status")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def fault_tolerance_status(request: Request):
+    manager = _get_sentinel_manager()
+    if manager is None:
+        return ORJSONResponse(content={"enabled": False, "state": "DISABLED"})
+    return ORJSONResponse(content=manager.get_status())
+
+
+@app.post("/fault_tolerance/apply")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def fault_tolerance_apply(obj: FaultToleranceApplyRequest, request: Request):
+    manager = _get_sentinel_manager()
+    if manager is None:
+        return ORJSONResponse(
+            content={
+                "success": False,
+                "message": "Fault tolerance is disabled.",
+                "state": "DISABLED",
+            },
+            status_code=400,
+        )
+    result = await manager.apply(
+        obj.fault_tolerance_instruction,
+        timeout=obj.fault_tolerance_timeout,
+        params=obj.fault_tolerance_params,
+    )
+    return ORJSONResponse(content=result, status_code=200 if result["success"] else 500)
+
+
 ##### OpenAI-compatible API endpoints #####
 
 
@@ -2125,11 +2175,18 @@ def _setup_and_run_http_server(
     Called by launch_server after subprocesses have been launched.
     """
     # Set global states
+    sentinel_manager = getattr(tokenizer_manager, "fault_tolerance_manager", None)
+    if sentinel_manager is None and server_args.enable_fault_tolerance:
+        sentinel_manager = SentinelManager(server_args, tokenizer_manager, port_args)
+        sentinel_manager.start()
+        setattr(tokenizer_manager, "fault_tolerance_manager", sentinel_manager)
+
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
             template_manager=template_manager,
             scheduler_info=scheduler_infos[0],
+            sentinel_manager=sentinel_manager,
         )
     )
 

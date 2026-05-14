@@ -101,6 +101,18 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
+    def fault_tolerance_prepare_reinit(self) -> None:
+        self.model_runner.fault_tolerance_prepare_reinit()
+
+    def fault_tolerance_reinit_distributed(self, params: dict) -> None:
+        self.model_runner.fault_tolerance_reinit_distributed(params)
+
+    def fault_tolerance_rebind_distributed_groups(self) -> None:
+        self.model_runner.fault_tolerance_rebind_distributed_groups()
+
+    def fault_tolerance_health_check(self) -> None:
+        self.model_runner.fault_tolerance_health_check()
+
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.model_runner.init_weights_update_group(
             recv_req.master_address,

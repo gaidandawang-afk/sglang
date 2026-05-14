@@ -667,4 +667,10 @@ def run_data_parallel_controller_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"DataParallelController hit an exception: {traceback}")
-        parent_process.send_signal(signal.SIGQUIT)
+        if server_args.enable_fault_tolerance:
+            logger.error(
+                "Fault tolerance is enabled; not sending SIGQUIT from "
+                "DataParallelController."
+            )
+        else:
+            parent_process.send_signal(signal.SIGQUIT)

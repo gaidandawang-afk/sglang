@@ -124,6 +124,7 @@ class PyNcclCommunicator:
         # to use it, use under `with obj.change_state(enable=True)`, usually
         # when we are using CUDA graph.
         self.disabled = True
+        self.aborted = False
 
     def _resolve_stream(self) -> torch.cuda.Stream:
         """Return the current device stream used for NCCL calls."""
@@ -367,6 +368,17 @@ class PyNcclCommunicator:
 
     def group_end(self):
         self.nccl.ncclGroupEnd()
+
+    def abort(self):
+        self.disabled = True
+        self.available = False
+        if getattr(self, "aborted", False):
+            return
+        comm = getattr(self, "comm", None)
+        if comm is not None:
+            self.nccl.ncclCommAbort(comm)
+            self.comm = None
+        self.aborted = True
 
     @contextmanager
     def change_state(self, enable: Optional[bool] = None):

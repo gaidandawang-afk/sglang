@@ -58,6 +58,7 @@ from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
     run_data_parallel_controller_process,
 )
+from sglang.srt.fault_tolerance.manager import SentinelManager
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
@@ -238,6 +239,9 @@ class Engine(EngineScoreMixin, EngineBase):
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self._scheduler_init_result = scheduler_init_result
+        self.fault_tolerance_manager = getattr(
+            tokenizer_manager, "fault_tolerance_manager", None
+        )
         if tokenizer_manager is not None:
             tokenizer_manager._subprocess_watchdog = subprocess_watchdog
         self.port_args = port_args
@@ -711,6 +715,15 @@ class Engine(EngineScoreMixin, EngineBase):
             port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
+        fault_tolerance_manager = None
+        if server_args.enable_fault_tolerance:
+            fault_tolerance_manager = SentinelManager(
+                server_args=server_args,
+                tokenizer_manager=None,
+                port_args=port_args,
+            )
+            fault_tolerance_manager.start()
+
         # Start the engine info bootstrap server if per-rank info is needed.
         engine_info_bootstrap_server = None
         if (
@@ -805,6 +818,10 @@ class Engine(EngineScoreMixin, EngineBase):
             "max_req_input_len"
         ]
 
+        if server_args.enable_fault_tolerance:
+            fault_tolerance_manager.set_tokenizer_manager(tokenizer_manager)
+            tokenizer_manager.fault_tolerance_manager = fault_tolerance_manager
+
         # Set up subprocess liveness watchdog to detect crashes
         # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
         processes = list(scheduler_procs or [])
@@ -812,7 +829,9 @@ class Engine(EngineScoreMixin, EngineBase):
         processes.append(detoken_proc)
         names.append("detokenizer")
         subprocess_watchdog = SubprocessWatchdog(
-            processes=processes, process_names=names
+            processes=processes,
+            process_names=names,
+            fault_tolerance_manager=fault_tolerance_manager,
         )
         subprocess_watchdog.start()
 
@@ -833,6 +852,8 @@ class Engine(EngineScoreMixin, EngineBase):
             and self.tokenizer_manager._subprocess_watchdog is not None
         ):
             self.tokenizer_manager._subprocess_watchdog.stop()
+        if getattr(self, "fault_tolerance_manager", None) is not None:
+            self.fault_tolerance_manager.stop()
         kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
 
     def __enter__(self):
@@ -1225,6 +1246,12 @@ def _set_envs_and_config(server_args: ServerArgs):
                 logger.error(
                     "Received sigquit from a child process. It usually means the child failed."
                 )
+                if server_args.enable_fault_tolerance:
+                    logger.error(
+                        "Fault tolerance is enabled; keeping the process tree alive "
+                        "for operator inspection."
+                    )
+                    return
                 kill_process_tree(os.getpid())
 
             signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)

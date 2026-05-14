@@ -29,8 +29,10 @@ import gc
 import logging
 import os
 import pickle
+import time
 import weakref
 from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
@@ -73,6 +75,15 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 # Reuse the user-provided distributed timeout for model-parallel subgroup
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
+
+
+@dataclass
+class GroupAbortResult:
+    group_name: str
+    success: bool
+    message: str
+    elapsed_sec: float
+    details: Dict[str, Any]
 
 
 def get_torch_distributed_pg_options(group_name=None):
@@ -2238,6 +2249,123 @@ def get_moe_tensor_parallel_world_size():
 def get_moe_tensor_parallel_rank():
     """Return my rank for the moe tensor parallel group."""
     return get_moe_tp_group().rank_in_group
+
+
+def get_all_model_groups() -> List[GroupCoordinator]:
+    groups = [
+        _WORLD,
+        _TP,
+        _PP,
+        _ATTN_TP,
+        _ATTN_CP,
+        _MOE_DP,
+        _MOE_EP,
+        _MOE_TP,
+        _PDMUX_PREFILL_TP_GROUP,
+    ]
+    ret = []
+    seen = set()
+    for group in groups:
+        if group is None:
+            continue
+        group_id = id(group)
+        if group_id in seen:
+            continue
+        seen.add(group_id)
+        ret.append(group)
+    return ret
+
+
+def safe_abort_or_destroy_group(
+    group: GroupCoordinator, timeout_sec: int
+) -> GroupAbortResult:
+    start = time.perf_counter()
+    details: Dict[str, Any] = {"communicators": []}
+    group_name = getattr(group, "unique_name", "unknown")
+
+    def mark_disabled(attr: str):
+        comm = getattr(group, attr, None)
+        if comm is not None and hasattr(comm, "disabled"):
+            comm.disabled = True
+            details["communicators"].append(f"{attr}:disabled")
+
+    try:
+        pynccl_comm = getattr(group, "pynccl_comm", None)
+        if pynccl_comm is not None:
+            try:
+                if hasattr(pynccl_comm, "abort"):
+                    pynccl_comm.abort()
+                    details["communicators"].append("pynccl_comm:aborted")
+                else:
+                    pynccl_comm.disabled = True
+                    details["communicators"].append("pynccl_comm:disabled")
+            except Exception as exc:
+                details["pynccl_abort_error"] = str(exc)
+
+        for attr in (
+            "ca_comm",
+            "qr_comm",
+            "pymscclpp_comm",
+            "torch_symm_mem_comm",
+            "hpu_communicator",
+            "xpu_communicator",
+            "npu_communicator",
+        ):
+            mark_disabled(attr)
+
+        def destroy_groups():
+            if group.device_group is not None:
+                torch.distributed.destroy_process_group(group.device_group)
+                group.device_group = None
+            if group.cpu_group is not None:
+                torch.distributed.destroy_process_group(group.cpu_group)
+                group.cpu_group = None
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(destroy_groups)
+        try:
+            future.result(timeout=timeout_sec)
+        except TimeoutError:
+            executor.shutdown(wait=False, cancel_futures=True)
+            return GroupAbortResult(
+                group_name=group_name,
+                success=False,
+                message="Timed out destroying process groups.",
+                elapsed_sec=time.perf_counter() - start,
+                details=details,
+            )
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        group.pynccl_comm = None
+        group.ca_comm = None
+        group.qr_comm = None
+        group.pymscclpp_comm = None
+        group.torch_symm_mem_comm = None
+        group.mq_broadcaster = None
+        return GroupAbortResult(
+            group_name=group_name,
+            success=True,
+            message="Group aborted/destroyed.",
+            elapsed_sec=time.perf_counter() - start,
+            details=details,
+        )
+    except Exception as exc:
+        logger.exception("Failed to abort/destroy group %s", group_name)
+        return GroupAbortResult(
+            group_name=group_name,
+            success=False,
+            message=str(exc),
+            elapsed_sec=time.perf_counter() - start,
+            details=details,
+        )
+
+
+def safe_abort_or_destroy_all_groups(timeout_sec: int) -> List[GroupAbortResult]:
+    return [
+        safe_abort_or_destroy_group(group, timeout_sec=timeout_sec)
+        for group in get_all_model_groups()
+    ]
 
 
 def destroy_model_parallel():

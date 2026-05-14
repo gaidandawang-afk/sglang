@@ -302,6 +302,8 @@ class NCCLLibrary:
         # it is better not to call it at all.
         # ncclResult_t  ncclCommDestroy(ncclComm_t comm);
         Function("ncclCommDestroy", ncclResult_t, [ncclComm_t]),
+        # ncclResult_t ncclCommAbort(ncclComm_t comm);
+        Function("ncclCommAbort", ncclResult_t, [ncclComm_t]),
         # ncclResult_t ncclGroupStart();
         Function("ncclGroupStart", ncclResult_t, []),
         # ncclResult_t ncclGroupEnd();
@@ -362,6 +364,8 @@ class NCCLLibrary:
             if hasattr(self.lib, "ncclCommWindowRegister"):
                 exported_functions.extend(NCCLLibrary.exported_functions_symm_mem)
             for func in exported_functions:
+                if func.name == "ncclCommAbort" and not hasattr(self.lib, func.name):
+                    continue
                 f = getattr(self.lib, func.name)
                 f.restype = func.restype
                 f.argtypes = func.argtypes
@@ -534,6 +538,11 @@ class NCCLLibrary:
 
     def ncclCommDestroy(self, comm: ncclComm_t) -> None:
         self.NCCL_CHECK(self._funcs["ncclCommDestroy"](comm))
+
+    def ncclCommAbort(self, comm: ncclComm_t) -> None:
+        if "ncclCommAbort" not in self._funcs:
+            raise RuntimeError("NCCL library does not export ncclCommAbort.")
+        self.NCCL_CHECK(self._funcs["ncclCommAbort"](comm))
 
     def ncclCommWindowRegister(
         self, comm: ncclComm_t, buff: buffer_type, size: int, win_flags: int

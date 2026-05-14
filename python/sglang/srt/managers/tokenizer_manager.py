@@ -2802,6 +2802,15 @@ class SignalHandler:
         logger.error(
             f"SIGQUIT received. {signum=}, {frame=}. It usually means one child failed."
         )
+        if self.tokenizer_manager.server_args.enable_fault_tolerance:
+            manager = getattr(self.tokenizer_manager, "fault_tolerance_manager", None)
+            if manager is not None:
+                manager.mark_component_exited("child_process", None, None)
+            logger.error(
+                "Fault tolerance is enabled; keeping the process tree alive "
+                "for operator inspection."
+            )
+            return
         # Stop subprocess watchdog before killing processes to prevent false-positive
         # crash detection during normal shutdown
         if self.tokenizer_manager._subprocess_watchdog is not None:
