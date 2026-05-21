@@ -247,6 +247,7 @@ class DataParallelController:
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
+            tmp_port_args.fault_tolerance_ipc_name = port_args.fault_tolerance_ipc_name
 
             # This port is checked free in PortArgs.init_new.
             # We hold it first so that the next dp worker gets a different port

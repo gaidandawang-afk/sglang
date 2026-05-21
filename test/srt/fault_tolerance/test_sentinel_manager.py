@@ -79,7 +79,7 @@ class TestSentinelManager(unittest.TestCase):
         self.assertTrue(manager.tokenizer_manager.is_pause)
         self.assertEqual(manager.get_status()["last_fault"]["message"], "boom")
 
-    def test_pause_without_registered_sentinels_still_freezes(self):
+    def test_pause_without_registered_sentinels_reports_failure(self):
         manager = self.make_manager()
 
         result = asyncio.run(
@@ -90,10 +90,24 @@ class TestSentinelManager(unittest.TestCase):
             )
         )
 
-        self.assertTrue(result["success"])
-        self.assertEqual(manager.state, FaultToleranceState.PAUSED)
+        self.assertFalse(result["success"])
+        self.assertEqual(manager.state, FaultToleranceState.WAITING_OPERATOR)
         self.assertTrue(manager.tokenizer_manager.is_pause)
         self.assertEqual(manager.tokenizer_manager.pause_calls[0].mode, "retract")
+        self.assertEqual(result["results"][0]["scheduler_id"], 0)
+        self.assertFalse(result["results"][0]["success"])
+        self.assertIn("not registered", result["results"][0]["message"])
+
+    def test_retry_without_registered_sentinels_reports_failure(self):
+        manager = self.make_manager()
+
+        result = asyncio.run(manager.apply("retry", timeout=1, params={}))
+
+        self.assertFalse(result["success"])
+        self.assertEqual(manager.state, FaultToleranceState.WAITING_OPERATOR)
+        self.assertTrue(manager.tokenizer_manager.is_pause)
+        self.assertEqual(result["results"][0]["scheduler_id"], 0)
+        self.assertFalse(result["results"][0]["success"])
 
 
 if __name__ == "__main__":

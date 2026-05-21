@@ -440,16 +440,30 @@ class SentinelManager:
         scheduler_ids: Optional[Iterable[int]] = None,
     ) -> List[SentinelCommandResult]:
         with self._lock:
-            expected = list(scheduler_ids or self._identities.keys())
+            expected = self._target_scheduler_ids_locked(scheduler_ids)
             cmd = SentinelCommand.create(
                 command_type,
                 epoch=self.epoch,
                 timeout_sec=timeout_sec,
                 params=params or {},
             )
-            if not expected:
-                return []
-            self._outgoing.put((cmd, expected))
+            registered = []
+            for scheduler_id in expected:
+                if scheduler_id in self._identities:
+                    registered.append(scheduler_id)
+                else:
+                    self._record_command_result_locked(
+                        SentinelCommandResult(
+                            command_id=cmd.command_id,
+                            scheduler_id=scheduler_id,
+                            success=False,
+                            state=ComponentState.UNRESPONSIVE.value,
+                            message="Sentinel has not registered.",
+                        )
+                    )
+
+            if registered:
+                self._outgoing.put((cmd, registered))
             deadline = time.monotonic() + timeout_sec
             while time.monotonic() < deadline:
                 received = {
@@ -460,7 +474,11 @@ class SentinelManager:
                 self._result_cond.wait(timeout=0.1)
 
             received = {result.scheduler_id for result in self._results[cmd.command_id]}
-            missing = [scheduler_id for scheduler_id in expected if scheduler_id not in received]
+            missing = [
+                scheduler_id
+                for scheduler_id in registered
+                if scheduler_id not in received
+            ]
             for scheduler_id in missing:
                 self._record_command_result_locked(
                     SentinelCommandResult(
@@ -472,6 +490,23 @@ class SentinelManager:
                     )
                 )
             return list(self._results.pop(cmd.command_id, []))
+
+    def _target_scheduler_ids_locked(
+        self, scheduler_ids: Optional[Iterable[int]]
+    ) -> List[int]:
+        if scheduler_ids is not None:
+            return list(scheduler_ids)
+        return self._expected_scheduler_ids_locked()
+
+    def _expected_scheduler_ids_locked(self) -> List[int]:
+        dp_size = int(getattr(self.server_args, "dp_size", 1) or 1)
+        pp_size = int(getattr(self.server_args, "pp_size", 1) or 1)
+        tp_size = int(getattr(self.server_args, "tp_size", 1) or 1)
+        attn_cp_size = int(getattr(self.server_args, "attn_cp_size", 1) or 1)
+        total = max(1, dp_size) * max(1, pp_size) * max(1, tp_size) * max(
+            1, attn_cp_size
+        )
+        return list(range(total))
 
     def _freeze_admission_locked(self) -> None:
         self.accepting_requests = False
@@ -545,7 +580,7 @@ class SentinelManager:
 
     @staticmethod
     def _all_success(results: List[SentinelCommandResult]) -> bool:
-        return all(result.success for result in results)
+        return bool(results) and all(result.success for result in results)
 
 
 def default_terminate_callback(reason: str) -> None:
