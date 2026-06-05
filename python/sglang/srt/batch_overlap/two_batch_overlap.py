@@ -1097,3 +1097,9 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         super().clear_overlap_args()
         for inner in self._inners:
             inner.clear_overlap_args()
+
+    def reset_fault_tolerance_state(self):
+        for inner in self._inners:
+            reset_fn = getattr(inner, "reset_fault_tolerance_state", None)
+            if callable(reset_fn):
+                reset_fn()

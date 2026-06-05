@@ -107,6 +107,7 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 )
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
+from sglang.srt.fault_tolerance.middleware import FaultToleranceAdmissionMiddleware
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -411,6 +412,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(
+    FaultToleranceAdmissionMiddleware,
+    global_state_getter=get_global_state,
+)
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -669,6 +674,37 @@ async def get_load():
         }
         for r in load_results
     ]
+
+
+@app.get("/fault_tolerance/status")
+async def fault_tolerance_status():
+    if not _global_state.tokenizer_manager.server_args.enable_fault_tolerance:
+        return ORJSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "type": "fault_tolerance_unavailable",
+                    "message": "fault tolerance is not enabled",
+                }
+            },
+        )
+    return _global_state.tokenizer_manager.fault_tolerance_status()
+
+
+@app.post("/fault_tolerance/apply")
+async def fault_tolerance_apply(request: Request):
+    try:
+        obj = await request.json()
+    except Exception:
+        return ORJSONResponse(
+            status_code=400,
+            content={"success": False, "message": "invalid JSON body", "ranks": []},
+        )
+
+    status_code, result = await _global_state.tokenizer_manager.fault_tolerance_apply(
+        obj
+    )
+    return ORJSONResponse(status_code=status_code, content=result)
 
 
 # example usage:
@@ -2136,6 +2172,12 @@ def _setup_and_run_http_server(
     # Store watchdog on tokenizer_manager (single source of truth for SIGQUIT handler)
     if tokenizer_manager is not None:
         tokenizer_manager._subprocess_watchdog = subprocess_watchdog
+        if server_args.enable_fault_tolerance and subprocess_watchdog is not None:
+            logger.info(
+                "Stopping subprocess watchdog because fault tolerance is enabled."
+            )
+            subprocess_watchdog.stop()
+        tokenizer_manager.start_fault_tolerance_watchdog(scheduler_infos[0])
 
     if server_args.enable_metrics:
         add_prometheus_track_response_middleware(app)

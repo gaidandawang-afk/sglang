@@ -240,6 +240,14 @@ class Engine(EngineScoreMixin, EngineBase):
         self._scheduler_init_result = scheduler_init_result
         if tokenizer_manager is not None:
             tokenizer_manager._subprocess_watchdog = subprocess_watchdog
+            if server_args.enable_fault_tolerance and subprocess_watchdog is not None:
+                logger.info(
+                    "Stopping subprocess watchdog because fault tolerance is enabled."
+                )
+                subprocess_watchdog.stop()
+                tokenizer_manager.start_fault_tolerance_watchdog(
+                    scheduler_init_result.scheduler_infos[0]
+                )
         self.port_args = port_args
         # Access transfer engine info if bootstrap server is started.
         if scheduler_init_result.engine_info_bootstrap_server is not None:

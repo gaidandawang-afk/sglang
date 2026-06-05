@@ -525,6 +525,11 @@ class ServerArgs:
     dp_size: int = 1
     load_balance_method: str = "auto"
 
+    # Fault tolerance
+    enable_fault_tolerance: bool = False
+    fault_tolerance_on_error_strategy: Literal["pause", "continue"] = "pause"
+    fault_tolerance_recovery_timeout_sec: int = 60
+
     attn_cp_size: int = 1
     moe_dp_size: int = 1
 
@@ -5499,6 +5504,25 @@ class ServerArgs:
             ],
         )
         parser.add_argument(
+            "--enable-fault-tolerance",
+            action="store_true",
+            default=ServerArgs.enable_fault_tolerance,
+            help="Enable SGLang fault-tolerance control-plane APIs.",
+        )
+        parser.add_argument(
+            "--fault-tolerance-on-error-strategy",
+            type=str,
+            default=ServerArgs.fault_tolerance_on_error_strategy,
+            choices=["pause", "continue"],
+            help="Fault-tolerance strategy after a rank error.",
+        )
+        parser.add_argument(
+            "--fault-tolerance-recovery-timeout-sec",
+            type=int,
+            default=ServerArgs.fault_tolerance_recovery_timeout_sec,
+            help="Timeout for fault-tolerance recovery commands.",
+        )
+        parser.add_argument(
             "--prefill-round-robin-balance",
             action=DeprecatedAction,
             help="Note: --prefill-round-robin-balance is deprecated now.",
@@ -7209,6 +7233,19 @@ class ServerArgs:
 
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
+        assert (
+            self.fault_tolerance_recovery_timeout_sec > 0
+        ), "fault_tolerance_recovery_timeout_sec must be positive"
+        if (
+            self.enable_fault_tolerance
+            and self.fault_tolerance_on_error_strategy == "continue"
+            and self.moe_a2a_backend != "mooncake"
+            and self.elastic_ep_backend != "mooncake"
+        ):
+            logger.warning(
+                "Fault tolerance continue strategy requires mooncake backend; "
+                "non-mooncake backend will fall back to pause-on-error."
+            )
 
         assert self.moe_dense_tp_size in {
             1,

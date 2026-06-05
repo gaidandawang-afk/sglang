@@ -1680,6 +1680,32 @@ class ActiveRanksOutput(BaseReq):
 
 
 @dataclass
+class FaultToleranceCommandReqInput(BaseReq):
+    request_id: str
+    command: str
+    target_ranks: List[int]
+    active_ranks: List[int]
+    isolated_ranks: List[int]
+    timeout_sec: int
+    params: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class FaultToleranceCommandReqOutput(BaseReq):
+    request_id: str
+    rank: int
+    success: bool
+    message: str = ""
+
+
+@dataclass
+class FaultToleranceRankFaultOutput(BaseReq):
+    rank: int
+    message: str = ""
+    recoverable: bool = True
+
+
+@dataclass
 class GetInternalStateReq(BaseReq):
     pass
 

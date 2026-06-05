@@ -105,6 +105,9 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
+    FaultToleranceCommandReqInput,
+    FaultToleranceCommandReqOutput,
+    FaultToleranceRankFaultOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     FreezeGCReq,
@@ -1063,6 +1066,7 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+        self._fault_tolerance_resume_event_loop = False
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1472,6 +1476,7 @@ class Scheduler(
                 (GetLoadsReqInput, self.get_loads),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (FaultToleranceCommandReqInput, self.handle_fault_tolerance_command),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
                 (
@@ -1524,14 +1529,68 @@ class Scheduler(
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
             # not PyTorch MPS streams.
-            dispatch_event_loop(self)
+            if self.server_args.enable_fault_tolerance:
+                self._run_event_loop_with_fault_tolerance()
+            else:
+                dispatch_event_loop(self)
             return
 
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         with self.device_module.StreamContext(self.schedule_stream):
-            dispatch_event_loop(self)
+            if self.server_args.enable_fault_tolerance:
+                self._run_event_loop_with_fault_tolerance()
+            else:
+                dispatch_event_loop(self)
+
+    def _run_event_loop_with_fault_tolerance(self) -> None:
+        while True:
+            try:
+                dispatch_event_loop(self)
+                return
+            except Exception:
+                traceback = get_exception_traceback()
+                logger.error(
+                    "Scheduler hit an exception under fault tolerance: %s",
+                    traceback,
+                )
+                self._engine_paused = True
+                self._fault_tolerance_resume_event_loop = False
+                self._fault_tolerance_cleanup_runtime_state()
+                self._fault_tolerance_notify_rank_fault(traceback)
+                self._fault_tolerance_parked_loop()
+                logger.info("Scheduler resumed normal event loop after recovery.")
+
+    def _fault_tolerance_parked_loop(self) -> None:
+        while True:
+            recv_reqs = self._fault_tolerance_recv_direct_control_requests()
+            control_reqs = [
+                req
+                for req in recv_reqs
+                if isinstance(req, FaultToleranceCommandReqInput)
+            ]
+            self.process_input_requests(control_reqs)
+            if self._fault_tolerance_resume_event_loop:
+                self._fault_tolerance_resume_event_loop = False
+                return
+            time.sleep(0.01)
+
+    def _fault_tolerance_recv_direct_control_requests(self) -> List[Any]:
+        recv_reqs = []
+        if self.recv_from_tokenizer is not None:
+            while True:
+                try:
+                    recv_reqs.append(self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK))
+                except zmq.ZMQError:
+                    break
+        if self.recv_from_rpc is not None:
+            while True:
+                try:
+                    recv_reqs.append(self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK))
+                except zmq.ZMQError:
+                    break
+        return recv_reqs
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1551,6 +1610,7 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                self._maybe_inject_test_recoverable_fault()
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
@@ -3717,6 +3777,210 @@ class Scheduler(
                 f"(freed {before_mb - after_mb:.1f} MB)"
             )
         self._engine_paused = False
+
+    def handle_fault_tolerance_command(
+        self, recv_req: FaultToleranceCommandReqInput
+    ) -> FaultToleranceCommandReqOutput:
+        rank = self.dp_rank if self.dp_rank is not None else 0
+        command = recv_req.command
+
+        try:
+            if command == "prepare_retry":
+                self._fault_tolerance_prepare_retry()
+                return FaultToleranceCommandReqOutput(
+                    request_id=recv_req.request_id,
+                    rank=rank,
+                    success=True,
+                    message="prepared retry",
+                )
+
+            if command == "isolate":
+                if rank in recv_req.target_ranks or rank in recv_req.isolated_ranks:
+                    self._engine_paused = True
+                    self._fault_tolerance_cleanup_runtime_state()
+                return FaultToleranceCommandReqOutput(
+                    request_id=recv_req.request_id,
+                    rank=rank,
+                    success=True,
+                    message="isolated",
+                )
+
+            if command in ("apply_active_mask", "reinit"):
+                self._fault_tolerance_apply_or_reinit(recv_req)
+                return FaultToleranceCommandReqOutput(
+                    request_id=recv_req.request_id,
+                    rank=rank,
+                    success=True,
+                    message="active mask applied" if command == "apply_active_mask" else "reinitialized",
+                )
+
+            if command == "health_check":
+                if rank in recv_req.target_ranks:
+                    self.tp_worker.model_runner.fault_tolerance_health_check()
+                return FaultToleranceCommandReqOutput(
+                    request_id=recv_req.request_id,
+                    rank=rank,
+                    success=True,
+                    message="health check passed",
+                )
+
+            if command == "resume":
+                if rank in recv_req.active_ranks:
+                    self._engine_paused = False
+                    self._fault_tolerance_resume_event_loop = True
+                return FaultToleranceCommandReqOutput(
+                    request_id=recv_req.request_id,
+                    rank=rank,
+                    success=True,
+                    message="resumed",
+                )
+
+            return FaultToleranceCommandReqOutput(
+                request_id=recv_req.request_id,
+                rank=rank,
+                success=False,
+                message=f"unsupported fault tolerance command: {command}",
+            )
+        except Exception as exc:
+            logger.exception("Fault tolerance command failed")
+            return FaultToleranceCommandReqOutput(
+                request_id=recv_req.request_id,
+                rank=rank,
+                success=False,
+                message=str(exc),
+            )
+
+    def _fault_tolerance_prepare_retry(self):
+        self._engine_paused = True
+        self._fault_tolerance_cleanup_runtime_state()
+        self.tp_worker.model_runner.fault_tolerance_prepare_reinit()
+
+    def _fault_tolerance_active_reqs(self):
+        reqs = []
+        for batch in (self.cur_batch, self.last_batch, self.running_batch):
+            if batch is not None and getattr(batch, "reqs", None):
+                reqs.extend(batch.reqs)
+        if self.chunked_req is not None:
+            reqs.append(self.chunked_req)
+        reqs.extend(list(self.waiting_queue))
+
+        unique_reqs = []
+        seen = set()
+        for req in reqs:
+            req_id = id(req)
+            if req_id not in seen:
+                seen.add(req_id)
+                unique_reqs.append(req)
+        return unique_reqs
+
+    def _fault_tolerance_release_runtime_requests(self):
+        for req in self._fault_tolerance_active_reqs():
+            if req.req_pool_idx is None and getattr(req, "mamba_pool_idx", None) is None:
+                continue
+            try:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+            except Exception:
+                logger.warning(
+                    "Failed to release request state during fault tolerance cleanup",
+                    exc_info=True,
+                )
+
+    def _fault_tolerance_cleanup_runtime_state(self):
+        self._fault_tolerance_release_runtime_requests()
+        self.cur_batch = None
+        self.last_batch = None
+        self.chunked_req = None
+        if hasattr(self, "result_queue"):
+            self.result_queue.clear()
+        self.waiting_queue.clear()
+        self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+
+    def _fault_tolerance_notify_rank_fault(self, message: str):
+        rank = self.dp_rank if self.dp_rank is not None else 0
+        self.send_to_tokenizer.send_output(
+            FaultToleranceRankFaultOutput(
+                rank=rank,
+                message=message,
+                recoverable=True,
+            )
+        )
+
+    def _fault_tolerance_rebind_distributed_groups(self):
+        self.tp_group = get_tp_group()
+        self.tp_cpu_group = self.tp_group.cpu_group
+        self.attn_tp_group = get_attention_tp_group()
+        self.attn_tp_cpu_group = self.attn_tp_group.cpu_group
+        self.attn_cp_group = get_attention_cp_group()
+        self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
+        self.pp_group = get_pp_group()
+        self.world_group = get_world_group()
+        self.dp_tp_group = (
+            self.attn_tp_group
+            if self.server_args.enable_dp_attention
+            else self.tp_group
+        )
+        self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
+
+    def _maybe_inject_test_recoverable_fault(self):
+        target_raw = os.environ.get("SGLANG_TEST_FT_RECOVERABLE_FAULT_RANK")
+        if target_raw is None:
+            return
+        rank = self.dp_rank if self.dp_rank is not None else 0
+        target_raw = target_raw.strip().lower()
+        if target_raw == "all":
+            target_ranks = set(range(self.dp_size))
+        else:
+            try:
+                target_ranks = {
+                    int(item.strip())
+                    for item in target_raw.split(",")
+                    if item.strip()
+                }
+            except ValueError:
+                return
+        if not target_ranks:
+            return
+        trigger_file = os.environ.get("SGLANG_TEST_FT_RECOVERABLE_FAULT_FILE", "")
+        if trigger_file and not os.path.exists(trigger_file):
+            return
+        if getattr(self, "_test_recoverable_fault_injected", False):
+            return
+        setattr(self, "_test_recoverable_fault_injected", True)
+        done_file = os.environ.get("SGLANG_TEST_FT_RECOVERABLE_FAULT_DONE_FILE", "")
+        is_target_rank = rank in target_ranks
+        if done_file and is_target_rank:
+            try:
+                with open(done_file, "a", encoding="utf-8") as f:
+                    f.write(f"pid={os.getpid()} rank={rank}\n")
+            except OSError:
+                pass
+        if is_target_rank:
+            raise RuntimeError(f"Injected recoverable FT fault on scheduler rank {rank}")
+        raise RuntimeError(
+            f"Cooperative recoverable FT pause on scheduler rank {rank}; "
+            f"target ranks={sorted(target_ranks)}"
+        )
+
+    def _fault_tolerance_apply_or_reinit(
+        self, recv_req: FaultToleranceCommandReqInput
+    ):
+        active_ranks = sorted(set(recv_req.active_ranks))
+        full_active = list(range(self.dp_size))
+        if active_ranks and active_ranks != full_active:
+            from sglang.srt.elastic_ep.elastic_ep import apply_active_rank_mask
+
+            active_set = set(active_ranks)
+            active_mask = [rank in active_set for rank in range(self.dp_size)]
+            apply_active_rank_mask(active_mask)
+            return
+
+        model_runner = self.tp_worker.model_runner
+        model_runner.fault_tolerance_reinit_distributed(recv_req.params)
+        model_runner.fault_tolerance_rebind_distributed_groups()
+        self._fault_tolerance_rebind_distributed_groups()
+        model_runner.fault_tolerance_invalidate_cuda_graphs()
+        if recv_req.params.get("recapture_cuda_graph", True):
+            model_runner.fault_tolerance_recapture_cuda_graphs()
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput

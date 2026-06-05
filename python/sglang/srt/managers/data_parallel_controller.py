@@ -33,6 +33,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    FaultToleranceCommandReqInput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -100,13 +101,26 @@ class DPBudget:
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
 
-    def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
+    def dispatch(
+        self,
+        method: LoadBalanceMethod,
+        estimated_tokens: int = 0,
+        active_status: Optional[List[bool]] = None,
+    ):
+        candidate_ranks = [
+            rank
+            for rank in range(self.dp_size)
+            if active_status is None or active_status[rank]
+        ]
+        if not candidate_ranks:
+            raise RuntimeError("No active data parallel rank is available")
+
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
-            target_rank = self.total_requests.index(min(self.total_requests))
+            target_rank = min(candidate_ranks, key=lambda i: self.total_requests[i])
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
             # Use total_requests as a tie-breaker when total_tokens are equal
             target_rank = min(
-                range(self.dp_size),
+                candidate_ranks,
                 key=lambda i: (self.total_tokens[i], self.total_requests[i]),
             )
         else:
@@ -231,6 +245,7 @@ class DataParallelController:
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
+                (FaultToleranceCommandReqInput, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
                 (ActiveRanksOutput, self.update_active_ranks),
             ]
@@ -563,6 +578,10 @@ class DataParallelController:
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
+            if not self.status[req.routed_dp_rank]:
+                raise RuntimeError(
+                    f"routed_dp_rank={req.routed_dp_rank} is inactive"
+                )
             logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
             self.workers[req.routed_dp_rank].send_pyobj(req)
             return True
@@ -598,7 +617,10 @@ class DataParallelController:
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
+        target_worker = self.dp_budget.dispatch(
+            LoadBalanceMethod.TOTAL_REQUESTS,
+            active_status=self.status,
+        )
         self.workers[target_worker].send_pyobj(req)
 
     def total_tokens_scheduler(self, req: Req):
@@ -606,7 +628,9 @@ class DataParallelController:
             return
         estimated_tokens = len(req.input_ids)
         target_worker = self.dp_budget.dispatch(
-            LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
+            LoadBalanceMethod.TOTAL_TOKENS,
+            estimated_tokens=estimated_tokens,
+            active_status=self.status,
         )
         self.workers[target_worker].send_pyobj(req)
 

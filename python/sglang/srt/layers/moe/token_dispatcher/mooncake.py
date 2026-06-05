@@ -8,6 +8,7 @@ from typing import NamedTuple, Optional
 import torch
 import torch.distributed as dist
 
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
@@ -61,6 +62,7 @@ assert isinstance(MooncakeCombineInput, CombineInput)
 
 class EPBuffer:
     _buffer = None
+    _group: Optional[dist.ProcessGroup] = None
     _hidden_size: Optional[int] = None
     _num_max_dispatch_tokens_per_rank: Optional[int] = None
     _num_experts: Optional[int] = None
@@ -76,7 +78,9 @@ class EPBuffer:
         num_experts: int = -1,
     ):
         if cls._buffer is not None:
-            return cls._buffer
+            if cls._group is group:
+                return cls._buffer
+            cls.reset()
 
         # Lazy import Buffer to avoid creating CUDA context at module import time
         from mooncake.mooncake_ep_buffer import Buffer
@@ -96,8 +100,17 @@ class EPBuffer:
                 num_experts,
             )
 
+        cls._group = group
         cls._buffer = Buffer(group, num_ep_buffer_bytes)
         return cls._buffer
+
+    @classmethod
+    def reset(cls):
+        cls._buffer = None
+        cls._group = None
+        cls._hidden_size = None
+        cls._num_max_dispatch_tokens_per_rank = None
+        cls._num_experts = None
 
 
 class _MooncakeEPDispatcherImpl:
@@ -274,6 +287,7 @@ class _MooncakeEPDispatcherImpl:
         return combined_hidden_states, event, hook
 
     def _get_buffer(self):
+        self._refresh_group_if_needed()
         return EPBuffer.get_ep_buffer(
             self.group,
             self.hidden_size,
@@ -282,6 +296,19 @@ class _MooncakeEPDispatcherImpl:
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
         )
+
+    def _refresh_group_if_needed(self):
+        current_group = get_tp_group().device_group
+        if current_group is self.group:
+            return
+
+        logger.info(
+            "Refreshing Mooncake EP dispatcher process group after fault-tolerance recovery."
+        )
+        self.group = current_group
+        self.first_execution = True
+        self.handle = None
+        EPBuffer.reset()
 
 
 @dataclass
@@ -395,3 +422,10 @@ class MooncakeEPDispatcher(BaseDispatcher):
     def _update_stage(self, old_stage, new_stage):
         assert self._stage == old_stage
         self._stage = new_stage
+
+    def reset_fault_tolerance_state(self):
+        self._stage = _Stage.INITIAL
+        for attr in ("_dispatch_intermediate_state", "_combine_intermediate_state"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        self._get_impl()._refresh_group_if_needed()
