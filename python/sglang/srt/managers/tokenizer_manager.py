@@ -1538,6 +1538,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.metrics_collector.labels
             )
 
+    def _fault_tolerance_abort_all_local_requests(self, message: str):
+        """Unblock HTTP waiters before scheduler runtime state is discarded."""
+        self.abort_request(abort_all=True)
+        if not self.rid_to_state:
+            return
+
+        finish_reason = {
+            "type": "abort",
+            "message": message,
+            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+        }
+        for rid, state in list(self.rid_to_state.items()):
+            if state.finished:
+                continue
+            state.finished = True
+            state.time_stats.set_finished_time()
+            meta_info = {
+                "id": rid,
+                "finish_reason": finish_reason,
+                "weight_version": self.server_args.weight_version,
+                "e2e_latency": state.time_stats.get_e2e_latency(),
+            }
+            state.out_list.append(
+                {
+                    "text": "",
+                    "output_ids": [],
+                    "meta_info": meta_info,
+                }
+            )
+            state.event.set()
+
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = True
@@ -1557,6 +1588,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         async with self.is_pause_cond:
             self.is_pause = False
             await self.send_to_scheduler.send_pyobj(obj)
+            self.is_pause_cond.notify_all()
+
+    async def _fault_tolerance_continue_local_generation(self):
+        async with self.is_pause_cond:
+            self.is_pause = False
             self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(
@@ -2499,13 +2535,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state.event.set()
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
+        if self.server_args.enable_fault_tolerance:
+            ft_mask = self.fault_tolerance.active_mask()
+            if len(ranks.status) == len(ft_mask):
+                ranks = ActiveRanksOutput(
+                    status=[
+                        bool(rank_active) and bool(ft_active)
+                        for rank_active, ft_active in zip(ranks.status, ft_mask)
+                    ]
+                )
         self.send_to_scheduler.send_pyobj(ranks)
 
-    def _fault_tolerance_update_dp_routing(self):
+    async def _fault_tolerance_update_dp_routing(self):
         if self.server_args.dp_size > 1:
-            self.update_active_ranks(
+            send_result = self.send_to_scheduler.send_pyobj(
                 ActiveRanksOutput(status=self.fault_tolerance.active_mask())
             )
+            if inspect.isawaitable(send_result):
+                await send_result
 
     def _handle_fault_tolerance_output(self, recv_obj: FaultToleranceCommandReqOutput):
         pending = self._fault_tolerance_pending_commands.get(recv_obj.request_id)
@@ -2631,6 +2678,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 timeout_sec=timeout_sec,
                 params=params or {},
             )
+        await self._fault_tolerance_send_command(
+            "set_sparse_idle_control",
+            target_ranks=active_ranks,
+            active_ranks=active_ranks,
+            isolated_ranks=isolated_ranks,
+            timeout_sec=timeout_sec,
+            params={"enabled": len(active_ranks) <= self.server_args.dp_size - 2},
+            wait=False,
+        )
 
     async def _fault_tolerance_scale_down_ranks(
         self,
@@ -2656,7 +2712,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             return code, begin_result
 
-        self.abort_request(abort_all=True)
+        self._fault_tolerance_abort_all_local_requests(
+            "SGLang engine is recovering by fault tolerance."
+        )
         active_ranks = self.fault_tolerance.active_ranks()
         isolated_ranks = [
             item["rank"] for item in begin_result["ranks"] if item["state"] == "dead"
@@ -2671,7 +2729,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 params=params,
                 wait=False,
             )
-            self._fault_tolerance_update_dp_routing()
+            await self._fault_tolerance_send_command(
+                "apply_active_mask",
+                target_ranks=ranks,
+                active_ranks=active_ranks,
+                isolated_ranks=isolated_ranks,
+                timeout_sec=timeout_sec,
+                params=params,
+                wait=False,
+            )
+            await self._fault_tolerance_update_dp_routing()
             await self._fault_tolerance_run_recovery_sequence(
                 active_ranks=active_ranks,
                 isolated_ranks=isolated_ranks,
@@ -2683,8 +2750,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return 500, result
 
         result = self.fault_tolerance.commit_scale_down()
-        self._fault_tolerance_update_dp_routing()
-        await self.continue_generation(ContinueGenerationReqInput())
+        await self._fault_tolerance_update_dp_routing()
+        await self._fault_tolerance_continue_local_generation()
         return 200, result
 
     async def _fault_tolerance_auto_scale_down(self, rank: int, message: str):
@@ -2702,8 +2769,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     async def _fault_tolerance_handle_process_exit(self, rank: int, message: str):
-        self.abort_request(abort_all=True)
-        self._fault_tolerance_update_dp_routing()
+        self._fault_tolerance_abort_all_local_requests(message)
+        await self._fault_tolerance_update_dp_routing()
         if (
             self.server_args.fault_tolerance_on_error_strategy == "continue"
             and self.fault_tolerance.is_mooncake_backend
@@ -2711,8 +2778,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             await self._fault_tolerance_auto_scale_down(rank, message)
 
     async def _fault_tolerance_handle_recoverable_fault(self):
-        self.abort_request(abort_all=True)
-        self._fault_tolerance_update_dp_routing()
+        self._fault_tolerance_abort_all_local_requests(
+            "SGLang engine is paused by fault tolerance."
+        )
+        await self._fault_tolerance_update_dp_routing()
         active_ranks = self.fault_tolerance.active_ranks()
         isolated_ranks = [
             item["rank"]
@@ -2758,7 +2827,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             }
 
         if instruction == "retry":
-            self.abort_request(abort_all=True)
+            self._fault_tolerance_abort_all_local_requests(
+                "SGLang engine is recovering by fault tolerance."
+            )
             begin_result = self.fault_tolerance.begin_retry()
             if not begin_result["success"]:
                 return 500, begin_result
@@ -2781,8 +2852,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return 500, result
 
             result = self.fault_tolerance.apply_retry()
-            self._fault_tolerance_update_dp_routing()
-            await self.continue_generation(ContinueGenerationReqInput())
+            await self._fault_tolerance_update_dp_routing()
+            await self._fault_tolerance_continue_local_generation()
             return 200 if result["success"] else 500, result
 
         if instruction == "scale_down":

@@ -1067,6 +1067,7 @@ class Scheduler(
         self.forward_sleep_time = None
         self._engine_paused = False
         self._fault_tolerance_resume_event_loop = False
+        self._fault_tolerance_sparse_active_mask = False
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1767,6 +1768,10 @@ class Scheduler(
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
+                if self._engine_paused and work_reqs:
+                    for work_req in work_reqs:
+                        self._fault_tolerance_abort_work_req_while_paused(work_req)
+                    work_reqs = []
             else:
                 work_reqs = None
                 control_reqs = None
@@ -1793,7 +1798,12 @@ class Scheduler(
             # instead of the full tp_group.  This avoids an expensive
             # all-ranks gloo sync.
             _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
-            if _local_ctrl:
+            _sparse_idle_ctrl = (
+                self._fault_tolerance_sparse_active_mask and not control_reqs
+            )
+            if _sparse_idle_ctrl:
+                control_reqs = []
+            elif _local_ctrl:
                 if self.attn_tp_size != 1:
                     control_reqs = broadcast_pyobj(
                         control_reqs,
@@ -1874,35 +1884,58 @@ class Scheduler(
         work_reqs = [
             req
             for req in recv_reqs
-            if isinstance(
-                req,
-                (
-                    TokenizedGenerateReqInput,
-                    TokenizedEmbeddingReqInput,
-                    BatchTokenizedGenerateReqInput,
-                    BatchTokenizedEmbeddingReqInput,
-                ),
-            )
+            if self._fault_tolerance_is_work_req(req)
         ]
         control_reqs = [
             req
             for req in recv_reqs
-            if not isinstance(
-                req,
-                (
-                    TokenizedGenerateReqInput,
-                    TokenizedEmbeddingReqInput,
-                    BatchTokenizedGenerateReqInput,
-                    BatchTokenizedEmbeddingReqInput,
-                ),
-            )
+            if not self._fault_tolerance_is_work_req(req)
         ]
         return work_reqs, control_reqs
+
+    def _fault_tolerance_is_work_req(self, req: Any) -> bool:
+        return isinstance(
+            req,
+            (
+                TokenizedGenerateReqInput,
+                TokenizedEmbeddingReqInput,
+                BatchTokenizedGenerateReqInput,
+                BatchTokenizedEmbeddingReqInput,
+            ),
+        )
+
+    def _fault_tolerance_abort_work_req_while_paused(self, recv_req: Any):
+        tokenized_reqs = (
+            recv_req
+            if isinstance(
+                recv_req,
+                (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput),
+            )
+            else [recv_req]
+        )
+        message = "SGLang engine is paused by fault tolerance."
+        for tokenized_req in tokenized_reqs:
+            abort_req = AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": message,
+                },
+                rid=tokenized_req.rid,
+            )
+            tokenized_req.time_stats.trace_ctx.abort(
+                abort_info=abort_req.finished_reason
+            )
+            self.send_to_tokenizer.send_output(abort_req, tokenized_req)
 
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
+            if self._engine_paused and self._fault_tolerance_is_work_req(recv_req):
+                self._fault_tolerance_abort_work_req_while_paused(recv_req)
+                continue
+
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
                 for_health_check=True
@@ -3822,6 +3855,17 @@ class Scheduler(
                     rank=rank,
                     success=True,
                     message="health check passed",
+                )
+
+            if command == "set_sparse_idle_control":
+                self._fault_tolerance_sparse_active_mask = bool(
+                    recv_req.params.get("enabled", False)
+                )
+                return FaultToleranceCommandReqOutput(
+                    request_id=recv_req.request_id,
+                    rank=rank,
+                    success=True,
+                    message="sparse idle control updated",
                 )
 
             if command == "resume":

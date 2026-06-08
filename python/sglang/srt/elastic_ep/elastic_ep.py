@@ -170,6 +170,8 @@ def apply_active_rank_mask(active_mask: Sequence[bool]) -> None:
         )
         group.active_ranks.copy_(values_device)
 
+    _refresh_ep_members()
+
 
 # ---------------------------------------------------------------------------
 # Helpers for elastic EP recovery

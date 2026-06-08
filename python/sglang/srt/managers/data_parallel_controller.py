@@ -33,7 +33,9 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    ContinueGenerationReqInput,
     FaultToleranceCommandReqInput,
+    PauseGenerationReqInput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -187,8 +189,11 @@ class DataParallelController:
             # within its own attn_tp_group instead of the full tp_group.
             # Otherwise fall back to the original behaviour: send to only the
             # first leader, which then broadcasts over the full tp_group.
-            local_ctrl = server_args.enable_dp_attention_local_control_broadcast
-            self.control_message_step = 1 if local_ctrl else server_args.tp_size
+            self.control_message_step = (
+                1
+                if server_args.enable_dp_attention_local_control_broadcast
+                else server_args.tp_size
+            )
         else:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
@@ -209,6 +214,21 @@ class DataParallelController:
         for i, worker in enumerate(self.workers):
             if self.status[i]:
                 worker.send_pyobj(obj)
+
+    def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
+        if obj.command in ("isolate", "apply_active_mask"):
+            recipients = set(obj.active_ranks) | {
+                rank
+                for rank in obj.target_ranks
+                if 0 <= rank < len(self.status) and self.status[rank]
+            }
+        else:
+            recipients = set(obj.target_ranks)
+        recipients = sorted(
+            rank for rank in recipients if 0 <= rank < len(self.workers)
+        )
+        for rank in recipients:
+            self.workers[rank].send_pyobj(obj)
 
     def send_control_message(self, obj):
         # Send control messages to first worker of tp group
@@ -244,8 +264,10 @@ class DataParallelController:
                 (BatchTokenizedGenerateReqInput, self.dispatch_batch_generate),
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
                 (BlockReqInput, self.send_to_all_workers),
+                (PauseGenerationReqInput, self.send_to_all_workers),
+                (ContinueGenerationReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
-                (FaultToleranceCommandReqInput, self.send_to_all_workers),
+                (FaultToleranceCommandReqInput, self.send_fault_tolerance_command),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
                 (ActiveRanksOutput, self.update_active_ranks),
             ]
