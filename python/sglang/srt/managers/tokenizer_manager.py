@@ -2915,7 +2915,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             logger.error(
                                 "[FaultTolerance] tokenizer event loop is unavailable"
                             )
-                        return
+                        continue
 
         self._fault_tolerance_watchdog_thread = threading.Thread(
             target=watch_loop,
