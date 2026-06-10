@@ -240,16 +240,6 @@ class Engine(EngineScoreMixin, EngineBase):
         self._scheduler_init_result = scheduler_init_result
         if tokenizer_manager is not None:
             tokenizer_manager._subprocess_watchdog = subprocess_watchdog
-            if server_args.enable_fault_tolerance and subprocess_watchdog is not None:
-                logger.info(
-                    "Stopping subprocess watchdog because fault tolerance is enabled."
-                )
-                subprocess_watchdog.stop()
-                tokenizer_manager.start_fault_tolerance_watchdog(
-                    scheduler_init_result.scheduler_infos[0],
-                    scheduler_procs=scheduler_procs if server_args.dp_size == 1 else None,
-                    watchdog_reader=watchdog_reader if server_args.dp_size > 1 else None,
-                )
         self.port_args = port_args
         # Access transfer engine info if bootstrap server is started.
         if scheduler_init_result.engine_info_bootstrap_server is not None:
@@ -831,6 +821,22 @@ class Engine(EngineScoreMixin, EngineBase):
             processes=processes, process_names=names
         )
         subprocess_watchdog.start()
+
+        # Start fault-tolerance watchdog with proper params (DP=1 sentinel or DP>1 DPC pipe)
+        if (
+            server_args.enable_fault_tolerance
+            and tokenizer_manager is not None
+            and subprocess_watchdog is not None
+        ):
+            logger.info(
+                "Stopping subprocess watchdog because fault tolerance is enabled."
+            )
+            subprocess_watchdog.stop()
+            tokenizer_manager.start_fault_tolerance_watchdog(
+                scheduler_init_result.scheduler_infos[0],
+                scheduler_procs=scheduler_procs if server_args.dp_size == 1 else None,
+                watchdog_reader=watchdog_reader if server_args.dp_size > 1 else None,
+            )
 
         return (
             tokenizer_manager,

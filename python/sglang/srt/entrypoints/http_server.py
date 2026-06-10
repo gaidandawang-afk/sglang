@@ -2177,7 +2177,8 @@ def _setup_and_run_http_server(
                 "Stopping subprocess watchdog because fault tolerance is enabled."
             )
             subprocess_watchdog.stop()
-        tokenizer_manager.start_fault_tolerance_watchdog(scheduler_infos[0])
+            # Fault tolerance watchdog is already started in _launch_subprocesses;
+            # call here for paths that bypass Engine.__init__ (e.g. Granian workers).
 
     if server_args.enable_metrics:
         add_prometheus_track_response_middleware(app)
