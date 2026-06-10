@@ -2998,6 +2998,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
 
 
+        reported = set()
+
         def watch_loop_sentinel():
             while not self._fault_tolerance_watchdog_stop.is_set():
                 ready = connection.wait(
@@ -3005,10 +3007,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 for sentinel in ready:
                     rank = sentinel_map[sentinel]
+                    if rank in reported:
+                        continue
                     if self.fault_tolerance.status_response()["ranks"][rank][
                         "state"
                     ] == "dead":
                         continue
+                    reported.add(rank)
                     proc = scheduler_procs[rank]
                     exitcode = proc.exitcode if proc else None
                     message = (
@@ -3029,6 +3034,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _fault_tolerance_watchdog_start_dpc_events(self, watchdog_reader):
         """DP>1: read rank-death events from the DPC watchdog pipe."""
 
+        reported = set()
+
         def watch_loop_dpc():
             while not self._fault_tolerance_watchdog_stop.is_set():
                 if watchdog_reader.poll(1.0):
@@ -3042,6 +3049,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     rank = event.get("rank")
                     if rank is None:
                         continue
+                    if rank in reported:
+                        continue
+                    reported.add(rank)
                     message = event.get(
                         "message",
                         f"scheduler rank {rank} process exited"

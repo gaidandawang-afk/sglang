@@ -90,12 +90,17 @@ def _start_dpc_watchdog(scheduler_procs, watchdog_writer):
     if not sentinel_map:
         return
 
+    reported = set()
+
     def _watch():
         try:
             while True:
                 ready = connection.wait(list(sentinel_map.keys()), timeout=1.0)
                 for sentinel in ready:
                     rank = sentinel_map[sentinel]
+                    if rank in reported:
+                        continue
+                    reported.add(rank)
                     proc = scheduler_procs[rank]
                     exitcode = proc.exitcode if proc else None
                     pid = proc.pid if proc else None
