@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import random
+import sys
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
@@ -874,6 +875,14 @@ class ServerArgs:
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
             return
+
+        # Fault tolerance requires mooncake backend.
+        if self.enable_fault_tolerance and self.moe_a2a_backend == "none":
+            logger.error(
+                "Fault tolerance is only supported with mooncake backend. "
+                "Set --moe-a2a-backend mooncake or remove --enable-fault-tolerance."
+            )
+            sys.exit(1)
 
         # Handle deprecated arguments.
         self._handle_deprecated_args()
