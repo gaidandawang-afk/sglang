@@ -159,6 +159,27 @@ class FaultToleranceManager:
             self._last_message = "SGLang engine is recovering by fault tolerance."
             return self._success_locked("retry started")
 
+    def validate_retry(self) -> Optional[str]:
+        """Validate that retry is applicable: no DEAD ranks exist.
+
+        Retry only handles recoverable faults where ranks are merely PAUSED.
+        DEAD ranks indicate process exit or kill faults that require scale_down.
+        """
+        if not self.enabled:
+            return "fault tolerance is not enabled"
+        with self._lock:
+            dead_ranks = [
+                item.rank
+                for item in self._ranks
+                if item.state == RankState.DEAD
+            ]
+            if dead_ranks:
+                return (
+                    f"retry cannot be performed when ranks {dead_ranks} are dead; "
+                    "use scale_down for process/rank failures"
+                )
+            return None
+
     def validate_scale_down(self, ranks: Sequence[int]) -> Optional[str]:
         if not ranks:
             return "scale_down requires non-empty fault_tolerance_params.ranks"

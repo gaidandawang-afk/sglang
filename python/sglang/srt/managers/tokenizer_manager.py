@@ -2661,6 +2661,33 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         finally:
             self._fault_tolerance_pending_commands.pop(request_id, None)
 
+    async def _fault_tolerance_run_retry_cleanup_sequence(
+        self,
+        *,
+        timeout_sec: int,
+        params: Optional[Dict[str, Any]] = None,
+    ):
+        """Lightweight retry cleanup: only stale state cleanup and resume.
+
+        Does NOT perform distributed reinit, health_check, active mask changes,
+        or CUDA graph invalidate/recapture.  Those are reserved for scale_down.
+        """
+        cleanup_params = dict(params or {})
+        cleanup_params["lightweight"] = True
+
+        await self._fault_tolerance_send_command(
+            "prepare_retry",
+            target_ranks=self.fault_tolerance.active_ranks(),
+            timeout_sec=timeout_sec,
+            params=cleanup_params,
+        )
+        await self._fault_tolerance_send_command(
+            "resume",
+            target_ranks=self.fault_tolerance.active_ranks(),
+            timeout_sec=timeout_sec,
+            params=cleanup_params,
+        )
+
     async def _fault_tolerance_run_recovery_sequence(
         self,
         *,
@@ -2746,8 +2773,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 params=params,
             )
         except Exception as exc:
-            result = self.fault_tolerance.fail_recovery(str(exc))
-            return 500, result
+            logger.exception(
+                "[FaultTolerance] scale_down recovery failed; triggering fail-stop"
+            )
+            os._exit(1)
 
         result = self.fault_tolerance.commit_scale_down()
         await self._fault_tolerance_update_dp_routing()
@@ -2827,29 +2856,31 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             }
 
         if instruction == "retry":
-            self._fault_tolerance_abort_all_local_requests(
-                "SGLang engine is recovering by fault tolerance."
-            )
+            validation_error = self.fault_tolerance.validate_retry()
+            if validation_error is not None:
+                return 400, {
+                    "success": False,
+                    "message": validation_error,
+                    "ranks": self.fault_tolerance.status_response()["ranks"],
+                }
+
             begin_result = self.fault_tolerance.begin_retry()
             if not begin_result["success"]:
                 return 500, begin_result
 
-            active_ranks = self.fault_tolerance.active_ranks()
-            isolated_ranks = [
-                item["rank"]
-                for item in self.fault_tolerance.status_response()["ranks"]
-                if item["state"] == "dead"
-            ]
+            self._fault_tolerance_abort_all_local_requests(
+                "SGLang engine is recovering by fault tolerance."
+            )
             try:
-                await self._fault_tolerance_run_recovery_sequence(
-                    active_ranks=active_ranks,
-                    isolated_ranks=isolated_ranks,
+                await self._fault_tolerance_run_retry_cleanup_sequence(
                     timeout_sec=int(timeout),
                     params=params,
                 )
             except Exception as exc:
-                result = self.fault_tolerance.fail_recovery(str(exc))
-                return 500, result
+                logger.exception(
+                    "[FaultTolerance] retry cleanup failed; triggering fail-stop"
+                )
+                os._exit(1)
 
             result = self.fault_tolerance.apply_retry()
             await self._fault_tolerance_update_dp_routing()

@@ -3819,7 +3819,10 @@ class Scheduler(
 
         try:
             if command == "prepare_retry":
-                self._fault_tolerance_prepare_retry()
+                if recv_req.params.get("lightweight", False):
+                    self._fault_tolerance_prepare_retry(lightweight=True)
+                else:
+                    self._fault_tolerance_prepare_retry()
                 return FaultToleranceCommandReqOutput(
                     request_id=recv_req.request_id,
                     rank=rank,
@@ -3894,10 +3897,18 @@ class Scheduler(
                 message=str(exc),
             )
 
-    def _fault_tolerance_prepare_retry(self):
+    def _fault_tolerance_prepare_retry(self, lightweight: bool = False):
         self._engine_paused = True
         self._fault_tolerance_cleanup_runtime_state()
-        self.tp_worker.model_runner.fault_tolerance_prepare_reinit()
+        if lightweight:
+            # Lightweight retry: only accelerator synchronize, no CUDA graph invalidation.
+            device = self.tp_worker.model_runner.device
+            if device != "cpu":
+                import contextlib
+                with contextlib.suppress(Exception):
+                    torch.get_device_module(device).synchronize()
+        else:
+            self.tp_worker.model_runner.fault_tolerance_prepare_reinit()
 
     def _fault_tolerance_active_reqs(self):
         reqs = []
