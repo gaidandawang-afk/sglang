@@ -72,6 +72,59 @@ logger = logging.getLogger(__name__)
 SCHEDULER_PIDS_ARG = "scheduler_pids"
 
 
+def _start_dpc_watchdog(scheduler_procs, watchdog_writer):
+    """Monitor DP>1 scheduler children and report exits through watchdog_writer.
+
+    Runs as a daemon thread inside the DataParallelController process so
+    that `mp.Process.sentinel` can be waited on locally (cross-process
+    sentinel handles are not usable in a different process).
+    """
+    import threading
+    from multiprocessing import connection
+
+    sentinel_map = {}
+    for rank, proc in enumerate(scheduler_procs):
+        if proc is not None:
+            sentinel_map[proc.sentinel] = rank
+
+    if not sentinel_map:
+        return
+
+    def _watch():
+        try:
+            while True:
+                ready = connection.wait(list(sentinel_map.keys()), timeout=1.0)
+                for sentinel in ready:
+                    rank = sentinel_map[sentinel]
+                    proc = scheduler_procs[rank]
+                    exitcode = proc.exitcode if proc else None
+                    pid = proc.pid if proc else None
+                    event = {
+                        "rank": rank,
+                        "pid": pid,
+                        "exitcode": exitcode,
+                        "message": (
+                            f"scheduler rank {rank} process exited with code "
+                            f"{exitcode}"
+                        ),
+                    }
+                    try:
+                        watchdog_writer.send(event)
+                    except Exception:
+                        logger.exception(
+                            "DPC watchdog failed to send rank death event"
+                        )
+        except Exception:
+            logger.exception("DPC watchdog thread failed")
+
+    t = threading.Thread(target=_watch, daemon=True, name="dpc-watchdog")
+    t.start()
+    logger.info(
+        "DPC watchdog started: monitoring %d scheduler children",
+        len(sentinel_map),
+    )
+
+
 class LoadBalanceMethod(Enum):
     """Load balance method."""
 
@@ -671,6 +724,7 @@ def run_data_parallel_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
     pipe_writer,
+    watchdog_writer=None,
     run_scheduler_process_func: Callable = run_scheduler_process,
 ):
     setproctitle.setproctitle("sglang::data_parallel_controller")
@@ -703,6 +757,10 @@ def run_data_parallel_controller_process(
                 SCHEDULER_PIDS_ARG: scheduler_pids,
             }
         )
+
+        # Start watchdog thread to monitor scheduler children for DP>1
+        if watchdog_writer is not None and controller.scheduler_procs:
+            _start_dpc_watchdog(controller.scheduler_procs, watchdog_writer)
         if server_args.node_rank == 0:
             controller.event_loop()
         for proc in controller.scheduler_procs:

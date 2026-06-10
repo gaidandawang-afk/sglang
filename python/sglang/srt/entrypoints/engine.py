@@ -246,7 +246,9 @@ class Engine(EngineScoreMixin, EngineBase):
                 )
                 subprocess_watchdog.stop()
                 tokenizer_manager.start_fault_tolerance_watchdog(
-                    scheduler_init_result.scheduler_infos[0]
+                    scheduler_init_result.scheduler_infos[0],
+                    scheduler_procs=scheduler_procs if server_args.dp_size == 1 else None,
+                    watchdog_reader=watchdog_reader if server_args.dp_size > 1 else None,
                 )
         self.port_args = port_args
         # Access transfer engine info if bootstrap server is started.
@@ -584,6 +586,7 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_procs is None for RayEngine (uses Ray actors instead).
         """
         scheduler_procs = []
+        watchdog_reader = None
 
         if server_args.dp_size == 1:
             # Launch tensor parallel scheduler processes
@@ -641,12 +644,14 @@ class Engine(EngineScoreMixin, EngineBase):
             # Launch the data parallel controller
             reader, writer = mp.Pipe(duplex=False)
             scheduler_pipe_readers = [reader]
+            watchdog_reader, watchdog_writer = mp.Pipe(duplex=False)
             proc = mp.Process(
                 target=run_data_parallel_controller_process,
                 kwargs=dict(
                     server_args=server_args,
                     port_args=port_args,
                     pipe_writer=writer,
+                    watchdog_writer=watchdog_writer,
                     run_scheduler_process_func=run_scheduler_process_func,
                 ),
             )
@@ -681,6 +686,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 wait_for_completion=wait_for_completion,
             ),
             scheduler_procs,
+            watchdog_reader if server_args.dp_size > 1 else None,
         )
 
     @classmethod
@@ -743,8 +749,10 @@ class Engine(EngineScoreMixin, EngineBase):
             resolve_auto_parsers(server_args)
 
         # Launch scheduler processes
-        scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
-            server_args, port_args, run_scheduler_process_func
+        scheduler_init_result, scheduler_procs, watchdog_reader = (
+            cls._launch_scheduler_processes(
+                server_args, port_args, run_scheduler_process_func
+            )
         )
         scheduler_init_result.engine_info_bootstrap_server = (
             engine_info_bootstrap_server

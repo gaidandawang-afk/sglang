@@ -2910,20 +2910,56 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "ranks": self.fault_tolerance.status_response()["ranks"],
         }
 
-    def start_fault_tolerance_watchdog(self, scheduler_info: Dict[str, Any]):
+    def start_fault_tolerance_watchdog(
+        self,
+        scheduler_info: Optional[Dict[str, Any]] = None,
+        *,
+        scheduler_procs: Optional[List] = None,
+        watchdog_reader: Optional[Any] = None,
+    ):
+        """Start an event-based watchdog that detects scheduler process exits.
+
+        - DP=1: `scheduler_procs` is a list of `mp.Process` owned by the
+          main process; the watchdog waits on `proc.sentinel` via
+          `multiprocessing.connection.wait`.
+        - DP>1: `watchdog_reader` is a `multiprocessing.Connection`
+          from which the DPC sends rank-death events.
+        - Fallback: `scheduler_info` with `scheduler_pids` uses
+          `psutil` polling (compatibility path).
+        """
         if (
             not self.server_args.enable_fault_tolerance
             or self._fault_tolerance_watchdog_thread is not None
         ):
             return
 
+        scheduler_info = scheduler_info or {}
+
+        # --- DP=1: sentinel-based (preferred) ---
+        if scheduler_procs:
+            self._fault_tolerance_watchdog_start_sentinel(scheduler_procs)
+            return
+
+        # --- DP>1: DPC event channel (preferred) ---
+        if watchdog_reader is not None:
+            self._fault_tolerance_watchdog_start_dpc_events(watchdog_reader)
+            return
+
+        # --- Fallback: psutil polling ---
         scheduler_pids = scheduler_info.get("scheduler_pids") or []
         if not scheduler_pids:
-            logger.warning("Fault tolerance enabled but scheduler pids are unavailable")
+            logger.warning(
+                "Fault tolerance enabled but scheduler pids are unavailable"
+            )
             return
+
+        logger.warning(
+            "Fault tolerance watchdog falling back to psutil polling; "
+            "consider passing scheduler_procs or watchdog_reader"
+        )
         scheduler_pids = scheduler_pids[: self.server_args.dp_size]
 
-        def watch_loop():
+        def watch_loop_psutil():
             pid_to_rank = {pid: rank for rank, pid in enumerate(scheduler_pids)}
             while not self._fault_tolerance_watchdog_stop.wait(1.0):
                 for pid, rank in pid_to_rank.items():
@@ -2935,25 +2971,108 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         message = f"scheduler rank {rank} process exited"
                         logger.error("[FaultTolerance] %s pid=%s", message, pid)
                         self.fault_tolerance.record_fault(rank, message)
-                        if self.event_loop is not None:
-                            asyncio.run_coroutine_threadsafe(
-                                self._fault_tolerance_handle_process_exit(
-                                    rank, message
-                                ),
-                                self.event_loop,
-                            )
-                        else:
-                            logger.error(
-                                "[FaultTolerance] tokenizer event loop is unavailable"
-                            )
-                        continue
+                        self._fault_tolerance_watchdog_dispatch(rank, message)
 
         self._fault_tolerance_watchdog_thread = threading.Thread(
-            target=watch_loop,
+            target=watch_loop_psutil,
             daemon=True,
             name="fault-tolerance-watchdog",
         )
         self._fault_tolerance_watchdog_thread.start()
+
+    def _fault_tolerance_watchdog_start_sentinel(
+        self, scheduler_procs: List
+    ):
+        """DP=1: wait on mp.Process sentinels via connection.wait."""
+        from multiprocessing import connection
+
+        sentinel_map = {}
+        for rank, proc in enumerate(scheduler_procs):
+            if proc is not None:
+                sentinel_map[proc.sentinel] = rank
+
+        if not sentinel_map:
+            logger.warning(
+                "Fault tolerance watchdog: no valid scheduler process sentinels"
+            )
+            return
+
+
+        def watch_loop_sentinel():
+            while not self._fault_tolerance_watchdog_stop.is_set():
+                ready = connection.wait(
+                    list(sentinel_map.keys()), timeout=1.0
+                )
+                for sentinel in ready:
+                    rank = sentinel_map[sentinel]
+                    if self.fault_tolerance.status_response()["ranks"][rank][
+                        "state"
+                    ] == "dead":
+                        continue
+                    proc = scheduler_procs[rank]
+                    exitcode = proc.exitcode if proc else None
+                    message = (
+                        f"scheduler rank {rank} process exited with code "
+                        f"{exitcode}"
+                    )
+                    logger.error("[FaultTolerance] %s", message)
+                    self.fault_tolerance.record_fault(rank, message)
+                    self._fault_tolerance_watchdog_dispatch(rank, message)
+
+        self._fault_tolerance_watchdog_thread = threading.Thread(
+            target=watch_loop_sentinel,
+            daemon=True,
+            name="fault-tolerance-watchdog",
+        )
+        self._fault_tolerance_watchdog_thread.start()
+
+    def _fault_tolerance_watchdog_start_dpc_events(self, watchdog_reader):
+        """DP>1: read rank-death events from the DPC watchdog pipe."""
+
+        def watch_loop_dpc():
+            while not self._fault_tolerance_watchdog_stop.is_set():
+                if watchdog_reader.poll(1.0):
+                    try:
+                        event = watchdog_reader.recv()
+                    except EOFError:
+                        logger.warning(
+                            "Fault tolerance watchdog pipe closed by DPC"
+                        )
+                        break
+                    rank = event.get("rank")
+                    if rank is None:
+                        continue
+                    message = event.get(
+                        "message",
+                        f"scheduler rank {rank} process exited"
+                    )
+                    logger.error(
+                        "[FaultTolerance] DPC reported: %s (pid=%s exitcode=%s)",
+                        message,
+                        event.get("pid"),
+                        event.get("exitcode"),
+                    )
+                    self.fault_tolerance.record_fault(rank, message)
+                    self._fault_tolerance_watchdog_dispatch(rank, message)
+
+        self._fault_tolerance_watchdog_thread = threading.Thread(
+            target=watch_loop_dpc,
+            daemon=True,
+            name="fault-tolerance-watchdog",
+        )
+        self._fault_tolerance_watchdog_thread.start()
+
+    def _fault_tolerance_watchdog_dispatch(self, rank: int, message: str):
+        """Schedule the async process-exit handler on the tokenizer event loop."""
+        if self.event_loop is not None:
+            asyncio.run_coroutine_threadsafe(
+                self._fault_tolerance_handle_process_exit(rank, message),
+                self.event_loop,
+            )
+        else:
+            logger.error(
+                "[FaultTolerance] tokenizer event loop is unavailable"
+            )
 
     @staticmethod
     def _is_fault_tolerance_pid_dead(pid: int) -> bool:
