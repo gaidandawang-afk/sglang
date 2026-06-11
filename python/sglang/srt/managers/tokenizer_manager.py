@@ -2553,6 +2553,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             if inspect.isawaitable(send_result):
                 await send_result
+            # Wait for DPC to process the active-ranks update before
+            # the caller returns 200 and the next generate request
+            # could be routed to a dead rank.
+            await asyncio.sleep(1)
 
     def _handle_fault_tolerance_output(self, recv_obj: FaultToleranceCommandReqOutput):
         pending = self._fault_tolerance_pending_commands.get(recv_obj.request_id)
