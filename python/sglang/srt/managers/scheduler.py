@@ -1777,20 +1777,28 @@ class Scheduler(
                 control_reqs = None
 
             if self.attn_tp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_tp_group.rank,
-                    self.attn_tp_cpu_group,
-                    src=self.attn_tp_group.ranks[0],
-                )
+                try:
+                    work_reqs = broadcast_pyobj(
+                        work_reqs,
+                        self.attn_tp_group.rank,
+                        self.attn_tp_cpu_group,
+                        src=self.attn_tp_group.ranks[0],
+                    )
+                except Exception:
+                    if work_reqs is None:
+                        work_reqs = []
 
             if self.attn_cp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_cp_group.rank,
-                    self.attn_cp_cpu_group,
-                    src=self.attn_cp_group.ranks[0],
-                )
+                try:
+                    work_reqs = broadcast_pyobj(
+                        work_reqs,
+                        self.attn_cp_group.rank,
+                        self.attn_cp_cpu_group,
+                        src=self.attn_cp_group.ranks[0],
+                    )
+                except Exception:
+                    if work_reqs is None:
+                        work_reqs = []
 
             # When dp_attention_local_control_broadcast is enabled, each DP
             # group leader already receives control messages from the DP
@@ -1805,26 +1813,38 @@ class Scheduler(
                 control_reqs = []
             elif _local_ctrl:
                 if self.attn_tp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_tp_group.rank,
-                        self.attn_tp_cpu_group,
-                        src=self.attn_tp_group.ranks[0],
-                    )
+                    try:
+                        control_reqs = broadcast_pyobj(
+                            control_reqs,
+                            self.attn_tp_group.rank,
+                            self.attn_tp_cpu_group,
+                            src=self.attn_tp_group.ranks[0],
+                        )
+                    except Exception:
+                        if control_reqs is None:
+                            control_reqs = []
                 if self.attn_cp_size != 1:
+                    try:
+                        control_reqs = broadcast_pyobj(
+                            control_reqs,
+                            self.attn_cp_group.rank,
+                            self.attn_cp_cpu_group,
+                            src=self.attn_cp_group.ranks[0],
+                        )
+                    except Exception:
+                        if control_reqs is None:
+                            control_reqs = []
+            elif self.tp_size != 1:
+                try:
                     control_reqs = broadcast_pyobj(
                         control_reqs,
-                        self.attn_cp_group.rank,
-                        self.attn_cp_cpu_group,
-                        src=self.attn_cp_group.ranks[0],
+                        self.tp_group.rank,
+                        self.tp_cpu_group,
+                        src=self.tp_group.ranks[0],
                     )
-            elif self.tp_size != 1:
-                control_reqs = broadcast_pyobj(
-                    control_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
-                )
+                except Exception:
+                    if control_reqs is None:
+                        control_reqs = []
             recv_reqs = work_reqs + control_reqs
         elif self.tp_size != 1:
             recv_reqs = broadcast_pyobj(
