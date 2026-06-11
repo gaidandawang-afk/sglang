@@ -1565,17 +1565,11 @@ class Scheduler(
 
     def _fault_tolerance_parked_loop(self) -> None:
         while True:
-            recv_reqs = self._fault_tolerance_recv_direct_control_requests()
-            control_reqs = [
-                req
-                for req in recv_reqs
-                if isinstance(req, FaultToleranceCommandReqInput)
-            ]
-            self.process_input_requests(control_reqs)
+            if not self._fault_tolerance_poll_direct_control_when_paused():
+                time.sleep(0.01)
             if self._fault_tolerance_resume_event_loop:
                 self._fault_tolerance_resume_event_loop = False
                 return
-            time.sleep(0.01)
 
     def _fault_tolerance_recv_direct_control_requests(self) -> List[Any]:
         recv_reqs = []
@@ -1593,10 +1587,26 @@ class Scheduler(
                     break
         return recv_reqs
 
+    def _fault_tolerance_poll_direct_control_when_paused(self) -> bool:
+        if not (self.server_args.enable_fault_tolerance and self._engine_paused):
+            return False
+        recv_reqs = self._fault_tolerance_recv_direct_control_requests()
+        control_reqs = [
+            req
+            for req in recv_reqs
+            if isinstance(req, FaultToleranceCommandReqInput)
+        ]
+        self.process_input_requests(control_reqs)
+        time.sleep(0.01)
+        return True
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
+            if self._fault_tolerance_poll_direct_control_when_paused():
+                continue
+
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1634,6 +1644,9 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            if self._fault_tolerance_poll_direct_control_when_paused():
+                continue
+
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1800,14 +1813,47 @@ class Scheduler(
                     if work_reqs is None:
                         work_reqs = []
 
-            # When dp_attention_local_control_broadcast is enabled, each DP
-            # group leader already receives control messages from the DP
-            # controller, so we broadcast within attn_tp_group + attn_cp_group
-            # instead of the full tp_group.  This avoids an expensive
-            # all-ranks gloo sync.
-            _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
+            ft_control_reqs, control_reqs = (
+                self._split_fault_tolerance_control_reqs(control_reqs)
+            )
+            if self.attn_tp_size != 1:
+                try:
+                    ft_control_reqs = broadcast_pyobj(
+                        ft_control_reqs,
+                        self.attn_tp_group.rank,
+                        self.attn_tp_cpu_group,
+                        src=self.attn_tp_group.ranks[0],
+                    )
+                except Exception:
+                    if ft_control_reqs is None:
+                        ft_control_reqs = []
+            if self.attn_cp_size != 1:
+                try:
+                    ft_control_reqs = broadcast_pyobj(
+                        ft_control_reqs,
+                        self.attn_cp_group.rank,
+                        self.attn_cp_cpu_group,
+                        src=self.attn_cp_group.ranks[0],
+                    )
+                except Exception:
+                    if ft_control_reqs is None:
+                        ft_control_reqs = []
+
+            # FT commands are sent by the DPC to each active DP leader and are
+            # handled above with only local DP-attention broadcasts.  When FT is
+            # enabled, ordinary control messages also avoid the full tp_group:
+            # after a rank exits that group is not a safe control collective.
+            _local_ctrl = (
+                self.server_args.enable_dp_attention_local_control_broadcast
+                or self.server_args.enable_fault_tolerance
+            )
+            _ft_only_ctrl = bool(ft_control_reqs) and not control_reqs
             _sparse_idle_ctrl = (
-                self._fault_tolerance_sparse_active_mask and not control_reqs
+                _ft_only_ctrl
+                or (
+                    self._fault_tolerance_sparse_active_mask
+                    and not control_reqs
+                )
             )
             if _sparse_idle_ctrl:
                 control_reqs = []
@@ -1845,7 +1891,7 @@ class Scheduler(
                 except Exception:
                     if control_reqs is None:
                         control_reqs = []
-            recv_reqs = work_reqs + control_reqs
+            recv_reqs = work_reqs + ft_control_reqs + control_reqs
         elif self.tp_size != 1:
             recv_reqs = broadcast_pyobj(
                 recv_reqs,
@@ -1912,6 +1958,21 @@ class Scheduler(
             if not self._fault_tolerance_is_work_req(req)
         ]
         return work_reqs, control_reqs
+
+    def _split_fault_tolerance_control_reqs(self, control_reqs: Optional[List]):
+        if not control_reqs:
+            return [], []
+        ft_control_reqs = [
+            req
+            for req in control_reqs
+            if isinstance(req, FaultToleranceCommandReqInput)
+        ]
+        other_control_reqs = [
+            req
+            for req in control_reqs
+            if not isinstance(req, FaultToleranceCommandReqInput)
+        ]
+        return ft_control_reqs, other_control_reqs
 
     def _fault_tolerance_is_work_req(self, req: Any) -> bool:
         return isinstance(
@@ -3836,13 +3897,34 @@ class Scheduler(
     ) -> FaultToleranceCommandReqOutput:
         rank = self.dp_rank if self.dp_rank is not None else 0
         command = recv_req.command
+        logger.info(
+            "[FaultTolerance] scheduler received command=%s request_id=%s rank=%s "
+            "target=%s active=%s paused=%s",
+            command,
+            recv_req.request_id,
+            rank,
+            recv_req.target_ranks,
+            recv_req.active_ranks,
+            self._engine_paused,
+        )
 
         try:
             if command == "prepare_retry":
+                if recv_req.params.get("apply_active_mask_before_prepare", False):
+                    self._fault_tolerance_apply_sparse_active_mask(recv_req)
                 if recv_req.params.get("lightweight", False):
-                    self._fault_tolerance_prepare_retry(lightweight=True)
+                    self._fault_tolerance_prepare_retry(
+                        lightweight=True,
+                        skip_device_synchronize=recv_req.params.get(
+                            "skip_device_synchronize", False
+                        ),
+                    )
                 else:
-                    self._fault_tolerance_prepare_retry()
+                    self._fault_tolerance_prepare_retry(
+                        skip_device_synchronize=recv_req.params.get(
+                            "skip_device_synchronize", False
+                        )
+                    )
                 return FaultToleranceCommandReqOutput(
                     request_id=recv_req.request_id,
                     rank=rank,
@@ -3891,6 +3973,14 @@ class Scheduler(
                     message="sparse idle control updated",
                 )
 
+            if command == "sync_active_ranks":
+                return FaultToleranceCommandReqOutput(
+                    request_id=recv_req.request_id,
+                    rank=rank,
+                    success=True,
+                    message="active ranks synchronized",
+                )
+
             if command == "resume":
                 if rank in recv_req.active_ranks:
                     self._engine_paused = False
@@ -3917,18 +4007,44 @@ class Scheduler(
                 message=str(exc),
             )
 
-    def _fault_tolerance_prepare_retry(self, lightweight: bool = False):
+    def _fault_tolerance_prepare_retry(
+        self,
+        lightweight: bool = False,
+        skip_device_synchronize: bool = False,
+    ):
         self._engine_paused = True
         self._fault_tolerance_cleanup_runtime_state()
         if lightweight:
             # Lightweight retry: only accelerator synchronize, no CUDA graph invalidation.
-            device = self.tp_worker.model_runner.device
-            if device != "cpu":
-                import contextlib
-                with contextlib.suppress(Exception):
-                    torch.get_device_module(device).synchronize()
+            if not skip_device_synchronize:
+                device = self.tp_worker.model_runner.device
+                if device != "cpu":
+                    import contextlib
+                    with contextlib.suppress(Exception):
+                        torch.get_device_module(device).synchronize()
         else:
-            self.tp_worker.model_runner.fault_tolerance_prepare_reinit()
+            model_runner = self.tp_worker.model_runner
+            if skip_device_synchronize:
+                model_runner.fault_tolerance_invalidate_cuda_graphs()
+            else:
+                model_runner.fault_tolerance_prepare_reinit()
+
+    def _fault_tolerance_apply_sparse_active_mask(
+        self, recv_req: FaultToleranceCommandReqInput
+    ) -> bool:
+        active_ranks = sorted(set(recv_req.active_ranks))
+        full_active = list(range(self.dp_size))
+        if not active_ranks or active_ranks == full_active:
+            self._fault_tolerance_sparse_active_mask = False
+            return False
+
+        from sglang.srt.elastic_ep.elastic_ep import apply_active_rank_mask
+
+        active_set = set(active_ranks)
+        active_mask = [rank in active_set for rank in range(self.dp_size)]
+        apply_active_rank_mask(active_mask)
+        self._fault_tolerance_sparse_active_mask = True
+        return True
 
     def _fault_tolerance_active_reqs(self):
         reqs = []
@@ -4039,14 +4155,7 @@ class Scheduler(
     def _fault_tolerance_apply_or_reinit(
         self, recv_req: FaultToleranceCommandReqInput
     ):
-        active_ranks = sorted(set(recv_req.active_ranks))
-        full_active = list(range(self.dp_size))
-        if active_ranks and active_ranks != full_active:
-            from sglang.srt.elastic_ep.elastic_ep import apply_active_rank_mask
-
-            active_set = set(active_ranks)
-            active_mask = [rank in active_set for rank in range(self.dp_size)]
-            apply_active_rank_mask(active_mask)
+        if self._fault_tolerance_apply_sparse_active_mask(recv_req):
             return
 
         model_runner = self.tp_worker.model_runner

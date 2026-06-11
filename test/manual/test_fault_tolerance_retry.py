@@ -177,6 +177,49 @@ class TestLightweightCleanupMock:
         )
 
 
+class TestScaleDownRecoveryMock:
+    """Verify scale_down recovery is ordered and does not use fire-and-forget masks."""
+
+    @pytest.mark.asyncio
+    async def test_sparse_scale_down_prepares_mask_before_skipping_sync(self):
+        from sglang.srt.managers.tokenizer_manager import TokenizerManager
+
+        tm = mock.AsyncMock(spec=TokenizerManager)
+        tm.server_args = mock.Mock()
+        tm.server_args.dp_size = 4
+
+        sent = []
+
+        async def fake_send_command(command, **kwargs):
+            sent.append((command, kwargs))
+
+        tm._fault_tolerance_send_command = fake_send_command
+
+        real_method = TokenizerManager._fault_tolerance_run_recovery_sequence
+        await real_method(
+            tm,
+            active_ranks=[0, 2, 3],
+            isolated_ranks=[1],
+            timeout_sec=180,
+            params={"ranks": [1]},
+        )
+
+        assert [command for command, _ in sent] == [
+            "prepare_retry",
+            "reinit",
+            "health_check",
+            "resume",
+            "set_sparse_idle_control",
+        ]
+        assert all("wait" not in kwargs for _, kwargs in sent[:4])
+        assert sent[-1][1]["wait"] is False
+
+        params = sent[0][1]["params"]
+        assert params["apply_active_mask_before_prepare"] is True
+        assert params["skip_device_synchronize"] is True
+        assert sent[-1][1]["params"] == {"enabled": True}
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

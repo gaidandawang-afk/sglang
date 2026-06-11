@@ -245,11 +245,15 @@ class DataParallelController:
             # When local control broadcast is enabled, send control messages to
             # every DP group leader (attn_tp_rank=0) so each leader broadcasts
             # within its own attn_tp_group instead of the full tp_group.
-            # Otherwise fall back to the original behaviour: send to only the
-            # first leader, which then broadcasts over the full tp_group.
+            # Fault tolerance also uses local control broadcast: once a rank is
+            # dead, the full tp_group is no longer a safe control-plane
+            # collective.
             self.control_message_step = (
                 1
-                if server_args.enable_dp_attention_local_control_broadcast
+                if (
+                    server_args.enable_dp_attention_local_control_broadcast
+                    or server_args.enable_fault_tolerance
+                )
                 else server_args.tp_size
             )
         else:
@@ -275,26 +279,39 @@ class DataParallelController:
 
     def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
         if obj.command in ("isolate", "apply_active_mask"):
-            # Only send to active ranks.  target_ranks are the ranks being
-            # killed; their ZMQ sockets accumulate buffered sends and
-            # eventually block the DPC event loop.
+            # The FT manager has already moved target/isolated ranks out of
+            # active_ranks. Do not also filter through DPC self.status here:
+            # status is updated asynchronously and can lag the authoritative
+            # FT state, dropping required control messages during scale_down.
             recipients = {
                 rank
                 for rank in obj.active_ranks
-                if 0 <= rank < len(self.status) and self.status[rank]
+                if 0 <= rank < len(self.workers)
             }
         else:
             recipients = set(obj.target_ranks)
         recipients = sorted(
             rank for rank in recipients if 0 <= rank < len(self.workers)
         )
+        logger.info(
+            "[FaultTolerance] DPC forward command=%s request_id=%s recipients=%s "
+            "target=%s active=%s status=%s",
+            obj.command,
+            obj.request_id,
+            recipients,
+            obj.target_ranks,
+            obj.active_ranks,
+            self.status,
+        )
         for rank in recipients:
             self.workers[rank].send_pyobj(obj)
 
     def send_control_message(self, obj):
         # Send control messages to first worker of tp group
-        for worker in self.workers[:: self.control_message_step]:
-            worker.send_pyobj(obj)
+        for rank in range(0, len(self.workers), self.control_message_step):
+            if self.server_args.enable_fault_tolerance and not self.status[rank]:
+                continue
+            self.workers[rank].send_pyobj(obj)
 
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)

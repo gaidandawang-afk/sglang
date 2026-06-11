@@ -2546,13 +2546,43 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
         self.send_to_scheduler.send_pyobj(ranks)
 
-    async def _fault_tolerance_update_dp_routing(self):
+    async def _fault_tolerance_update_dp_routing(
+        self,
+        *,
+        wait: bool = False,
+        active_ranks: Optional[List[int]] = None,
+        timeout_sec: Optional[int] = None,
+    ):
         if self.server_args.dp_size > 1:
+            active_mask = self.fault_tolerance.active_mask()
             send_result = self.send_to_scheduler.send_pyobj(
-                ActiveRanksOutput(status=self.fault_tolerance.active_mask())
+                ActiveRanksOutput(status=active_mask)
             )
             if inspect.isawaitable(send_result):
                 await send_result
+            if wait:
+                active_ranks = (
+                    active_ranks
+                    if active_ranks is not None
+                    else [
+                        rank
+                        for rank, is_active in enumerate(active_mask)
+                        if is_active
+                    ]
+                )
+                if active_ranks:
+                    await self._fault_tolerance_send_command(
+                        "sync_active_ranks",
+                        target_ranks=active_ranks,
+                        active_ranks=active_ranks,
+                        isolated_ranks=[
+                            rank
+                            for rank, is_active in enumerate(active_mask)
+                            if not is_active
+                        ],
+                        timeout_sec=timeout_sec,
+                        params={"active_mask": active_mask},
+                    )
 
     def _handle_fault_tolerance_output(self, recv_obj: FaultToleranceCommandReqOutput):
         pending = self._fault_tolerance_pending_commands.get(recv_obj.request_id)
@@ -2635,6 +2665,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             timeout_sec=timeout_sec,
             params=params or {},
         )
+        logger.info(
+            "[FaultTolerance] send command=%s request_id=%s target=%s active=%s "
+            "isolated=%s wait=%s timeout=%s",
+            command,
+            request_id,
+            req.target_ranks,
+            active_ranks,
+            isolated_ranks,
+            wait,
+            timeout_sec,
+        )
 
         if wait:
             self._fault_tolerance_pending_commands[request_id] = (
@@ -2648,11 +2689,42 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             send_result = self.send_to_scheduler.send_pyobj(req)
             if inspect.isawaitable(send_result):
                 await send_result
+            logger.info(
+                "[FaultTolerance] dispatched command=%s request_id=%s",
+                command,
+                request_id,
+            )
             if not wait:
                 return []
-            outputs = await asyncio.wait_for(
-                self._fault_tolerance_pending_commands[request_id].future,
-                timeout=timeout_sec,
+            try:
+                outputs = await asyncio.wait_for(
+                    self._fault_tolerance_pending_commands[request_id].future,
+                    timeout=timeout_sec,
+                )
+            except asyncio.TimeoutError:
+                pending = self._fault_tolerance_pending_commands.get(request_id)
+                received = (
+                    sorted(pending.outputs)
+                    if pending is not None
+                    else []
+                )
+                logger.error(
+                    "[FaultTolerance] command timeout command=%s request_id=%s "
+                    "expected=%s received=%s",
+                    command,
+                    request_id,
+                    sorted(expected_ranks),
+                    received,
+                )
+                raise
+            logger.info(
+                "[FaultTolerance] done command=%s request_id=%s outputs=%s",
+                command,
+                request_id,
+                [
+                    (output.rank, output.success, output.message)
+                    for output in outputs
+                ],
             )
             failed = [output for output in outputs if not output.success]
             if failed:
@@ -2696,6 +2768,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         timeout_sec: int,
         params: Optional[Dict[str, Any]] = None,
     ):
+        command_params = dict(params or {})
+        if len(active_ranks) < self.server_args.dp_size:
+            command_params["apply_active_mask_before_prepare"] = True
+            command_params["skip_device_synchronize"] = True
+
         for command in ("prepare_retry", "reinit", "health_check", "resume"):
             await self._fault_tolerance_send_command(
                 command,
@@ -2703,7 +2780,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 active_ranks=active_ranks,
                 isolated_ranks=isolated_ranks,
                 timeout_sec=timeout_sec,
-                params=params or {},
+                params=command_params,
             )
         await self._fault_tolerance_send_command(
             "set_sparse_idle_control",
@@ -2711,7 +2788,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             active_ranks=active_ranks,
             isolated_ranks=isolated_ranks,
             timeout_sec=timeout_sec,
-            params={"enabled": len(active_ranks) <= self.server_args.dp_size - 2},
+            params={"enabled": len(active_ranks) < self.server_args.dp_size},
             wait=False,
         )
 
@@ -2739,33 +2816,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             return code, begin_result
 
-        self._fault_tolerance_abort_all_local_requests(
-            "SGLang engine is recovering by fault tolerance."
-        )
         active_ranks = self.fault_tolerance.active_ranks()
         isolated_ranks = [
             item["rank"] for item in begin_result["ranks"] if item["state"] == "dead"
         ]
         try:
-            await self._fault_tolerance_send_command(
-                "isolate",
-                target_ranks=ranks,
-                active_ranks=active_ranks,
-                isolated_ranks=isolated_ranks,
-                timeout_sec=timeout_sec,
-                params=params,
-                wait=False,
-            )
-            await self._fault_tolerance_send_command(
-                "apply_active_mask",
-                target_ranks=ranks,
-                active_ranks=active_ranks,
-                isolated_ranks=isolated_ranks,
-                timeout_sec=timeout_sec,
-                params=params,
-                wait=False,
-            )
             await self._fault_tolerance_update_dp_routing()
+            self._fault_tolerance_abort_all_local_requests(
+                "SGLang engine is recovering by fault tolerance."
+            )
             await self._fault_tolerance_run_recovery_sequence(
                 active_ranks=active_ranks,
                 isolated_ranks=isolated_ranks,
@@ -2779,7 +2838,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             os._exit(1)
 
         result = self.fault_tolerance.commit_scale_down()
-        await self._fault_tolerance_update_dp_routing()
+        await self._fault_tolerance_update_dp_routing(
+            wait=True,
+            active_ranks=self.fault_tolerance.active_ranks(),
+            timeout_sec=timeout_sec,
+        )
         await self._fault_tolerance_continue_local_generation()
         return 200, result
 
@@ -2798,8 +2861,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     async def _fault_tolerance_handle_process_exit(self, rank: int, message: str):
-        self._fault_tolerance_abort_all_local_requests(message)
         await self._fault_tolerance_update_dp_routing()
+        self._fault_tolerance_abort_all_local_requests(message)
         if (
             self.server_args.fault_tolerance_on_error_strategy == "continue"
             and self.fault_tolerance.is_mooncake_backend
@@ -2883,7 +2946,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 os._exit(1)
 
             result = self.fault_tolerance.apply_retry()
-            await self._fault_tolerance_update_dp_routing()
+            await self._fault_tolerance_update_dp_routing(
+                wait=True,
+                active_ranks=self.fault_tolerance.active_ranks(),
+                timeout_sec=int(timeout),
+            )
             await self._fault_tolerance_continue_local_generation()
             return 200 if result["success"] else 500, result
 
