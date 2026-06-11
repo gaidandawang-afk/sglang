@@ -275,9 +275,12 @@ class DataParallelController:
 
     def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
         if obj.command in ("isolate", "apply_active_mask"):
-            recipients = set(obj.active_ranks) | {
+            # Only send to active ranks.  target_ranks are the ranks being
+            # killed; their ZMQ sockets accumulate buffered sends and
+            # eventually block the DPC event loop.
+            recipients = {
                 rank
-                for rank in obj.target_ranks
+                for rank in obj.active_ranks
                 if 0 <= rank < len(self.status) and self.status[rank]
             }
         else:
