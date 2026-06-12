@@ -8,6 +8,7 @@ Covers Commit 1 of the FT Retry / Watchdog fix plan:
 - retry cleanup exception triggers fail-stop
 """
 
+import asyncio
 import os
 import sys
 from unittest import mock
@@ -220,7 +221,119 @@ class TestScaleDownRecoveryMock:
         assert sent[-1][1]["params"] == {"enabled": True}
 
 
+class TestFinalResponseBarrierMock:
+    """Verify Mooncake FT responses park schedulers before returning."""
+
+    @pytest.mark.asyncio
+    async def test_degraded_mooncake_parks_after_final_response(self):
+        from sglang.srt.managers.tokenizer_manager import TokenizerManager
+
+        mgr = make_manager()
+        mgr.begin_scale_down([1])
+        mgr.commit_scale_down()
+
+        tm = mock.AsyncMock(spec=TokenizerManager)
+        tm.fault_tolerance = mgr
+        tm.server_args = mock.Mock()
+        tm.server_args.enable_fault_tolerance = True
+        tm.server_args.dp_size = 4
+        tm.server_args.fault_tolerance_recovery_timeout_sec = 300
+        tm._fault_tolerance_schedulers_parked = False
+        tm._fault_tolerance_scheduler_park_lock = asyncio.Lock()
+
+        sent = []
+
+        async def fake_send_command(command, **kwargs):
+            sent.append((command, kwargs))
+            return []
+
+        tm._fault_tolerance_send_command = fake_send_command
+        obj = mock.Mock()
+        obj.rid = "rid-response-barrier"
+
+        real_method = TokenizerManager._fault_tolerance_barrier_before_final_response
+        await real_method(tm, obj, is_stream=False)
+
+        assert [command for command, _ in sent] == ["park_idle"]
+        kwargs = sent[0][1]
+        assert kwargs["target_ranks"] == [0, 2, 3]
+        assert kwargs["active_ranks"] == [0, 2, 3]
+        assert kwargs["timeout_sec"] == 300
+        assert kwargs["params"] == {"reason": "final_response"}
+        assert tm._fault_tolerance_schedulers_parked is True
+
+    @pytest.mark.asyncio
+    async def test_degraded_mooncake_resumes_before_next_request(self):
+        from sglang.srt.managers.tokenizer_manager import TokenizerManager
+
+        mgr = make_manager()
+        mgr.begin_scale_down([1])
+        mgr.commit_scale_down()
+
+        tm = mock.AsyncMock(spec=TokenizerManager)
+        tm.fault_tolerance = mgr
+        tm.server_args = mock.Mock()
+        tm.server_args.enable_fault_tolerance = True
+        tm.server_args.dp_size = 4
+        tm.server_args.fault_tolerance_recovery_timeout_sec = 300
+        tm._fault_tolerance_schedulers_parked = True
+        tm._fault_tolerance_scheduler_park_lock = asyncio.Lock()
+
+        sent = []
+
+        async def fake_send_command(command, **kwargs):
+            sent.append((command, kwargs))
+            return []
+
+        tm._fault_tolerance_send_command = fake_send_command
+        obj = mock.Mock()
+        obj.rid = "rid-resume-parked"
+
+        real_method = (
+            TokenizerManager._fault_tolerance_resume_parked_schedulers_before_request
+        )
+        await real_method(tm, obj)
+
+        assert [command for command, _ in sent] == ["resume"]
+        kwargs = sent[0][1]
+        assert kwargs["target_ranks"] == [0, 2, 3]
+        assert kwargs["active_ranks"] == [0, 2, 3]
+        assert kwargs["timeout_sec"] == 300
+        assert kwargs["params"] == {"reason": "before_request"}
+        assert tm._fault_tolerance_schedulers_parked is False
+
+    @pytest.mark.asyncio
+    async def test_full_mooncake_cluster_parks_after_final_response(self):
+        from sglang.srt.managers.tokenizer_manager import TokenizerManager
+
+        tm = mock.AsyncMock(spec=TokenizerManager)
+        tm.fault_tolerance = make_manager()
+        tm.server_args = mock.Mock()
+        tm.server_args.enable_fault_tolerance = True
+        tm.server_args.dp_size = 4
+        tm.server_args.fault_tolerance_recovery_timeout_sec = 300
+        tm._fault_tolerance_schedulers_parked = False
+        tm._fault_tolerance_scheduler_park_lock = asyncio.Lock()
+        tm._fault_tolerance_send_command = mock.AsyncMock(return_value=[])
+
+        obj = mock.Mock()
+        obj.rid = "rid-no-barrier"
+
+        real_method = TokenizerManager._fault_tolerance_barrier_before_final_response
+        await real_method(tm, obj, is_stream=False)
+
+        tm._fault_tolerance_send_command.assert_awaited_once_with(
+            "park_idle",
+            target_ranks=[0, 1, 2, 3],
+            active_ranks=[0, 1, 2, 3],
+            timeout_sec=300,
+            params={"reason": "final_response"},
+        )
+        assert tm._fault_tolerance_schedulers_parked is True
+
+
 if __name__ == "__main__":
     import sys
+
     sys.exit(pytest.main([__file__, "-v"]))
 

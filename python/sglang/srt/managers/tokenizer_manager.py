@@ -412,6 +412,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             str, FaultTolerancePendingCommand
         ] = {}
         self._fault_tolerance_recoverable_pause_task: Optional[asyncio.Future] = None
+        self._fault_tolerance_schedulers_parked = False
+        self._fault_tolerance_scheduler_park_lock = asyncio.Lock()
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
@@ -582,6 +584,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 status_code=503,
                 detail=self.fault_tolerance.unavailable_error(),
             )
+
+        await self._fault_tolerance_resume_parked_schedulers_before_request(obj)
 
         self._init_req_state(obj, request)
         if self.server_args.language_only:
@@ -1405,6 +1409,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         yield abort_out
                         break
 
+                await self._fault_tolerance_barrier_before_final_response(
+                    obj, is_stream=is_stream
+                )
                 yield out
                 break
 
@@ -2584,6 +2591,118 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         params={"active_mask": active_mask},
                     )
 
+    def _fault_tolerance_should_barrier_mooncake_response(self) -> bool:
+        if (
+            not self.server_args.enable_fault_tolerance
+            or self.server_args.dp_size <= 1
+            or not self.fault_tolerance.is_mooncake_backend
+        ):
+            return False
+        return True
+
+    def _fault_tolerance_should_park_schedulers(self) -> bool:
+        return self._fault_tolerance_should_barrier_mooncake_response()
+
+    async def _fault_tolerance_resume_parked_schedulers_before_request(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        if not self._fault_tolerance_should_park_schedulers():
+            return
+
+        async with self._fault_tolerance_scheduler_park_lock:
+            if not self._fault_tolerance_schedulers_parked:
+                return
+
+            active_ranks = self.fault_tolerance.active_ranks()
+            logger.info(
+                "[FaultTolerance] resume parked schedulers before request rid=%s "
+                "active=%s",
+                getattr(obj, "rid", None),
+                active_ranks,
+            )
+            await self._fault_tolerance_send_command(
+                "resume",
+                target_ranks=active_ranks,
+                active_ranks=active_ranks,
+                timeout_sec=self.server_args.fault_tolerance_recovery_timeout_sec,
+                params={"reason": "before_request"},
+            )
+            self._fault_tolerance_schedulers_parked = False
+
+    async def _fault_tolerance_park_active_schedulers(
+        self,
+        *,
+        reason: str,
+        obj: Optional[Union[GenerateReqInput, EmbeddingReqInput]] = None,
+        is_stream: bool = False,
+    ) -> None:
+        """Keep Mooncake schedulers out of idle collectives between requests."""
+        if not self._fault_tolerance_should_park_schedulers():
+            return
+
+        async with self._fault_tolerance_scheduler_park_lock:
+            if self._fault_tolerance_schedulers_parked:
+                return
+
+            active_ranks = self.fault_tolerance.active_ranks()
+            if not active_ranks:
+                return
+
+            try:
+                logger.info(
+                    "[FaultTolerance] park active schedulers start reason=%s "
+                    "rid=%s active=%s",
+                    reason,
+                    getattr(obj, "rid", None),
+                    active_ranks,
+                )
+                await self._fault_tolerance_send_command(
+                    "park_idle",
+                    target_ranks=active_ranks,
+                    active_ranks=active_ranks,
+                    timeout_sec=self.server_args.fault_tolerance_recovery_timeout_sec,
+                    params={"reason": reason},
+                )
+                self._fault_tolerance_schedulers_parked = True
+                logger.info(
+                    "[FaultTolerance] park active schedulers done reason=%s "
+                    "rid=%s active=%s",
+                    reason,
+                    getattr(obj, "rid", None),
+                    active_ranks,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "[FaultTolerance] park active schedulers failed reason=%s "
+                    "rid=%s",
+                    reason,
+                    getattr(obj, "rid", None),
+                )
+                if not is_stream:
+                    raise fastapi.HTTPException(
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                        detail=(
+                            "SGLang engine failed to park active "
+                            f"fault-tolerance schedulers: {exc}"
+                        ),
+                    ) from exc
+
+    async def _fault_tolerance_barrier_before_final_response(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        *,
+        is_stream: bool,
+    ) -> None:
+        if (
+            not self._fault_tolerance_should_barrier_mooncake_response()
+            or is_health_check_generate_req(obj)
+        ):
+            return
+
+        await self._fault_tolerance_park_active_schedulers(
+            reason="final_response", obj=obj, is_stream=is_stream
+        )
+
     def _handle_fault_tolerance_output(self, recv_obj: FaultToleranceCommandReqOutput):
         pending = self._fault_tolerance_pending_commands.get(recv_obj.request_id)
         if pending is not None and not pending.future.done():
@@ -2759,6 +2878,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             timeout_sec=timeout_sec,
             params=cleanup_params,
         )
+        self._fault_tolerance_schedulers_parked = False
 
     async def _fault_tolerance_run_recovery_sequence(
         self,
@@ -2782,6 +2902,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 timeout_sec=timeout_sec,
                 params=command_params,
             )
+        self._fault_tolerance_schedulers_parked = False
         await self._fault_tolerance_send_command(
             "set_sparse_idle_control",
             target_ranks=active_ranks,
@@ -2844,6 +2965,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             timeout_sec=timeout_sec,
         )
         await self._fault_tolerance_continue_local_generation()
+        try:
+            await self._fault_tolerance_park_active_schedulers(reason="scale_down")
+        except Exception:
+            logger.exception(
+                "[FaultTolerance] scale_down parking failed; triggering fail-stop"
+            )
+            os._exit(1)
         return 200, result
 
     async def _fault_tolerance_auto_scale_down(self, rank: int, message: str):

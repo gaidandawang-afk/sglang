@@ -33,6 +33,7 @@ class MLPSyncBatchInfo:
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
+    fault_tolerance_park_requested: bool = False
 
     # some gathered elements
     tp0_info: torch.Tensor = None
@@ -40,6 +41,7 @@ class MLPSyncBatchInfo:
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
+    all_active_park_requested: bool = False
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
@@ -51,6 +53,7 @@ class MLPSyncBatchInfo:
                 int(self.is_extend_in_batch),
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
+                int(self.fault_tolerance_park_requested),
             ],
             device=device,
             dtype=dtype,
@@ -65,6 +68,7 @@ class MLPSyncBatchInfo:
                 0,  # is_extend_in_batch
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
+                0,  # fault_tolerance_park_requested
             ],
             device=device,
             dtype=dtype,
@@ -73,7 +77,7 @@ class MLPSyncBatchInfo:
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 6),
+            (self.dp_size, self.tp_size * self.cp_size, 7),
             dtype=torch.int64,
             device=device,
         )
@@ -89,7 +93,7 @@ class MLPSyncBatchInfo:
             tp_active_ranks = get_tp_group().active_ranks
 
         # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 6)
+        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 7)
         tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
 
         tp0_info = global_info_tensor[:, 0, :]
@@ -100,6 +104,14 @@ class MLPSyncBatchInfo:
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
+        active_dp_ranks = tp_active_ranks.view(
+            self.dp_size, self.tp_size * self.cp_size
+        )[:, 0].bool()
+        park_requested = tp0_info[:, 6].bool()
+        self.all_active_park_requested = bool(
+            active_dp_ranks.any().item()
+            and park_requested[active_dp_ranks].all().item()
+        )
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
 
@@ -139,6 +151,7 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    fault_tolerance_park_requested: bool = False,
 ):
     # Check if other DP workers have running batches
     if local_batch is None or local_batch.forward_mode.is_prebuilt():
@@ -196,6 +209,7 @@ def prepare_mlp_sync_batch_raw(
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
+        fault_tolerance_park_requested=fault_tolerance_park_requested,
     )
 
     if not skip_all_gather:
@@ -207,7 +221,11 @@ def prepare_mlp_sync_batch_raw(
             )
         )
 
-    need_idle_batch = skip_all_gather or max(mlp_sync_info.global_num_tokens) > 0
+    need_idle_batch = (
+        skip_all_gather
+        or max(mlp_sync_info.global_num_tokens) > 0
+        or mlp_sync_info.all_active_park_requested
+    )
     if need_idle_batch:
         batch_to_gather = local_batch
         if local_batch is None:
@@ -218,6 +236,9 @@ def prepare_mlp_sync_batch_raw(
         _update_gather_batch(
             batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
         )
+        batch_to_gather.fault_tolerance_all_park_requested = (
+            mlp_sync_info.all_active_park_requested
+        )
 
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
         local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info
@@ -227,7 +248,7 @@ def prepare_mlp_sync_batch_raw(
 
 class SchedulerDPAttnMixin:
     def prepare_mlp_sync_batch(self: Scheduler, local_batch: ScheduleBatch):
-        return prepare_mlp_sync_batch_raw(
+        batch = prepare_mlp_sync_batch_raw(
             local_batch,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.attn_tp_size,
@@ -238,7 +259,13 @@ class SchedulerDPAttnMixin:
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
+            fault_tolerance_park_requested=getattr(
+                self, "_fault_tolerance_park_requested", False
+            ),
         )
+        if getattr(batch, "fault_tolerance_all_park_requested", False):
+            self._fault_tolerance_park_after_batch = True
+        return batch
 
     def maybe_prepare_mlp_sync_batch(
         self: Scheduler,

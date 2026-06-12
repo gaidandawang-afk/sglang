@@ -1068,6 +1068,11 @@ class Scheduler(
         self._engine_paused = False
         self._fault_tolerance_resume_event_loop = False
         self._fault_tolerance_sparse_active_mask = False
+        self._fault_tolerance_park_requested = False
+        self._fault_tolerance_park_after_batch = False
+        self._fault_tolerance_pending_park_req: Optional[
+            FaultToleranceCommandReqInput
+        ] = None
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1678,6 +1683,9 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
 
+            if self._fault_tolerance_finish_deferred_park_if_ready():
+                continue
+
             # Update last_batch
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
@@ -1734,6 +1742,9 @@ class Scheduler(
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result)
+
+            if self._fault_tolerance_finish_deferred_park_if_ready():
+                continue
 
             # Update last_batch
             self.last_batch = batch
@@ -3948,7 +3959,7 @@ class Scheduler(
 
     def handle_fault_tolerance_command(
         self, recv_req: FaultToleranceCommandReqInput
-    ) -> FaultToleranceCommandReqOutput:
+    ) -> Optional[FaultToleranceCommandReqOutput]:
         rank = self.dp_rank if self.dp_rank is not None else 0
         command = recv_req.command
         logger.info(
@@ -4027,7 +4038,26 @@ class Scheduler(
                     message="sparse idle control updated",
                 )
 
+            if command == "park_idle":
+                if rank in recv_req.active_ranks:
+                    self._fault_tolerance_response_barrier_cleanup(rank)
+                    if self.require_mlp_sync:
+                        self._fault_tolerance_park_requested = True
+                        self._fault_tolerance_pending_park_req = recv_req
+                        return None
+                    else:
+                        self._engine_paused = True
+                        self._fault_tolerance_resume_event_loop = False
+                return FaultToleranceCommandReqOutput(
+                    request_id=recv_req.request_id,
+                    rank=rank,
+                    success=True,
+                    message="parked idle",
+                )
+
             if command == "sync_active_ranks":
+                if recv_req.params.get("response_barrier", False):
+                    self._fault_tolerance_response_barrier_cleanup(rank)
                 return FaultToleranceCommandReqOutput(
                     request_id=recv_req.request_id,
                     rank=rank,
@@ -4037,6 +4067,9 @@ class Scheduler(
 
             if command == "resume":
                 if rank in recv_req.active_ranks:
+                    self._fault_tolerance_park_requested = False
+                    self._fault_tolerance_park_after_batch = False
+                    self._fault_tolerance_pending_park_req = None
                     self._engine_paused = False
                     self._fault_tolerance_resume_event_loop = True
                 return FaultToleranceCommandReqOutput(
@@ -4060,6 +4093,71 @@ class Scheduler(
                 success=False,
                 message=str(exc),
             )
+
+    def _fault_tolerance_response_barrier_cleanup(self, rank: int) -> None:
+        """Drop finished request state before acknowledging a response barrier."""
+
+        def batch_size(batch: Optional[ScheduleBatch]) -> int:
+            return len(getattr(batch, "reqs", []) or []) if batch is not None else 0
+
+        before = {
+            "running": batch_size(self.running_batch),
+            "last": batch_size(self.last_batch),
+            "cur": batch_size(self.cur_batch),
+            "waiting": len(self.waiting_queue),
+        }
+        seen_batches = set()
+        for batch in (self.running_batch, self.last_batch, self.cur_batch):
+            if batch is None or id(batch) in seen_batches:
+                continue
+            seen_batches.add(id(batch))
+            batch.filter_batch(v1_spec_info_filtered=True)
+            if batch.is_empty():
+                batch.batch_is_full = False
+
+        after = {
+            "running": batch_size(self.running_batch),
+            "last": batch_size(self.last_batch),
+            "cur": batch_size(self.cur_batch),
+            "waiting": len(self.waiting_queue),
+        }
+        logger.info(
+            "[FaultTolerance] response barrier cleanup rank=%s before=%s after=%s "
+            "fully_idle=%s",
+            rank,
+            before,
+            after,
+            self.is_fully_idle(),
+        )
+
+    def _fault_tolerance_finish_deferred_park_if_ready(self) -> bool:
+        if not self._fault_tolerance_park_after_batch:
+            return False
+
+        rank = self.dp_rank if self.dp_rank is not None else 0
+        pending_req = self._fault_tolerance_pending_park_req
+        self._fault_tolerance_park_requested = False
+        self._fault_tolerance_park_after_batch = False
+        self._fault_tolerance_pending_park_req = None
+        self._engine_paused = True
+        self._fault_tolerance_resume_event_loop = False
+
+        logger.info(
+            "[FaultTolerance] scheduler deferred park complete rank=%s req=%s",
+            rank,
+            getattr(pending_req, "request_id", None),
+        )
+        if pending_req is not None:
+            self.send_to_tokenizer.send_output(
+                FaultToleranceCommandReqOutput(
+                    request_id=pending_req.request_id,
+                    rank=rank,
+                    success=True,
+                    message="parked idle",
+                ),
+                pending_req,
+            )
+        return True
 
     def _fault_tolerance_prepare_retry(
         self,
