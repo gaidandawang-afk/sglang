@@ -304,7 +304,35 @@ class DataParallelController:
             self.status,
         )
         for rank in recipients:
-            self.workers[rank].send_pyobj(obj)
+            send_start = time.monotonic()
+            logger.info(
+                "[FaultTolerance] DPC send_begin command=%s request_id=%s "
+                "rank=%s status=%s",
+                obj.command,
+                obj.request_id,
+                rank,
+                self.status,
+            )
+            try:
+                self.workers[rank].send_pyobj(obj)
+            except Exception:
+                logger.exception(
+                    "[FaultTolerance] DPC send_error command=%s request_id=%s "
+                    "rank=%s elapsed_ms=%.3f",
+                    obj.command,
+                    obj.request_id,
+                    rank,
+                    (time.monotonic() - send_start) * 1000,
+                )
+                raise
+            logger.info(
+                "[FaultTolerance] DPC send_done command=%s request_id=%s "
+                "rank=%s elapsed_ms=%.3f",
+                obj.command,
+                obj.request_id,
+                rank,
+                (time.monotonic() - send_start) * 1000,
+            )
 
     def send_control_message(self, obj):
         # Send control messages to first worker of tp group

@@ -1571,18 +1571,67 @@ class Scheduler(
                 self._fault_tolerance_resume_event_loop = False
                 return
 
+    def _fault_tolerance_diag_loop(self, phase: str) -> None:
+        if not self.server_args.enable_fault_tolerance:
+            return
+        now = time.monotonic()
+        last_attr = f"_fault_tolerance_diag_last_{phase}"
+        last = getattr(self, last_attr, 0.0)
+        if now - last < 5.0:
+            return
+        setattr(self, last_attr, now)
+        rank = self.dp_rank if self.dp_rank is not None else 0
+        running_batch = getattr(self, "running_batch", None)
+        running_reqs = len(getattr(running_batch, "reqs", []) or [])
+        waiting_queue = getattr(self, "waiting_queue", None)
+        waiting_reqs = len(waiting_queue or [])
+        logger.info(
+            "[FaultTolerance] scheduler loop phase=%s rank=%s paused=%s "
+            "resume_pending=%s sparse_active_mask=%s running_reqs=%s "
+            "waiting_reqs=%s",
+            phase,
+            rank,
+            self._engine_paused,
+            self._fault_tolerance_resume_event_loop,
+            self._fault_tolerance_sparse_active_mask,
+            running_reqs,
+            waiting_reqs,
+        )
+
+    def _fault_tolerance_log_recv_control(self, recv_req: Any, source: str) -> None:
+        if not isinstance(recv_req, FaultToleranceCommandReqInput):
+            return
+        rank = self.dp_rank if self.dp_rank is not None else 0
+        logger.info(
+            "[FaultTolerance] scheduler zmq_recv source=%s command=%s "
+            "request_id=%s rank=%s target=%s active=%s paused=%s",
+            source,
+            recv_req.command,
+            recv_req.request_id,
+            rank,
+            recv_req.target_ranks,
+            recv_req.active_ranks,
+            self._engine_paused,
+        )
+
     def _fault_tolerance_recv_direct_control_requests(self) -> List[Any]:
         recv_reqs = []
         if self.recv_from_tokenizer is not None:
             while True:
                 try:
-                    recv_reqs.append(self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK))
+                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    self._fault_tolerance_log_recv_control(
+                        recv_req, "direct_tokenizer"
+                    )
+                    recv_reqs.append(recv_req)
                 except zmq.ZMQError:
                     break
         if self.recv_from_rpc is not None:
             while True:
                 try:
-                    recv_reqs.append(self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK))
+                    recv_req = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+                    self._fault_tolerance_log_recv_control(recv_req, "direct_rpc")
+                    recv_reqs.append(recv_req)
                 except zmq.ZMQError:
                     break
         return recv_reqs
@@ -1608,8 +1657,11 @@ class Scheduler(
                 continue
 
             # Receive requests
+            self._fault_tolerance_diag_loop("before_recv")
             recv_reqs = self.recv_requests()
+            self._fault_tolerance_diag_loop("after_recv")
             self.process_input_requests(recv_reqs)
+            self._fault_tolerance_diag_loop("after_process")
             if self._engine_paused:
                 continue
 
@@ -1750,6 +1802,7 @@ class Scheduler(
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
+                    self._fault_tolerance_log_recv_control(recv_req, "tokenizer")
                     recv_reqs.append(recv_req)
 
                 while True:
@@ -1759,6 +1812,7 @@ class Scheduler(
                         recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
+                    self._fault_tolerance_log_recv_control(recv_rpc, "rpc")
                     recv_reqs.append(recv_rpc)
             else:
                 recv_reqs = None
