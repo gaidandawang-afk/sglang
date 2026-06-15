@@ -3987,18 +3987,21 @@ class Scheduler(
             return
 
         rank = self.dp_rank if self.dp_rank is not None else 0
-        if rank not in target_ranks:
-            return
-
+        is_target_rank = rank in target_ranks
         setattr(self, "_test_recoverable_fault_injected", True)
         done_file = os.environ.get("SGLANG_TEST_FT_RECOVERABLE_FAULT_DONE_FILE", "")
-        if done_file:
+        if done_file and is_target_rank:
             try:
                 with open(done_file, "a", encoding="utf-8") as f:
                     f.write(f"pid={os.getpid()} rank={rank}\n")
             except OSError:
                 pass
-        raise RuntimeError(f"Injected recoverable FT fault on scheduler rank {rank}")
+        if is_target_rank:
+            raise RuntimeError(f"Injected recoverable FT fault on scheduler rank {rank}")
+        raise RuntimeError(
+            f"Cooperative recoverable FT pause on scheduler rank {rank}; "
+            f"target ranks={sorted(target_ranks)}"
+        )
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
