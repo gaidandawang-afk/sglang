@@ -2702,22 +2702,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         active_mask = self.fault_tolerance.active_mask()
         active_ranks = self.fault_tolerance.active_ranks()
+        command_params = dict(params or {})
+        if len(active_ranks) < self.server_args.dp_size:
+            command_params["apply_active_mask_before_prepare"] = True
+            command_params["skip_device_synchronize"] = True
+
         await self._fault_tolerance_update_dp_routing()
         self.abort_request(abort_all=True)
-        await self._fault_tolerance_send_command(
-            "apply_active_mask",
-            target_ranks=active_ranks,
-            active_mask=active_mask,
-            timeout_sec=timeout_sec,
-            params=params,
-        )
-        await self._fault_tolerance_send_command(
-            "resume",
-            target_ranks=active_ranks,
-            active_mask=active_mask,
-            timeout_sec=timeout_sec,
-            params=params,
-        )
+        for command in ("prepare_retry", "reinit", "health_check", "resume"):
+            await self._fault_tolerance_send_command(
+                command,
+                target_ranks=active_ranks,
+                active_mask=active_mask,
+                timeout_sec=timeout_sec,
+                params=command_params,
+            )
 
     def _fault_tolerance_scale_down_capability_error(self) -> Optional[str]:
         if self.server_args.elastic_ep_backend != "mooncake":

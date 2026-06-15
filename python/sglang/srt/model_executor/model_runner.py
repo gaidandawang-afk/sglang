@@ -1821,6 +1821,130 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
 
+    def _fault_tolerance_dist_init_method(self) -> str:
+        dist_init_method_override = envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
+        if dist_init_method_override:
+            return dist_init_method_override
+        if self.server_args.dist_init_addr:
+            return NetworkAddress.parse(self.server_args.dist_init_addr).to_tcp()
+        return NetworkAddress(
+            self.server_args.host or "127.0.0.1", self.dist_port
+        ).to_tcp()
+
+    def fault_tolerance_prepare_reinit(self) -> None:
+        if self.device != "cpu":
+            with contextlib.suppress(Exception):
+                torch.get_device_module(self.device).synchronize()
+        self.fault_tolerance_invalidate_cuda_graphs()
+
+    def fault_tolerance_reinit_distributed(self, params: dict) -> None:
+        del params
+        from sglang.srt.distributed.parallel_state import cleanup_dist_env_and_memory
+
+        self.fault_tolerance_prepare_reinit()
+        cleanup_dist_env_and_memory()
+
+        backend = get_default_distributed_backend(self.device)
+        if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
+            backend = "mooncake"
+        set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
+        set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
+        set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
+
+        init_distributed_environment(
+            backend=backend,
+            world_size=self.tp_size * self.pp_size,
+            rank=self.tp_size * self.pp_rank + self.tp_rank,
+            local_rank=self.gpu_id,
+            distributed_init_method=self._fault_tolerance_dist_init_method(),
+            timeout=self.server_args.dist_timeout,
+            moe_a2a_backend=self.server_args.moe_a2a_backend,
+            recovered_rank=self.server_args.elastic_ep_rejoin,
+        )
+        initialize_model_parallel(
+            tensor_model_parallel_size=self.tp_size,
+            attention_data_parallel_size=self.dp_size,
+            pipeline_model_parallel_size=self.pp_size,
+            expert_model_parallel_size=self.moe_ep_size,
+            attention_context_model_parallel_size=self.attn_cp_size,
+            moe_data_model_parallel_size=self.moe_dp_size,
+            duplicate_tp_group=self.server_args.enable_pdmux,
+            enable_symm_mem=self.server_args.enable_symm_mem,
+            recovered_rank=self.server_args.elastic_ep_rejoin,
+        )
+        initialize_dp_attention(
+            server_args=self.server_args,
+            model_config=self.model_config,
+        )
+
+    def fault_tolerance_rebind_distributed_groups(self) -> None:
+        self.tp_group = get_tp_group()
+        self.pp_group = get_pp_group()
+        self.attention_tp_group = get_attention_tp_group()
+        with contextlib.suppress(Exception):
+            self.init_attention_backend()
+        self.fault_tolerance_reset_moe_dispatchers()
+
+    def fault_tolerance_reset_moe_dispatchers(self) -> None:
+        if self.server_args.moe_a2a_backend != "mooncake" or not hasattr(
+            self, "model"
+        ):
+            return
+
+        reset_count = 0
+        for module in self.model.modules():
+            dispatcher = getattr(module, "dispatcher", None)
+            reset_fn = getattr(dispatcher, "reset_fault_tolerance_state", None)
+            if callable(reset_fn):
+                reset_fn()
+                reset_count += 1
+
+        if reset_count:
+            logger.info(
+                "Reset %d Mooncake MoE dispatchers after fault-tolerance recovery.",
+                reset_count,
+            )
+
+    def fault_tolerance_invalidate_cuda_graphs(self) -> None:
+        self.graph_runner = None
+        self.graph_mem_usage = 0
+        if hasattr(self, "piecewise_cuda_graph_runner"):
+            self.piecewise_cuda_graph_runner = None
+
+    def fault_tolerance_recapture_cuda_graphs(self) -> None:
+        if self.server_args.disable_cuda_graph:
+            return
+        if (
+            self.device in ("cuda", "musa", "cpu", "npu")
+            or (
+                current_platform.is_out_of_tree()
+                and current_platform.support_cuda_graph()
+            )
+        ):
+            self.init_device_graphs()
+            self.init_piecewise_cuda_graphs()
+
+    def fault_tolerance_health_check(self) -> None:
+        if (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+        ):
+            return
+        elastic_state = ElasticEPStateManager.instance()
+        if (
+            elastic_state is not None
+            and elastic_state.active_ranks is not None
+            and not bool(elastic_state.active_ranks.bool().all().item())
+        ):
+            logger.info(
+                "Skipping sparse active-rank fault-tolerance health collective; "
+                "active_ranks=%s",
+                elastic_state.active_ranks.detach().cpu().tolist(),
+            )
+            return
+        tensor = torch.ones(1, device=self.device)
+        dist.all_reduce(tensor, group=self.tp_group.device_group)
+
     def init_weights_send_group_for_remote_instance(
         self,
         master_address,

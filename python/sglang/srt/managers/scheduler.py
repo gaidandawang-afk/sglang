@@ -3777,8 +3777,15 @@ class Scheduler(
                 )
 
             if recv_req.command == "prepare_retry":
+                if recv_req.params.get("apply_active_mask_before_prepare", False):
+                    active_mask = self._fault_tolerance_normalize_active_mask(recv_req)
+                    self._fault_tolerance_apply_active_mask(active_mask)
                 self._engine_paused = True
                 self._fault_tolerance_cleanup_runtime_state()
+                if recv_req.params.get("skip_device_synchronize", False):
+                    self.tp_worker.model_runner.fault_tolerance_invalidate_cuda_graphs()
+                elif not recv_req.params.get("lightweight", False):
+                    self.tp_worker.model_runner.fault_tolerance_prepare_reinit()
                 return FaultToleranceCommandReqOutput(
                     request_id=recv_req.request_id,
                     rank=rank,
@@ -3795,6 +3802,36 @@ class Scheduler(
                     rank=rank,
                     success=True,
                     message="active mask applied",
+                )
+
+            if recv_req.command == "reinit":
+                active_mask = self._fault_tolerance_normalize_active_mask(recv_req)
+                if any(not is_active for is_active in active_mask):
+                    self._fault_tolerance_apply_active_mask(active_mask)
+                else:
+                    model_runner = self.tp_worker.model_runner
+                    model_runner.fault_tolerance_reinit_distributed(recv_req.params)
+                    model_runner.fault_tolerance_rebind_distributed_groups()
+                    scheduler_rebind = getattr(
+                        self, "_fault_tolerance_rebind_distributed_groups", None
+                    )
+                    if callable(scheduler_rebind):
+                        scheduler_rebind()
+                    model_runner.fault_tolerance_invalidate_cuda_graphs()
+                return FaultToleranceCommandReqOutput(
+                    request_id=recv_req.request_id,
+                    rank=rank,
+                    success=True,
+                    message="reinitialized",
+                )
+
+            if recv_req.command == "health_check":
+                self.tp_worker.model_runner.fault_tolerance_health_check()
+                return FaultToleranceCommandReqOutput(
+                    request_id=recv_req.request_id,
+                    rank=rank,
+                    success=True,
+                    message="health check passed",
                 )
 
             if recv_req.command == "resume":
