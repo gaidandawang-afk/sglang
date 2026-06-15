@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import multiprocessing as mp
+import os
 import signal
 import threading
 import time
@@ -33,6 +34,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    FaultToleranceCommandReqInput,
+    FaultToleranceRankFaultOutput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -163,6 +166,7 @@ class DataParallelController:
 
         # Launch data parallel workers
         self.scheduler_procs = []
+        self.scheduler_proc_dp_ranks: List[Optional[int]] = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
         self.status: List[bool] = [True] * server_args.dp_size
 
@@ -191,10 +195,22 @@ class DataParallelController:
         if server_args.enable_metrics:
             start_cpu_monitor_thread("data_parallel_controller")
 
+        if server_args.enable_fault_tolerance:
+            self.start_fault_tolerance_scheduler_watchdog()
+
     def send_to_all_workers(self, obj):
         for i, worker in enumerate(self.workers):
             if self.status[i]:
                 worker.send_pyobj(obj)
+
+    def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
+        recipients = [
+            rank
+            for rank in obj.target_ranks
+            if 0 <= rank < len(self.workers) and self.status[rank]
+        ]
+        for rank in recipients:
+            self.workers[rank].send_pyobj(obj)
 
     def send_control_message(self, obj):
         # Send control messages to first worker of tp group
@@ -231,11 +247,60 @@ class DataParallelController:
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
+                (FaultToleranceCommandReqInput, self.send_fault_tolerance_command),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
                 (ActiveRanksOutput, self.update_active_ranks),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
+
+    def start_fault_tolerance_scheduler_watchdog(self):
+        thread = threading.Thread(
+            target=self._fault_tolerance_scheduler_watchdog_loop,
+            daemon=True,
+            name="dp-ft-scheduler-watchdog",
+        )
+        thread.start()
+
+    def _fault_tolerance_scheduler_watchdog_loop(self):
+        context = zmq.Context(1)
+        send_to_tokenizer = get_zmq_socket(
+            context, zmq.PUSH, self.port_args.tokenizer_ipc_name, False
+        )
+        reported = set()
+        while True:
+            for index, proc in enumerate(self.scheduler_procs):
+                if index in reported or proc.is_alive() or proc.exitcode == 0:
+                    continue
+                reported.add(index)
+                dp_rank = self.scheduler_proc_dp_ranks[index]
+                if dp_rank is None:
+                    logger.error(
+                        "[FaultTolerance] scheduler process pid=%s exited with %s, "
+                        "but no dp_rank is available; triggering fail-stop",
+                        proc.pid,
+                        proc.exitcode,
+                    )
+                    os._exit(1)
+
+                logger.error(
+                    "[FaultTolerance] scheduler process pid=%s for dp_rank=%s "
+                    "exited with %s; reporting rank fault",
+                    proc.pid,
+                    dp_rank,
+                    proc.exitcode,
+                )
+                send_to_tokenizer.send_pyobj(
+                    FaultToleranceRankFaultOutput(
+                        rank=dp_rank,
+                        message=(
+                            f"scheduler process pid={proc.pid} for dp_rank={dp_rank} "
+                            f"exited with {proc.exitcode}"
+                        ),
+                        recoverable=False,
+                    )
+                )
+            time.sleep(1.0)
 
     def launch_dp_schedulers(self, server_args, port_args):
         base_gpu_id = 0
@@ -551,6 +616,7 @@ class DataParallelController:
                     ):
                         proc.start()
                 self.scheduler_procs.append(proc)
+                self.scheduler_proc_dp_ranks.append(dp_rank)
                 scheduler_pipe_readers.append(reader)
 
         # Wait for model to finish loading

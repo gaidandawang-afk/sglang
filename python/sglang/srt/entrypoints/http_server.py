@@ -107,6 +107,7 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 )
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
+from sglang.srt.fault_tolerance.middleware import FaultToleranceAdmissionMiddleware
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -411,6 +412,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(
+    FaultToleranceAdmissionMiddleware, global_state_getter=get_global_state
+)
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -575,6 +579,38 @@ async def health_generate(request: Request) -> Response:
     _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
     _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
     return Response(status_code=503)
+
+
+@app.get("/fault_tolerance/status")
+async def fault_tolerance_status():
+    tokenizer_manager = _global_state.tokenizer_manager
+    if not tokenizer_manager.server_args.enable_fault_tolerance:
+        return ORJSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "type": "fault_tolerance_unavailable",
+                    "message": "fault tolerance is not enabled",
+                }
+            },
+        )
+    return tokenizer_manager.fault_tolerance_status()
+
+
+@app.post("/fault_tolerance/apply")
+async def fault_tolerance_apply(request: Request):
+    try:
+        obj = await request.json()
+    except Exception:
+        return ORJSONResponse(
+            status_code=400,
+            content={"success": False, "message": "invalid JSON body", "ranks": []},
+        )
+
+    status_code, result = await _global_state.tokenizer_manager.fault_tolerance_apply(
+        obj
+    )
+    return ORJSONResponse(status_code=status_code, content=result)
 
 
 @app.get("/get_model_info")

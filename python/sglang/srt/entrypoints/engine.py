@@ -811,8 +811,15 @@ class Engine(EngineScoreMixin, EngineBase):
         names = [f"scheduler_{i}" for i in range(len(processes))]
         processes.append(detoken_proc)
         names.append("detokenizer")
+        on_process_exit = (
+            tokenizer_manager.handle_fault_tolerance_process_exit
+            if server_args.enable_fault_tolerance
+            else None
+        )
         subprocess_watchdog = SubprocessWatchdog(
-            processes=processes, process_names=names
+            processes=processes,
+            process_names=names,
+            on_process_exit=on_process_exit,
         )
         subprocess_watchdog.start()
 

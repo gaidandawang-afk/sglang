@@ -638,6 +638,9 @@ class ServerArgs:
     mooncake_ib_device: Optional[str] = None
     enable_deepep_waterfill: bool = False
     elastic_ep_rejoin: bool = False
+    enable_fault_tolerance: bool = False
+    fault_tolerance_on_error_strategy: Literal["pause", "continue"] = "pause"
+    fault_tolerance_recovery_timeout_sec: int = 60
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
@@ -6107,6 +6110,25 @@ class ServerArgs:
             default=ServerArgs.elastic_ep_rejoin,
             help="Indicates that this process is a relaunched elastic EP rank that should rejoin an existing process group.",
         )
+        parser.add_argument(
+            "--enable-fault-tolerance",
+            action="store_true",
+            default=ServerArgs.enable_fault_tolerance,
+            help="Enable SGLang fault tolerance control plane.",
+        )
+        parser.add_argument(
+            "--fault-tolerance-on-error-strategy",
+            type=str,
+            default=ServerArgs.fault_tolerance_on_error_strategy,
+            choices=["pause", "continue"],
+            help="Fault tolerance behavior after scheduler fault.",
+        )
+        parser.add_argument(
+            "--fault-tolerance-recovery-timeout-sec",
+            type=int,
+            default=ServerArgs.fault_tolerance_recovery_timeout_sec,
+            help="Timeout for fault tolerance recovery commands.",
+        )
 
         # Mamba Cache
         parser.add_argument(
@@ -7207,6 +7229,14 @@ class ServerArgs:
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
         ), "multi-node data parallel is not supported unless dp attention!"
 
+        assert (
+            self.fault_tolerance_recovery_timeout_sec > 0
+        ), "fault_tolerance_recovery_timeout_sec must be positive"
+        if self.enable_fault_tolerance:
+            assert self.elastic_ep_backend == "mooncake", (
+                "--enable-fault-tolerance currently requires "
+                "--elastic-ep-backend mooncake"
+            )
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 

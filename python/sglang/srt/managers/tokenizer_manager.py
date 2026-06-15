@@ -16,6 +16,7 @@
 import asyncio
 import copy
 import dataclasses
+import inspect
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ import signal
 import socket
 import sys
 import threading
+import uuid
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -44,6 +46,7 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.fault_tolerance import FaultToleranceManager
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -60,6 +63,9 @@ from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     EmbeddingReqInput,
     FreezeGCReq,
+    FaultToleranceCommandReqInput,
+    FaultToleranceCommandReqOutput,
+    FaultToleranceRankFaultOutput,
     GenerateReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
@@ -196,6 +202,15 @@ class ReqState:
     output_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
 
 
+@dataclasses.dataclass
+class FaultTolerancePendingCommand:
+    expected_ranks: set[int]
+    future: asyncio.Future
+    outputs: Dict[int, FaultToleranceCommandReqOutput] = dataclasses.field(
+        default_factory=dict
+    )
+
+
 def _slice_streaming_output_meta_info(
     meta_info: Dict[Any, Any],
     last_output_offset: int,
@@ -239,6 +254,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init running status
         self.init_running_status()
+        self.init_fault_tolerance()
 
         # Init logging and dumping
         self.init_request_logging_and_dumping()
@@ -378,6 +394,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
 
+    def init_fault_tolerance(self):
+        self.fault_tolerance = FaultToleranceManager(
+            enabled=self.server_args.enable_fault_tolerance,
+            dp_size=self.server_args.dp_size,
+            on_error_strategy=self.server_args.fault_tolerance_on_error_strategy,
+            recovery_timeout_sec=self.server_args.fault_tolerance_recovery_timeout_sec,
+            moe_a2a_backend=self.server_args.moe_a2a_backend,
+            elastic_ep_backend=self.server_args.elastic_ep_backend,
+        )
+        self._fault_tolerance_pending_commands: Dict[
+            str, FaultTolerancePendingCommand
+        ] = {}
+
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
         # Request logging
@@ -506,6 +535,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (FaultToleranceCommandReqOutput, self._handle_fault_tolerance_output),
+                (FaultToleranceRankFaultOutput, self._handle_fault_tolerance_rank_fault),
             ]
         )
         self.init_communicators(self.server_args)
@@ -534,6 +565,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
+            self.fault_tolerance.validate_routed_rank(obj.routed_dp_rank)
+
+        if (
+            self.server_args.enable_fault_tolerance
+            and not self.fault_tolerance.admission_open()
+        ):
+            raise fastapi.HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                detail=self.fault_tolerance.unavailable_error(),
+            )
 
         self._init_req_state(obj, request)
         if self.server_args.language_only:
@@ -2451,7 +2492,325 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state.event.set()
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
+        if self.server_args.enable_fault_tolerance:
+            ft_mask = self.fault_tolerance.active_mask()
+            if len(ranks.status) == len(ft_mask):
+                ranks = ActiveRanksOutput(
+                    status=[
+                        bool(rank_active) and bool(ft_active)
+                        for rank_active, ft_active in zip(ranks.status, ft_mask)
+                    ]
+                )
         self.send_to_scheduler.send_pyobj(ranks)
+
+    def _handle_fault_tolerance_output(self, recv_obj: FaultToleranceCommandReqOutput):
+        pending = self._fault_tolerance_pending_commands.get(recv_obj.request_id)
+        if pending is not None and not pending.future.done():
+            pending.outputs[recv_obj.rank] = recv_obj
+            if pending.expected_ranks.issubset(pending.outputs.keys()):
+                pending.future.set_result(
+                    [pending.outputs[rank] for rank in sorted(pending.outputs)]
+                )
+
+        if not recv_obj.success:
+            logger.error(
+                "Fault tolerance command failed on rank %s: %s",
+                recv_obj.rank,
+                recv_obj.message,
+            )
+
+    def _handle_fault_tolerance_rank_fault(
+        self, recv_obj: FaultToleranceRankFaultOutput
+    ):
+        if not self.server_args.enable_fault_tolerance:
+            return
+        if self.fault_tolerance.recovery_in_progress():
+            logger.error(
+                "[FaultTolerance] new rank fault during recovery; triggering fail-stop"
+            )
+            os._exit(1)
+        message = recv_obj.message or f"scheduler rank {recv_obj.rank} fault"
+        if recv_obj.recoverable:
+            self.fault_tolerance.pause_all_active(
+                message, rank=recv_obj.rank, fault_type="recoverable"
+            )
+            self.abort_request(abort_all=True)
+            if self.event_loop is not None:
+                asyncio.run_coroutine_threadsafe(
+                    self._fault_tolerance_pause_active_ranks(), self.event_loop
+                )
+        else:
+            self.fault_tolerance.record_fault(recv_obj.rank, message)
+            if self.event_loop is not None:
+                asyncio.run_coroutine_threadsafe(
+                    self._fault_tolerance_handle_process_exit(
+                        recv_obj.rank, message
+                    ),
+                    self.event_loop,
+                )
+
+    def handle_fault_tolerance_process_exit(
+        self, index: int, name: str, pid: Optional[int], exitcode: Optional[int]
+    ) -> bool:
+        if not self.server_args.enable_fault_tolerance:
+            return False
+        if not name.startswith("scheduler_"):
+            return False
+        if self.fault_tolerance.recovery_in_progress():
+            logger.error(
+                "[FaultTolerance] scheduler process exited during recovery; "
+                "falling back to fail-stop"
+            )
+            return False
+        try:
+            rank = int(name.split("_", 1)[1])
+        except (IndexError, ValueError):
+            rank = index
+        message = f"scheduler rank {rank} process exited with code {exitcode}"
+        logger.error("[FaultTolerance] %s pid=%s", message, pid)
+        self.fault_tolerance.record_fault(rank, message)
+        if self.event_loop is None:
+            return True
+        asyncio.run_coroutine_threadsafe(
+            self._fault_tolerance_handle_process_exit(rank, message),
+            self.event_loop,
+        )
+        return True
+
+    async def _fault_tolerance_handle_process_exit(self, rank: int, message: str):
+        await self._fault_tolerance_update_dp_routing()
+        self.abort_request(abort_all=True)
+        if (
+            self.server_args.fault_tolerance_on_error_strategy == "continue"
+            and self.fault_tolerance.is_mooncake_backend
+        ):
+            await self.fault_tolerance_apply(
+                {
+                    "fault_tolerance_instruction": "scale_down",
+                    "fault_tolerance_timeout": (
+                        self.server_args.fault_tolerance_recovery_timeout_sec
+                    ),
+                    "fault_tolerance_params": {
+                        "ranks": [rank],
+                        "source": "watchdog",
+                        "message": message,
+                    },
+                }
+            )
+        else:
+            await self._fault_tolerance_pause_active_ranks()
+
+    async def _fault_tolerance_pause_active_ranks(self):
+        try:
+            await self._fault_tolerance_update_dp_routing()
+            active_ranks = self.fault_tolerance.active_ranks()
+            if not active_ranks:
+                return
+            await self._fault_tolerance_send_command(
+                "prepare_retry",
+                target_ranks=active_ranks,
+                timeout_sec=self.server_args.fault_tolerance_recovery_timeout_sec,
+            )
+        except Exception:
+            logger.exception(
+                "[FaultTolerance] failed to pause active ranks; triggering fail-stop"
+            )
+            os._exit(1)
+
+    async def _fault_tolerance_update_dp_routing(self):
+        if self.server_args.dp_size <= 1:
+            return
+        send_result = self.send_to_scheduler.send_pyobj(
+            ActiveRanksOutput(status=self.fault_tolerance.active_mask())
+        )
+        if inspect.isawaitable(send_result):
+            await send_result
+
+    async def _fault_tolerance_send_command(
+        self,
+        command: str,
+        *,
+        target_ranks: Optional[List[int]] = None,
+        active_mask: Optional[List[bool]] = None,
+        timeout_sec: Optional[int] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ):
+        active_mask = (
+            active_mask
+            if active_mask is not None
+            else self.fault_tolerance.active_mask()
+        )
+        active_ranks = [
+            rank for rank, is_active in enumerate(active_mask) if is_active
+        ]
+        target_ranks = target_ranks if target_ranks is not None else active_ranks
+        if not target_ranks:
+            return []
+        timeout_sec = (
+            timeout_sec
+            if timeout_sec is not None
+            else self.server_args.fault_tolerance_recovery_timeout_sec
+        )
+        request_id = str(uuid.uuid4())
+        req = FaultToleranceCommandReqInput(
+            request_id=request_id,
+            command=command,
+            target_ranks=target_ranks,
+            active_mask=active_mask,
+            timeout_sec=timeout_sec,
+            params=params or {},
+        )
+        expected_ranks = set(target_ranks)
+        self._fault_tolerance_pending_commands[request_id] = (
+            FaultTolerancePendingCommand(
+                expected_ranks=expected_ranks,
+                future=asyncio.get_running_loop().create_future(),
+            )
+        )
+        try:
+            send_result = self.send_to_scheduler.send_pyobj(req)
+            if inspect.isawaitable(send_result):
+                await send_result
+            outputs = await asyncio.wait_for(
+                self._fault_tolerance_pending_commands[request_id].future,
+                timeout=timeout_sec,
+            )
+            failed = [output for output in outputs if not output.success]
+            if failed:
+                raise RuntimeError(failed[0].message)
+            return outputs
+        finally:
+            self._fault_tolerance_pending_commands.pop(request_id, None)
+
+    async def _fault_tolerance_run_retry(self, timeout_sec: int, params: Dict[str, Any]):
+        active_ranks = self.fault_tolerance.active_ranks()
+        await self._fault_tolerance_send_command(
+            "prepare_retry",
+            target_ranks=active_ranks,
+            timeout_sec=timeout_sec,
+            params=params,
+        )
+        await self._fault_tolerance_send_command(
+            "resume",
+            target_ranks=active_ranks,
+            timeout_sec=timeout_sec,
+            params=params,
+        )
+
+    async def _fault_tolerance_run_scale_down(
+        self, timeout_sec: int, params: Dict[str, Any]
+    ):
+        active_mask = self.fault_tolerance.active_mask()
+        active_ranks = self.fault_tolerance.active_ranks()
+        await self._fault_tolerance_update_dp_routing()
+        self.abort_request(abort_all=True)
+        await self._fault_tolerance_send_command(
+            "apply_active_mask",
+            target_ranks=active_ranks,
+            active_mask=active_mask,
+            timeout_sec=timeout_sec,
+            params=params,
+        )
+        await self._fault_tolerance_send_command(
+            "resume",
+            target_ranks=active_ranks,
+            active_mask=active_mask,
+            timeout_sec=timeout_sec,
+            params=params,
+        )
+
+    def _fault_tolerance_scale_down_capability_error(self) -> Optional[str]:
+        if self.server_args.elastic_ep_backend != "mooncake":
+            return "scale_down requires --elastic-ep-backend mooncake"
+        return None
+
+    def fault_tolerance_status(self):
+        return self.fault_tolerance.status_response()
+
+    async def fault_tolerance_apply(self, obj: Dict[str, Any]):
+        instruction = obj.get("fault_tolerance_instruction")
+        timeout_sec = int(
+            obj.get(
+                "fault_tolerance_timeout",
+                self.server_args.fault_tolerance_recovery_timeout_sec,
+            )
+        )
+        params = obj.get("fault_tolerance_params") or {}
+
+        if not self.server_args.enable_fault_tolerance:
+            return 503, {
+                "success": False,
+                "message": "fault tolerance is not enabled",
+                "ranks": self.fault_tolerance.status_response()["ranks"],
+            }
+        if self.fault_tolerance.recovery_in_progress():
+            return 409, {
+                "success": False,
+                "message": "fault tolerance recovery is already in progress",
+                "ranks": self.fault_tolerance.status_response()["ranks"],
+            }
+
+        if instruction == "retry":
+            validation_error = self.fault_tolerance.validate_retry()
+            if validation_error is not None:
+                return 400, {
+                    "success": False,
+                    "message": validation_error,
+                    "ranks": self.fault_tolerance.status_response()["ranks"],
+                }
+            self.fault_tolerance.begin_retry()
+            try:
+                await self._fault_tolerance_run_retry(timeout_sec, params)
+            except Exception:
+                logger.exception(
+                    "[FaultTolerance] retry failed; triggering fail-stop"
+                )
+                os._exit(1)
+            result = self.fault_tolerance.commit_retry()
+            await self._fault_tolerance_update_dp_routing()
+            return 200, result
+
+        if instruction == "scale_down":
+            capability_error = self._fault_tolerance_scale_down_capability_error()
+            if capability_error is not None:
+                return 400, {
+                    "success": False,
+                    "message": capability_error,
+                    "ranks": self.fault_tolerance.status_response()["ranks"],
+                }
+            ranks = params.get("ranks")
+            if not isinstance(ranks, list) or not all(
+                isinstance(rank, int) for rank in ranks
+            ):
+                return 400, {
+                    "success": False,
+                    "message": "scale_down requires integer list fault_tolerance_params.ranks",
+                    "ranks": self.fault_tolerance.status_response()["ranks"],
+                }
+            validation_error = self.fault_tolerance.validate_scale_down(ranks)
+            if validation_error is not None:
+                return 400, {
+                    "success": False,
+                    "message": validation_error,
+                    "ranks": self.fault_tolerance.status_response()["ranks"],
+                }
+            self.fault_tolerance.begin_scale_down(ranks)
+            try:
+                await self._fault_tolerance_run_scale_down(timeout_sec, params)
+            except Exception:
+                logger.exception(
+                    "[FaultTolerance] scale_down failed; triggering fail-stop"
+                )
+                os._exit(1)
+            result = self.fault_tolerance.commit_scale_down()
+            await self._fault_tolerance_update_dp_routing()
+            return 200, result
+
+        return 400, {
+            "success": False,
+            "message": f"unsupported fault tolerance instruction: {instruction}",
+            "ranks": self.fault_tolerance.status_response()["ranks"],
+        }
 
     def _handle_open_session_req_output(self, recv_obj):
         future = self.session_futures.get(recv_obj.session_id)
