@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Iterator, List, Optional
+from typing import Iterator, List, Optional, Sequence
 
 import torch
 
@@ -37,6 +37,23 @@ class ElasticEPState:
             self.active_ranks.fill_(1)
             self.snapshot_active_to_last()
             self.sync_active_to_cpu()
+
+    def apply_active_mask(self, active_mask: Sequence[bool]) -> None:
+        if self.active_ranks is None:
+            return
+        if len(active_mask) != self.active_ranks.numel():
+            raise ValueError(
+                f"active mask size {len(active_mask)} does not match "
+                f"elastic EP world size {self.active_ranks.numel()}"
+            )
+        values = torch.tensor(
+            [1 if item else 0 for item in active_mask],
+            dtype=self.active_ranks.dtype,
+            device=self.active_ranks.device,
+        )
+        self.active_ranks.copy_(values)
+        self.snapshot_active_to_last()
+        self.sync_active_to_cpu()
 
     def maybe_inject_test_rank_fault(self) -> bool:
         ranks_raw = os.environ.get("SGLANG_TEST_ELASTIC_EP_FAULT_RANKS", "")
@@ -128,6 +145,33 @@ class ElasticEPStateManager:
         dev = device if device is not None else cls._select_device()
 
         return torch.ones(size, dtype=torch.int32, device=dev)
+
+
+def apply_active_rank_mask(active_mask: Sequence[bool]) -> None:
+    """Apply a sparse active-rank mask to ElasticEP and Mooncake PG state."""
+
+    state = ElasticEPStateManager.instance()
+    if state is not None:
+        state.apply_active_mask(active_mask)
+
+    for group in _iter_live_parallel_groups():
+        if not hasattr(group, "active_ranks") or group.active_ranks is None:
+            continue
+        if len(active_mask) != group.active_ranks.numel():
+            continue
+
+        values_cpu = torch.tensor(
+            [1 if item else 0 for item in active_mask],
+            dtype=group.active_ranks_cpu.dtype,
+        )
+        group.active_ranks_cpu.copy_(values_cpu)
+        values_device = values_cpu.to(
+            device=group.active_ranks.device,
+            dtype=group.active_ranks.dtype,
+        )
+        group.active_ranks.copy_(values_device)
+
+    _refresh_ep_members()
 
 
 # ---------------------------------------------------------------------------

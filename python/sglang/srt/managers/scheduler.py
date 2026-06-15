@@ -3939,7 +3939,10 @@ class Scheduler(
             )
         state = None
         if self.server_args.elastic_ep_backend is not None:
-            from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+            from sglang.srt.elastic_ep.elastic_ep import (
+                ElasticEPStateManager,
+                apply_active_rank_mask,
+            )
 
             state = ElasticEPStateManager.instance()
         if state is None or state.active_ranks is None:
@@ -3952,14 +3955,7 @@ class Scheduler(
         expanded_mask = [
             is_active for is_active in active_mask for _ in range(ranks_per_dp)
         ]
-        mask = torch.tensor(
-            [1 if is_active else 0 for is_active in expanded_mask],
-            dtype=state.active_ranks.dtype,
-            device=state.active_ranks.device,
-        )
-        state.active_ranks.copy_(mask)
-        state.snapshot_active_to_last()
-        state.sync_active_to_cpu()
+        apply_active_rank_mask(expanded_mask)
 
     def _maybe_inject_test_recoverable_fault(self) -> None:
         target_raw = os.environ.get("SGLANG_TEST_FT_RECOVERABLE_FAULT_RANK")
