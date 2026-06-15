@@ -52,7 +52,6 @@ class ElasticEPState:
             device=self.active_ranks.device,
         )
         self.active_ranks.copy_(values)
-        self.snapshot_active_to_last()
         self.sync_active_to_cpu()
 
     def maybe_inject_test_rank_fault(self) -> bool:
