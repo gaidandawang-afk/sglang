@@ -4029,11 +4029,6 @@ class Scheduler(
         rank = self.dp_rank if self.dp_rank is not None else 0
         is_target_rank = rank in target_ranks
         setattr(self, "_test_recoverable_fault_injected", True)
-        if (
-            not is_target_rank
-            and self.server_args.fault_tolerance_on_error_strategy == "continue"
-        ):
-            return
         done_file = os.environ.get("SGLANG_TEST_FT_RECOVERABLE_FAULT_DONE_FILE", "")
         if done_file and is_target_rank:
             try:

@@ -2528,12 +2528,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         if not self.server_args.enable_fault_tolerance:
             return
+        message = recv_obj.message or f"scheduler rank {recv_obj.rank} fault"
+        if (
+            recv_obj.recoverable
+            and self.server_args.fault_tolerance_on_error_strategy == "continue"
+            and "Cooperative recoverable FT pause" in message
+        ):
+            logger.info(
+                "[FaultTolerance] ignoring cooperative continue pause from rank %s",
+                recv_obj.rank,
+            )
+            return
         if self.fault_tolerance.recovery_in_progress():
             logger.error(
                 "[FaultTolerance] new rank fault during recovery; triggering fail-stop"
             )
             os._exit(1)
-        message = recv_obj.message or f"scheduler rank {recv_obj.rank} fault"
         if recv_obj.recoverable:
             self.fault_tolerance.pause_all_active(
                 message, rank=recv_obj.rank, fault_type="recoverable"
