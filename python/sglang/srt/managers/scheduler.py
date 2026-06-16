@@ -3768,6 +3768,13 @@ class Scheduler(
     ) -> FaultToleranceCommandReqOutput:
         rank = self.dp_rank if self.dp_rank is not None else 0
         try:
+            logger.info(
+                "[FaultTolerance] rank %s received command=%s targets=%s params=%s",
+                rank,
+                recv_req.command,
+                recv_req.target_ranks,
+                recv_req.params,
+            )
             if rank not in recv_req.target_ranks:
                 return FaultToleranceCommandReqOutput(
                     request_id=recv_req.request_id,
@@ -3795,11 +3802,21 @@ class Scheduler(
 
             if recv_req.command == "apply_active_mask":
                 active_mask = self._fault_tolerance_normalize_active_mask(recv_req)
+                logger.info(
+                    "[FaultTolerance] rank %s applying active_mask=%s",
+                    rank,
+                    active_mask,
+                )
                 self._fault_tolerance_apply_active_mask(
                     active_mask,
                     refresh_ep_members=not recv_req.params.get(
                         "skip_ep_member_refresh", False
                     ),
+                )
+                logger.info(
+                    "[FaultTolerance] rank %s applied active_mask=%s",
+                    rank,
+                    active_mask,
                 )
                 self._fault_tolerance_cleanup_runtime_state()
                 return FaultToleranceCommandReqOutput(
@@ -3984,6 +4001,7 @@ class Scheduler(
     def _fault_tolerance_apply_active_mask(
         self, active_mask: List[bool], *, refresh_ep_members: bool = True
     ) -> None:
+        rank = self.dp_rank if self.dp_rank is not None else 0
         if len(active_mask) != self.dp_size:
             raise ValueError(
                 "fault tolerance active_mask length does not match dp_size"
@@ -4006,8 +4024,19 @@ class Scheduler(
         expanded_mask = [
             is_active for is_active in active_mask for _ in range(ranks_per_dp)
         ]
+        logger.info(
+            "[FaultTolerance] rank %s applying expanded active mask; "
+            "refresh_ep_members=%s expanded_mask=%s",
+            rank,
+            refresh_ep_members,
+            expanded_mask,
+        )
         apply_active_rank_mask(
             expanded_mask, refresh_ep_members=refresh_ep_members
+        )
+        logger.info(
+            "[FaultTolerance] rank %s finished expanded active mask",
+            rank,
         )
 
     def _maybe_inject_test_recoverable_fault(self) -> None:
