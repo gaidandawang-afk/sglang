@@ -146,7 +146,9 @@ class ElasticEPStateManager:
         return torch.ones(size, dtype=torch.int32, device=dev)
 
 
-def apply_active_rank_mask(active_mask: Sequence[bool]) -> None:
+def apply_active_rank_mask(
+    active_mask: Sequence[bool], *, refresh_ep_members: bool = True
+) -> None:
     """Apply a sparse active-rank mask to ElasticEP and Mooncake PG state."""
 
     state = ElasticEPStateManager.instance()
@@ -170,7 +172,8 @@ def apply_active_rank_mask(active_mask: Sequence[bool]) -> None:
         )
         group.active_ranks.copy_(values_device)
 
-    _refresh_ep_members()
+    if refresh_ep_members:
+        _refresh_ep_members()
 
 
 # ---------------------------------------------------------------------------

@@ -3795,7 +3795,12 @@ class Scheduler(
 
             if recv_req.command == "apply_active_mask":
                 active_mask = self._fault_tolerance_normalize_active_mask(recv_req)
-                self._fault_tolerance_apply_active_mask(active_mask)
+                self._fault_tolerance_apply_active_mask(
+                    active_mask,
+                    refresh_ep_members=not recv_req.params.get(
+                        "skip_ep_member_refresh", False
+                    ),
+                )
                 self._fault_tolerance_cleanup_runtime_state()
                 return FaultToleranceCommandReqOutput(
                     request_id=recv_req.request_id,
@@ -3976,7 +3981,9 @@ class Scheduler(
                 )
         return [bool(x) for x in active_mask]
 
-    def _fault_tolerance_apply_active_mask(self, active_mask: List[bool]) -> None:
+    def _fault_tolerance_apply_active_mask(
+        self, active_mask: List[bool], *, refresh_ep_members: bool = True
+    ) -> None:
         if len(active_mask) != self.dp_size:
             raise ValueError(
                 "fault tolerance active_mask length does not match dp_size"
@@ -3999,7 +4006,9 @@ class Scheduler(
         expanded_mask = [
             is_active for is_active in active_mask for _ in range(ranks_per_dp)
         ]
-        apply_active_rank_mask(expanded_mask)
+        apply_active_rank_mask(
+            expanded_mask, refresh_ep_members=refresh_ep_members
+        )
 
     def _maybe_inject_test_recoverable_fault(self) -> None:
         target_raw = os.environ.get("SGLANG_TEST_FT_RECOVERABLE_FAULT_RANK")
