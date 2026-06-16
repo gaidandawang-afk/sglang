@@ -4330,6 +4330,11 @@ def configure_scheduler_process(
     # Config the process
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
+    if hasattr(signal, "SIGUSR1"):
+        try:
+            faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+        except RuntimeError:
+            pass
 
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
