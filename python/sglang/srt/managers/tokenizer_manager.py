@@ -407,6 +407,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             str, FaultTolerancePendingCommand
         ] = {}
 
+    def _fault_tolerance_schedule(self, coro):
+        if self.event_loop is None:
+            return
+
+        def create_task():
+            task = self.event_loop.create_task(coro)
+            self.asyncio_tasks.add(task)
+            task.add_done_callback(self.asyncio_tasks.discard)
+
+        self.event_loop.call_soon_threadsafe(create_task)
+
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
         # Request logging
@@ -2542,23 +2553,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             if self.event_loop is not None:
                 if self.server_args.fault_tolerance_on_error_strategy == "continue":
-                    asyncio.run_coroutine_threadsafe(
-                        self._fault_tolerance_continue_after_recoverable_fault(),
-                        self.event_loop,
+                    logger.info(
+                        "[FaultTolerance] scheduling continue recoverable handling "
+                        "for rank %s",
+                        recv_obj.rank,
+                    )
+                    self._fault_tolerance_schedule(
+                        self._fault_tolerance_continue_after_recoverable_fault()
                     )
                 else:
                     self.abort_request(abort_all=True)
-                    asyncio.run_coroutine_threadsafe(
-                        self._fault_tolerance_pause_active_ranks(), self.event_loop
+                    self._fault_tolerance_schedule(
+                        self._fault_tolerance_pause_active_ranks()
                     )
         else:
             self.fault_tolerance.record_fault(recv_obj.rank, message)
             if self.event_loop is not None:
-                asyncio.run_coroutine_threadsafe(
+                self._fault_tolerance_schedule(
                     self._fault_tolerance_handle_process_exit(
                         recv_obj.rank, message
                     ),
-                    self.event_loop,
                 )
 
     def handle_fault_tolerance_process_exit(
@@ -2583,9 +2597,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.fault_tolerance.record_fault(rank, message)
         if self.event_loop is None:
             return True
-        asyncio.run_coroutine_threadsafe(
+        self._fault_tolerance_schedule(
             self._fault_tolerance_handle_process_exit(rank, message),
-            self.event_loop,
         )
         return True
 
@@ -2642,6 +2655,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             live_ranks = self.fault_tolerance.active_ranks()
             if not live_ranks:
                 return
+            logger.info(
+                "[FaultTolerance] applying continue recoverable active mask; "
+                "live_ranks=%s active_mask=%s",
+                live_ranks,
+                self.fault_tolerance.active_mask(),
+            )
             await self._fault_tolerance_send_command(
                 "apply_active_mask",
                 target_ranks=live_ranks,
