@@ -2493,6 +2493,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         if self.server_args.enable_fault_tolerance:
+            self.fault_tolerance.sync_active_ranks(
+                ranks.status,
+                message="Mooncake active_ranks isolated rank(s)",
+            )
             ft_mask = self.fault_tolerance.active_mask()
             if len(ranks.status) == len(ft_mask):
                 ranks = ActiveRanksOutput(
@@ -2534,11 +2538,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.fault_tolerance.pause_all_active(
                 message, rank=recv_obj.rank, fault_type="recoverable"
             )
-            self.abort_request(abort_all=True)
-            if self.event_loop is not None:
-                asyncio.run_coroutine_threadsafe(
-                    self._fault_tolerance_pause_active_ranks(), self.event_loop
-                )
+            if (
+                self.server_args.fault_tolerance_on_error_strategy == "continue"
+                and self.fault_tolerance.is_mooncake_backend
+            ):
+                if self.event_loop is not None:
+                    asyncio.run_coroutine_threadsafe(
+                        self._fault_tolerance_handle_rank_exception(
+                            recv_obj.rank, message
+                        ),
+                        self.event_loop,
+                    )
+            else:
+                self.abort_request(abort_all=True)
+                if self.event_loop is not None:
+                    asyncio.run_coroutine_threadsafe(
+                        self._fault_tolerance_pause_active_ranks(), self.event_loop
+                    )
         else:
             self.fault_tolerance.record_fault(recv_obj.rank, message)
             if self.event_loop is not None:
@@ -2594,8 +2610,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         "ranks": [rank],
                         "source": "watchdog",
                         "message": message,
-                    },
-                }
+                        },
+                },
+                internal=True,
             )
         else:
             logger.info(
@@ -2604,15 +2621,33 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 rank,
             )
 
+    async def _fault_tolerance_handle_rank_exception(self, rank: int, message: str):
+        await self._fault_tolerance_update_dp_routing()
+        await self.fault_tolerance_apply(
+            {
+                "fault_tolerance_instruction": "scale_down",
+                "fault_tolerance_timeout": (
+                    self.server_args.fault_tolerance_recovery_timeout_sec
+                ),
+                "fault_tolerance_params": {
+                    "ranks": [rank],
+                    "source": "rank_fault",
+                    "message": message,
+                },
+            },
+            internal=True,
+        )
+
     async def _fault_tolerance_pause_active_ranks(self):
         try:
             await self._fault_tolerance_update_dp_routing()
-            active_ranks = self.fault_tolerance.active_ranks()
+            active_ranks = self.fault_tolerance.alive_ranks()
             if not active_ranks:
                 return
             await self._fault_tolerance_send_command(
                 "prepare_retry",
                 target_ranks=active_ranks,
+                active_mask=self.fault_tolerance.recovery_active_mask(),
                 timeout_sec=self.server_args.fault_tolerance_recovery_timeout_sec,
                 params={"lightweight": True},
             )
@@ -2688,16 +2723,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self._fault_tolerance_pending_commands.pop(request_id, None)
 
     async def _fault_tolerance_run_retry(self, timeout_sec: int, params: Dict[str, Any]):
-        active_ranks = self.fault_tolerance.active_ranks()
+        active_mask = self.fault_tolerance.recovery_active_mask()
+        active_ranks = self.fault_tolerance.alive_ranks()
         await self._fault_tolerance_send_command(
             "prepare_retry",
             target_ranks=active_ranks,
+            active_mask=active_mask,
             timeout_sec=timeout_sec,
             params=params,
         )
         await self._fault_tolerance_send_command(
             "resume",
             target_ranks=active_ranks,
+            active_mask=active_mask,
             timeout_sec=timeout_sec,
             params=params,
         )
@@ -2705,8 +2743,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _fault_tolerance_run_scale_down(
         self, timeout_sec: int, params: Dict[str, Any]
     ):
-        active_mask = self.fault_tolerance.active_mask()
-        active_ranks = self.fault_tolerance.active_ranks()
+        active_mask = self.fault_tolerance.recovery_active_mask()
+        active_ranks = [
+            rank for rank, is_active in enumerate(active_mask) if is_active
+        ]
         command_params = dict(params or {})
         if len(active_ranks) < self.server_args.dp_size:
             command_params["apply_active_mask_before_prepare"] = True
@@ -2731,7 +2771,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def fault_tolerance_status(self):
         return self.fault_tolerance.status_response()
 
-    async def fault_tolerance_apply(self, obj: Dict[str, Any]):
+    async def fault_tolerance_apply(self, obj: Dict[str, Any], *, internal: bool = False):
         instruction = obj.get("fault_tolerance_instruction")
         timeout_sec = int(
             obj.get(
@@ -2751,6 +2791,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return 409, {
                 "success": False,
                 "message": "fault tolerance recovery is already in progress",
+                "ranks": self.fault_tolerance.status_response()["ranks"],
+            }
+        if (
+            self.server_args.fault_tolerance_on_error_strategy == "continue"
+            and not internal
+            and instruction in ("retry", "scale_down")
+        ):
+            return 400, {
+                "success": False,
+                "message": (
+                    "continue only supports status query and automatic handling"
+                ),
                 "ranks": self.fault_tolerance.status_response()["ranks"],
             }
 

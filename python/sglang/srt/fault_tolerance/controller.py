@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 class RankState(str, Enum):
     HEALTHY = "healthy"
+    UNHEALTHY = "unhealthy"
     PAUSED = "paused"
     DEAD = "dead"
 
@@ -74,6 +75,7 @@ class FaultToleranceManager:
         self._admission_open = True
         self._last_fault: Optional[FaultStatus] = None
         self._last_message = ""
+        self._pending_scale_down_ranks = set()
 
     @property
     def is_mooncake_backend(self) -> bool:
@@ -84,9 +86,7 @@ class FaultToleranceManager:
 
     def status_response(self) -> Dict[str, Any]:
         with self._lock:
-            active_mask = [
-                rank.state != RankState.DEAD for rank in self._ranks
-            ]
+            active_mask = self._service_active_mask_locked()
             return {
                 "enabled": self.enabled,
                 "instance_state": self._instance_state.value,
@@ -121,9 +121,21 @@ class FaultToleranceManager:
 
     def active_mask(self) -> List[bool]:
         with self._lock:
-            return [rank.state != RankState.DEAD for rank in self._ranks]
+            return self._service_active_mask_locked()
 
     def active_ranks(self) -> List[int]:
+        with self._lock:
+            return [
+                rank.rank
+                for rank in self._ranks
+                if rank.state == RankState.HEALTHY
+            ]
+
+    def alive_mask(self) -> List[bool]:
+        with self._lock:
+            return self._alive_mask_locked()
+
+    def alive_ranks(self) -> List[int]:
         with self._lock:
             return [
                 rank.rank
@@ -141,9 +153,42 @@ class FaultToleranceManager:
         if not self.enabled:
             return
         with self._lock:
-            if 0 <= rank < self.dp_size and self._ranks[rank].state == RankState.DEAD:
+            if 0 <= rank < self.dp_size and self._ranks[rank].state != RankState.HEALTHY:
                 raise ValueError(
                     f"routed_dp_rank={rank} is isolated by fault tolerance"
+                )
+
+    def sync_active_ranks(self, active_mask: Sequence[bool], message: str = "") -> None:
+        if not self.enabled or len(active_mask) != self.dp_size:
+            return
+        with self._lock:
+            changed = False
+            for rank, is_active in enumerate(active_mask):
+                if is_active or self._ranks[rank].state == RankState.DEAD:
+                    continue
+                if self._ranks[rank].state != RankState.UNHEALTHY:
+                    self._ranks[rank].state = RankState.UNHEALTHY
+                    changed = True
+            if not changed:
+                return
+
+            self._last_fault = FaultStatus(
+                rank=None,
+                type="active_ranks",
+                message=message or "Mooncake active_ranks isolated rank(s)",
+            )
+            if self.on_error_strategy == "pause":
+                for item in self._ranks:
+                    if item.state == RankState.HEALTHY:
+                        item.state = RankState.PAUSED
+                self._instance_state = InstanceState.PAUSED
+                self._admission_open = False
+                self._last_message = (
+                    message or "SGLang engine is paused by fault tolerance."
+                )
+            else:
+                self._set_degraded_or_failed_locked(
+                    message or "Mooncake active_ranks isolated rank(s)"
                 )
 
     def pause_all_active(
@@ -156,17 +201,25 @@ class FaultToleranceManager:
         if not self.enabled:
             return
         with self._lock:
-            for item in self._ranks:
-                if item.state == RankState.HEALTHY:
-                    item.state = RankState.PAUSED
-            self._instance_state = InstanceState.PAUSED
-            self._admission_open = False
+            if rank is not None and 0 <= rank < self.dp_size:
+                if self._ranks[rank].state != RankState.DEAD:
+                    self._ranks[rank].state = RankState.UNHEALTHY
             self._last_fault = FaultStatus(
                 rank=rank,
                 type=fault_type,
                 message=message or "scheduler rank fault",
             )
-            self._last_message = message or "SGLang engine is paused by fault tolerance."
+            if self.on_error_strategy == "pause":
+                for item in self._ranks:
+                    if item.state == RankState.HEALTHY:
+                        item.state = RankState.PAUSED
+                self._instance_state = InstanceState.PAUSED
+                self._admission_open = False
+                self._last_message = (
+                    message or "SGLang engine is paused by fault tolerance."
+                )
+            else:
+                self._set_degraded_or_failed_locked(message or "scheduler rank fault")
 
     def record_fault(self, rank: int, message: str) -> None:
         if not self.enabled:
@@ -176,21 +229,28 @@ class FaultToleranceManager:
                 logger.warning("Ignoring FT fault for unknown rank %s", rank)
                 return
             self._ranks[rank].state = RankState.DEAD
-            for item in self._ranks:
-                if item.state == RankState.HEALTHY:
-                    item.state = RankState.PAUSED
-            self._instance_state = (
-                InstanceState.PAUSED
-                if any(item.state != RankState.DEAD for item in self._ranks)
-                else InstanceState.FAILED
-            )
-            self._admission_open = False
             self._last_fault = FaultStatus(
                 rank=rank,
                 type="non_recoverable",
                 message=message or "scheduler process exited",
             )
-            self._last_message = message or "SGLang engine is paused by fault tolerance."
+            if self.on_error_strategy == "pause":
+                for item in self._ranks:
+                    if item.state == RankState.HEALTHY:
+                        item.state = RankState.PAUSED
+                self._instance_state = (
+                    InstanceState.PAUSED
+                    if any(item.state != RankState.DEAD for item in self._ranks)
+                    else InstanceState.FAILED
+                )
+                self._admission_open = False
+                self._last_message = (
+                    message or "SGLang engine is paused by fault tolerance."
+                )
+            else:
+                self._set_degraded_or_failed_locked(
+                    message or "scheduler process exited"
+                )
 
     def validate_retry(self) -> Optional[str]:
         if not self.enabled:
@@ -220,6 +280,7 @@ class FaultToleranceManager:
         if error is not None:
             return self._failure(error)
         with self._lock:
+            self._pending_scale_down_ranks.clear()
             for item in self._ranks:
                 if item.state != RankState.DEAD:
                     item.state = RankState.PAUSED
@@ -235,6 +296,7 @@ class FaultToleranceManager:
             for item in self._ranks:
                 if item.state == RankState.PAUSED:
                     item.state = RankState.HEALTHY
+            self._pending_scale_down_ranks.clear()
             self._instance_state = InstanceState.RUNNING
             self._admission_open = True
             self._last_message = ""
@@ -268,10 +330,18 @@ class FaultToleranceManager:
         if error is not None:
             return self._failure(error)
         with self._lock:
-            for rank in set(ranks):
-                self._ranks[rank].state = RankState.DEAD
+            self._pending_scale_down_ranks = set(ranks)
+            for rank in self._pending_scale_down_ranks:
+                if self._ranks[rank].state not in (
+                    RankState.UNHEALTHY,
+                    RankState.DEAD,
+                ):
+                    self._ranks[rank].state = RankState.DEAD
             for item in self._ranks:
-                if item.state != RankState.DEAD:
+                if (
+                    item.rank not in self._pending_scale_down_ranks
+                    and item.state != RankState.DEAD
+                ):
                     item.state = RankState.PAUSED
             self._instance_state = InstanceState.RECOVERING
             self._admission_open = False
@@ -282,20 +352,18 @@ class FaultToleranceManager:
         if not self.enabled:
             return self._failure("fault tolerance is not enabled")
         with self._lock:
+            pending = set(self._pending_scale_down_ranks)
             for item in self._ranks:
-                if item.state != RankState.DEAD:
+                if item.rank not in pending and item.state != RankState.DEAD:
                     item.state = RankState.HEALTHY
-            self._instance_state = (
-                InstanceState.DEGRADED_RUNNING
-                if any(item.state == RankState.DEAD for item in self._ranks)
-                else InstanceState.RUNNING
-            )
-            self._admission_open = True
+            self._pending_scale_down_ranks.clear()
+            self._set_running_or_degraded_locked()
             self._last_message = ""
             return self._success_locked("scale_down succeeded")
 
     def fail_recovery(self, message: str) -> Dict[str, Any]:
         with self._lock:
+            self._pending_scale_down_ranks.clear()
             self._instance_state = InstanceState.FAILED
             self._admission_open = False
             self._last_message = message
@@ -318,3 +386,41 @@ class FaultToleranceManager:
             "message": message,
             "ranks": [rank.to_api() for rank in self._ranks],
         }
+
+    def recovery_active_mask(self) -> List[bool]:
+        with self._lock:
+            if self._pending_scale_down_ranks:
+                return [
+                    item.rank not in self._pending_scale_down_ranks
+                    and item.state != RankState.DEAD
+                    for item in self._ranks
+                ]
+            return self._alive_mask_locked()
+
+    def _service_active_mask_locked(self) -> List[bool]:
+        return [rank.state == RankState.HEALTHY for rank in self._ranks]
+
+    def _alive_mask_locked(self) -> List[bool]:
+        return [rank.state != RankState.DEAD for rank in self._ranks]
+
+    def _set_running_or_degraded_locked(self) -> None:
+        if any(item.state == RankState.HEALTHY for item in self._ranks):
+            self._instance_state = (
+                InstanceState.DEGRADED_RUNNING
+                if any(item.state != RankState.HEALTHY for item in self._ranks)
+                else InstanceState.RUNNING
+            )
+            self._admission_open = True
+        else:
+            self._instance_state = InstanceState.FAILED
+            self._admission_open = False
+
+    def _set_degraded_or_failed_locked(self, message: str) -> None:
+        if any(item.state == RankState.HEALTHY for item in self._ranks):
+            self._instance_state = InstanceState.DEGRADED_RUNNING
+            self._admission_open = True
+            self._last_message = message
+        else:
+            self._instance_state = InstanceState.FAILED
+            self._admission_open = False
+            self._last_message = message
