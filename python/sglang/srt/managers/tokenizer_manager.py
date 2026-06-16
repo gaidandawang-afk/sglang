@@ -2610,6 +2610,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "prepare_retry",
                 target_ranks=active_ranks,
                 timeout_sec=self.server_args.fault_tolerance_recovery_timeout_sec,
+                params={"lightweight": True},
             )
         except Exception:
             logger.exception(
