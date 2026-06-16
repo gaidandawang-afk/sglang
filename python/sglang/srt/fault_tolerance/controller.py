@@ -224,6 +224,8 @@ class FaultToleranceManager:
     def validate_retry(self) -> Optional[str]:
         if not self.enabled:
             return "fault tolerance is not enabled"
+        if self.on_error_strategy == "continue":
+            return "retry is not supported when fault_tolerance_on_error_strategy=continue"
         with self._lock:
             if self._instance_state == InstanceState.RECOVERING:
                 return "fault tolerance recovery is already in progress"
@@ -272,6 +274,11 @@ class FaultToleranceManager:
     def validate_scale_down(self, ranks: Sequence[int]) -> Optional[str]:
         if not self.enabled:
             return "fault tolerance is not enabled"
+        if self.on_error_strategy == "continue":
+            return (
+                "scale_down is not supported when "
+                "fault_tolerance_on_error_strategy=continue"
+            )
         if not self.is_mooncake_backend:
             return "scale_down requires mooncake backend"
         if not ranks:

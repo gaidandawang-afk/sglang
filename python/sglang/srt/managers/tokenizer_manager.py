@@ -2608,18 +2608,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and self.fault_tolerance.is_mooncake_backend
         ):
             await self._fault_tolerance_update_dp_routing()
-            await self.fault_tolerance_apply(
-                {
-                    "fault_tolerance_instruction": "scale_down",
-                    "fault_tolerance_timeout": (
-                        self.server_args.fault_tolerance_recovery_timeout_sec
-                    ),
-                    "fault_tolerance_params": {
-                        "ranks": [rank],
-                        "source": "watchdog",
-                        "message": message,
-                    },
-                }
+            logger.info(
+                "[FaultTolerance] scheduler rank %s marked dead; continuing "
+                "with active_mask=%s",
+                rank,
+                self.fault_tolerance.active_mask(),
             )
         else:
             logger.info(
@@ -2664,17 +2657,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             await self._fault_tolerance_send_command(
                 "apply_active_mask",
                 target_ranks=live_ranks,
-                active_mask=self.fault_tolerance.active_mask(),
-                timeout_sec=self.server_args.fault_tolerance_recovery_timeout_sec,
-            )
-            healthy_ranks = [
-                rank
-                for rank, is_active in enumerate(self.fault_tolerance.active_mask())
-                if is_active
-            ]
-            await self._fault_tolerance_send_command(
-                "resume",
-                target_ranks=healthy_ranks,
                 active_mask=self.fault_tolerance.active_mask(),
                 timeout_sec=self.server_args.fault_tolerance_recovery_timeout_sec,
             )
@@ -2836,6 +2818,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return 409, {
                 "success": False,
                 "message": "fault tolerance recovery is already in progress",
+                "ranks": self.fault_tolerance.status_response()["ranks"],
+            }
+        if self.server_args.fault_tolerance_on_error_strategy == "continue":
+            return 400, {
+                "success": False,
+                "message": (
+                    "fault tolerance apply is not supported when "
+                    "fault_tolerance_on_error_strategy=continue"
+                ),
                 "ranks": self.fault_tolerance.status_response()["ranks"],
             }
 

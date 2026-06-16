@@ -123,28 +123,16 @@ def test_continue_recoverable_fault_keeps_healthy_ranks_active():
     assert status["active_mask"] == [True, True, False, True]
     assert mgr.live_mask() == [True, True, True, True]
     assert mgr.paused_ranks() == [2]
-    assert mgr.validate_retry() is None
+    assert "not supported" in mgr.validate_retry()
 
 
-def test_continue_retry_only_recovers_paused_rank():
+def test_continue_rejects_apply_operations():
     mgr = make_manager(dp_size=3, strategy="continue")
     mgr.pause_all_active("recoverable fault", rank=1)
-    assert mgr.begin_retry()["success"] is True
-    status = mgr.status_response()
-    assert status["instance_state"] == "recovering"
-    assert status["admission_open"] is True
-    assert [item["state"] for item in status["ranks"]] == [
-        "healthy",
-        "paused",
-        "healthy",
-    ]
-    assert mgr.paused_ranks() == [1]
-    assert mgr.commit_retry()["success"] is True
-    assert [item["state"] for item in mgr.status_response()["ranks"]] == [
-        "healthy",
-        "healthy",
-        "healthy",
-    ]
+    assert "not supported" in mgr.validate_retry()
+    assert "not supported" in mgr.validate_scale_down([1])
+    assert mgr.begin_retry()["success"] is False
+    assert mgr.begin_scale_down([1])["success"] is False
 
 
 def test_continue_non_recoverable_fault_keeps_healthy_ranks_active():
@@ -161,7 +149,8 @@ def test_continue_non_recoverable_fault_keeps_healthy_ranks_active():
     ]
     assert status["active_mask"] == [True, False, True, True]
     assert mgr.live_mask() == [True, False, True, True]
-    assert "scale_down" in mgr.validate_retry()
+    assert "not supported" in mgr.validate_retry()
+    assert "not supported" in mgr.validate_scale_down([1])
 
 
 def test_continue_routed_paused_or_dead_rank_rejected():
@@ -176,17 +165,17 @@ def test_continue_routed_paused_or_dead_rank_rejected():
 
 
 def test_retry_failure_rolls_back_recovery_state():
-    mgr = make_manager(dp_size=3, strategy="continue")
+    mgr = make_manager(dp_size=3)
     mgr.pause_all_active("recoverable fault", rank=1)
     assert mgr.begin_retry()["success"] is True
     result = mgr.rollback_recovery("retry failed")
     assert result["success"] is False
     status = mgr.status_response()
-    assert status["instance_state"] == "degraded_running"
+    assert status["instance_state"] == "paused"
     assert [item["state"] for item in status["ranks"]] == [
-        "healthy",
         "paused",
-        "healthy",
+        "paused",
+        "paused",
     ]
 
 
