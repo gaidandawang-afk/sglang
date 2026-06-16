@@ -7237,6 +7237,16 @@ class ServerArgs:
                 "--enable-fault-tolerance currently requires "
                 "--elastic-ep-backend mooncake"
             )
+            if (
+                self.enable_dp_attention
+                and not self.enable_dp_attention_local_control_broadcast
+            ):
+                logger.info(
+                    "Enable DP attention local control broadcast for fault "
+                    "tolerance so control commands do not depend on a "
+                    "full TP-group broadcast."
+                )
+                self.enable_dp_attention_local_control_broadcast = True
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 
