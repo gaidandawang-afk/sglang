@@ -4077,6 +4077,10 @@ class Scheduler(
         if is_target_rank:
             raise RuntimeError(f"Injected recoverable FT fault on scheduler rank {rank}")
         if self.server_args.fault_tolerance_on_error_strategy == "continue":
+            active_mask = [
+                dp_rank not in target_ranks for dp_rank in range(self.dp_size)
+            ]
+            self._fault_tolerance_apply_active_mask(active_mask)
             return
         raise RuntimeError(
             f"Cooperative recoverable FT pause on scheduler rank {rank}; "
