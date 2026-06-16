@@ -2667,6 +2667,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 active_mask=self.fault_tolerance.active_mask(),
                 timeout_sec=self.server_args.fault_tolerance_recovery_timeout_sec,
             )
+            healthy_ranks = [
+                rank
+                for rank, is_active in enumerate(self.fault_tolerance.active_mask())
+                if is_active
+            ]
+            await self._fault_tolerance_send_command(
+                "resume",
+                target_ranks=healthy_ranks,
+                active_mask=self.fault_tolerance.active_mask(),
+                timeout_sec=self.server_args.fault_tolerance_recovery_timeout_sec,
+            )
             logger.info(
                 "[FaultTolerance] continue recoverable fault active mask applied; "
                 "live_ranks=%s active_mask=%s",

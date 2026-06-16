@@ -4081,6 +4081,7 @@ class Scheduler(
                 dp_rank not in target_ranks for dp_rank in range(self.dp_size)
             ]
             self._fault_tolerance_apply_active_mask(active_mask)
+            self._engine_paused = True
             return
         raise RuntimeError(
             f"Cooperative recoverable FT pause on scheduler rank {rank}; "
