@@ -2640,14 +2640,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def _fault_tolerance_pause_active_ranks(self):
         try:
-            await self._fault_tolerance_update_dp_routing()
+            active_mask = self.fault_tolerance.recovery_active_mask()
+            await self._fault_tolerance_update_dp_routing(active_mask=active_mask)
             active_ranks = self.fault_tolerance.alive_ranks()
             if not active_ranks:
                 return
             await self._fault_tolerance_send_command(
                 "prepare_retry",
                 target_ranks=active_ranks,
-                active_mask=self.fault_tolerance.recovery_active_mask(),
+                active_mask=active_mask,
                 timeout_sec=self.server_args.fault_tolerance_recovery_timeout_sec,
                 params={"lightweight": True},
             )
@@ -2657,11 +2658,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             os._exit(1)
 
-    async def _fault_tolerance_update_dp_routing(self):
+    async def _fault_tolerance_update_dp_routing(
+        self, active_mask: Optional[List[bool]] = None
+    ):
         if self.server_args.dp_size <= 1:
             return
+        active_mask = (
+            active_mask
+            if active_mask is not None
+            else self.fault_tolerance.active_mask()
+        )
         send_result = self.send_to_scheduler.send_pyobj(
-            ActiveRanksOutput(status=self.fault_tolerance.active_mask())
+            ActiveRanksOutput(status=active_mask)
         )
         if inspect.isawaitable(send_result):
             await send_result
@@ -2752,7 +2760,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             command_params["apply_active_mask_before_prepare"] = True
             command_params["skip_device_synchronize"] = True
 
-        await self._fault_tolerance_update_dp_routing()
+        await self._fault_tolerance_update_dp_routing(active_mask=active_mask)
         self.abort_request(abort_all=True)
         for command in ("prepare_retry", "reinit", "health_check", "resume"):
             await self._fault_tolerance_send_command(
