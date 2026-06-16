@@ -209,15 +209,6 @@ class DataParallelController:
             for rank in obj.target_ranks
             if 0 <= rank < len(self.workers) and self.status[rank]
         ]
-        logger.info(
-            "[FaultTolerance] DPC dispatch command=%s request_id=%s "
-            "target_ranks=%s recipients=%s status=%s",
-            obj.command,
-            obj.request_id,
-            obj.target_ranks,
-            recipients,
-            self.status,
-        )
         for rank in recipients:
             self.workers[rank].send_pyobj(obj)
 

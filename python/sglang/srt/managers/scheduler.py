@@ -3767,15 +3767,6 @@ class Scheduler(
         self, recv_req: FaultToleranceCommandReqInput
     ) -> FaultToleranceCommandReqOutput:
         rank = self.dp_rank if self.dp_rank is not None else 0
-        logger.info(
-            "[FaultTolerance] rank=%s handling command=%s request_id=%s "
-            "target_ranks=%s params=%s",
-            rank,
-            recv_req.command,
-            recv_req.request_id,
-            recv_req.target_ranks,
-            recv_req.params,
-        )
         try:
             if rank not in recv_req.target_ranks:
                 return FaultToleranceCommandReqOutput(
@@ -3790,13 +3781,6 @@ class Scheduler(
                 self._fault_tolerance_cleanup_runtime_state()
                 if recv_req.params.get("apply_active_mask_before_prepare", False):
                     active_mask = self._fault_tolerance_normalize_active_mask(recv_req)
-                    logger.info(
-                        "[FaultTolerance] rank=%s applying active mask during "
-                        "prepare_retry request_id=%s active_mask=%s",
-                        rank,
-                        recv_req.request_id,
-                        active_mask,
-                    )
                     self._fault_tolerance_apply_active_mask(active_mask)
                 if recv_req.params.get("skip_device_synchronize", False):
                     self.tp_worker.model_runner.fault_tolerance_invalidate_cuda_graphs()
@@ -3824,25 +3808,12 @@ class Scheduler(
                 active_mask = self._fault_tolerance_normalize_active_mask(recv_req)
                 if any(not is_active for is_active in active_mask):
                     if recv_req.params.get("apply_active_mask_before_prepare", False):
-                        logger.info(
-                            "[FaultTolerance] rank=%s skipping reinit active mask; "
-                            "already applied request_id=%s",
-                            rank,
-                            recv_req.request_id,
-                        )
                         return FaultToleranceCommandReqOutput(
                             request_id=recv_req.request_id,
                             rank=rank,
                             success=True,
                             message="active mask already applied",
                         )
-                    logger.info(
-                        "[FaultTolerance] rank=%s applying active mask during "
-                        "reinit request_id=%s active_mask=%s",
-                        rank,
-                        recv_req.request_id,
-                        active_mask,
-                    )
                     self._fault_tolerance_apply_active_mask(active_mask)
                 else:
                     model_runner = self.tp_worker.model_runner

@@ -2657,16 +2657,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else self.server_args.fault_tolerance_recovery_timeout_sec
         )
         request_id = str(uuid.uuid4())
-        logger.info(
-            "[FaultTolerance] sending command=%s request_id=%s target_ranks=%s "
-            "active_mask=%s params=%s timeout=%s",
-            command,
-            request_id,
-            target_ranks,
-            active_mask,
-            params or {},
-            timeout_sec,
-        )
         req = FaultToleranceCommandReqInput(
             request_id=request_id,
             command=command,
@@ -2689,12 +2679,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             outputs = await asyncio.wait_for(
                 self._fault_tolerance_pending_commands[request_id].future,
                 timeout=timeout_sec,
-            )
-            logger.info(
-                "[FaultTolerance] command=%s request_id=%s completed ranks=%s",
-                command,
-                request_id,
-                [output.rank for output in outputs],
             )
             failed = [output for output in outputs if not output.success]
             if failed:
@@ -2756,12 +2740,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         )
         params = obj.get("fault_tolerance_params") or {}
-        logger.info(
-            "[FaultTolerance] apply instruction=%s timeout=%s params=%s",
-            instruction,
-            timeout_sec,
-            params,
-        )
 
         if not self.server_args.enable_fault_tolerance:
             return 503, {
