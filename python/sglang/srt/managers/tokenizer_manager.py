@@ -2639,18 +2639,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _fault_tolerance_continue_after_recoverable_fault(self):
         try:
             await self._fault_tolerance_update_dp_routing()
-            active_ranks = [
-                rank
-                for rank, is_active in enumerate(self.fault_tolerance.active_mask())
-                if is_active
-            ]
-            if not active_ranks:
+            live_ranks = self.fault_tolerance.active_ranks()
+            if not live_ranks:
                 return
             await self._fault_tolerance_send_command(
                 "apply_active_mask",
-                target_ranks=active_ranks,
+                target_ranks=live_ranks,
                 active_mask=self.fault_tolerance.active_mask(),
                 timeout_sec=self.server_args.fault_tolerance_recovery_timeout_sec,
+            )
+            logger.info(
+                "[FaultTolerance] continue recoverable fault active mask applied; "
+                "live_ranks=%s active_mask=%s",
+                live_ranks,
+                self.fault_tolerance.active_mask(),
             )
         except Exception:
             logger.exception(
