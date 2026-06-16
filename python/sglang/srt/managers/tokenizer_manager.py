@@ -2598,7 +2598,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 }
             )
         else:
-            await self._fault_tolerance_pause_active_ranks()
+            logger.info(
+                "[FaultTolerance] scheduler rank %s marked dead; admission is "
+                "paused until an explicit recovery instruction is applied",
+                rank,
+            )
 
     async def _fault_tolerance_pause_active_ranks(self):
         try:
