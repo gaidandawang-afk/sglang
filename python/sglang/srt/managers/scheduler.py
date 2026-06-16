@@ -3777,11 +3777,11 @@ class Scheduler(
                 )
 
             if recv_req.command == "prepare_retry":
+                self._engine_paused = True
+                self._fault_tolerance_cleanup_runtime_state()
                 if recv_req.params.get("apply_active_mask_before_prepare", False):
                     active_mask = self._fault_tolerance_normalize_active_mask(recv_req)
                     self._fault_tolerance_apply_active_mask(active_mask)
-                self._engine_paused = True
-                self._fault_tolerance_cleanup_runtime_state()
                 if recv_req.params.get("skip_device_synchronize", False):
                     self.tp_worker.model_runner.fault_tolerance_invalidate_cuda_graphs()
                 elif not recv_req.params.get("lightweight", False):
@@ -3807,6 +3807,13 @@ class Scheduler(
             if recv_req.command == "reinit":
                 active_mask = self._fault_tolerance_normalize_active_mask(recv_req)
                 if any(not is_active for is_active in active_mask):
+                    if recv_req.params.get("apply_active_mask_before_prepare", False):
+                        return FaultToleranceCommandReqOutput(
+                            request_id=recv_req.request_id,
+                            rank=rank,
+                            success=True,
+                            message="active mask already applied",
+                        )
                     self._fault_tolerance_apply_active_mask(active_mask)
                 else:
                     model_runner = self.tp_worker.model_runner
