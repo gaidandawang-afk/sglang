@@ -204,11 +204,17 @@ class DataParallelController:
                 worker.send_pyobj(obj)
 
     def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
-        recipients = [
-            rank
-            for rank in obj.target_ranks
-            if 0 <= rank < len(self.workers)
-        ]
+        if (
+            self.server_args.enable_dp_attention
+            and not self.server_args.enable_dp_attention_local_control_broadcast
+        ):
+            recipients = list(range(0, len(self.workers), self.control_message_step))
+        else:
+            recipients = [
+                rank
+                for rank in obj.target_ranks
+                if 0 <= rank < len(self.workers)
+            ]
         logger.info(
             "[FaultTolerance] DPC forwarding command=%s request_id=%s "
             "targets=%s recipients=%s status=%s",
