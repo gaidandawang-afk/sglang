@@ -2732,9 +2732,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         )
         try:
+            logger.info(
+                "[FaultTolerance] sending command=%s request_id=%s "
+                "target_ranks=%s active_mask=%s",
+                command,
+                request_id,
+                target_ranks,
+                active_mask,
+            )
             send_result = self.send_to_scheduler.send_pyobj(req)
             if inspect.isawaitable(send_result):
                 await send_result
+            logger.info(
+                "[FaultTolerance] sent command=%s request_id=%s; waiting for %s",
+                command,
+                request_id,
+                sorted(expected_ranks),
+            )
             outputs = await asyncio.wait_for(
                 self._fault_tolerance_pending_commands[request_id].future,
                 timeout=timeout_sec,

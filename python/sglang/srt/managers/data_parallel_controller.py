@@ -209,8 +209,22 @@ class DataParallelController:
             for rank in obj.target_ranks
             if 0 <= rank < len(self.workers)
         ]
+        logger.info(
+            "[FaultTolerance] DPC forwarding command=%s request_id=%s "
+            "targets=%s recipients=%s status=%s",
+            obj.command,
+            obj.request_id,
+            obj.target_ranks,
+            recipients,
+            self.status,
+        )
         for rank in recipients:
             self.workers[rank].send_pyobj(obj)
+        logger.info(
+            "[FaultTolerance] DPC forwarded command=%s request_id=%s",
+            obj.command,
+            obj.request_id,
+        )
 
     def send_control_message(self, obj):
         # Send control messages to first worker of tp group
@@ -221,6 +235,11 @@ class DataParallelController:
         self.dp_budget.update_budget(obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
+        logger.info(
+            "[FaultTolerance] DPC active ranks update: %s -> %s",
+            self.status,
+            ranks.status,
+        )
         self.status = ranks.status
 
     def dispatching_with_trace(self, req: Req):
