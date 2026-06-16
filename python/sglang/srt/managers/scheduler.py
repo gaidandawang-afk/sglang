@@ -4038,6 +4038,8 @@ class Scheduler(
                 pass
         if is_target_rank:
             raise RuntimeError(f"Injected recoverable FT fault on scheduler rank {rank}")
+        if self.server_args.fault_tolerance_on_error_strategy == "continue":
+            return
         raise RuntimeError(
             f"Cooperative recoverable FT pause on scheduler rank {rank}; "
             f"target ranks={sorted(target_ranks)}"

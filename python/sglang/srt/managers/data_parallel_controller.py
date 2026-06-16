@@ -207,7 +207,7 @@ class DataParallelController:
         recipients = [
             rank
             for rank in obj.target_ranks
-            if 0 <= rank < len(self.workers) and self.status[rank]
+            if 0 <= rank < len(self.workers)
         ]
         for rank in recipients:
             self.workers[rank].send_pyobj(obj)

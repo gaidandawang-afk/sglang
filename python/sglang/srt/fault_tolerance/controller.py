@@ -4,7 +4,7 @@ import logging
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,9 @@ class FaultToleranceManager:
         self._admission_open = True
         self._last_fault: Optional[FaultStatus] = None
         self._last_message = ""
+        self._recovery_snapshot: Optional[
+            Tuple[List[RankState], InstanceState, bool, Optional[FaultStatus], str]
+        ] = None
 
     @property
     def is_mooncake_backend(self) -> bool:
@@ -84,9 +87,7 @@ class FaultToleranceManager:
 
     def status_response(self) -> Dict[str, Any]:
         with self._lock:
-            active_mask = [
-                rank.state != RankState.DEAD for rank in self._ranks
-            ]
+            active_mask = self._active_mask_locked()
             return {
                 "enabled": self.enabled,
                 "instance_state": self._instance_state.value,
@@ -121,7 +122,11 @@ class FaultToleranceManager:
 
     def active_mask(self) -> List[bool]:
         with self._lock:
-            return [rank.state != RankState.DEAD for rank in self._ranks]
+            return self._active_mask_locked()
+
+    def live_mask(self) -> List[bool]:
+        with self._lock:
+            return self._live_mask_locked()
 
     def active_ranks(self) -> List[int]:
         with self._lock:
@@ -129,6 +134,12 @@ class FaultToleranceManager:
                 rank.rank
                 for rank in self._ranks
                 if rank.state != RankState.DEAD
+            ]
+
+    def paused_ranks(self) -> List[int]:
+        with self._lock:
+            return [
+                rank.rank for rank in self._ranks if rank.state == RankState.PAUSED
             ]
 
     def dead_ranks(self) -> List[int]:
@@ -141,9 +152,9 @@ class FaultToleranceManager:
         if not self.enabled:
             return
         with self._lock:
-            if 0 <= rank < self.dp_size and self._ranks[rank].state == RankState.DEAD:
+            if 0 <= rank < self.dp_size and self._ranks[rank].state != RankState.HEALTHY:
                 raise ValueError(
-                    f"routed_dp_rank={rank} is isolated by fault tolerance"
+                    f"routed_dp_rank={rank} is unavailable by fault tolerance"
                 )
 
     def pause_all_active(
@@ -156,17 +167,27 @@ class FaultToleranceManager:
         if not self.enabled:
             return
         with self._lock:
-            for item in self._ranks:
-                if item.state == RankState.HEALTHY:
-                    item.state = RankState.PAUSED
-            self._instance_state = InstanceState.PAUSED
-            self._admission_open = False
+            if self.on_error_strategy == "continue" and rank is not None:
+                if 0 <= rank < self.dp_size and self._ranks[rank].state != RankState.DEAD:
+                    self._ranks[rank].state = RankState.PAUSED
+                self._instance_state = (
+                    InstanceState.DEGRADED_RUNNING
+                    if any(item.state == RankState.HEALTHY for item in self._ranks)
+                    else InstanceState.PAUSED
+                )
+                self._admission_open = self._instance_state == InstanceState.DEGRADED_RUNNING
+            else:
+                for item in self._ranks:
+                    if item.state == RankState.HEALTHY:
+                        item.state = RankState.PAUSED
+                self._instance_state = InstanceState.PAUSED
+                self._admission_open = False
             self._last_fault = FaultStatus(
                 rank=rank,
                 type=fault_type,
                 message=message or "scheduler rank fault",
             )
-            self._last_message = message or "SGLang engine is paused by fault tolerance."
+            self._last_message = message or "SGLang engine is degraded by fault tolerance."
 
     def record_fault(self, rank: int, message: str) -> None:
         if not self.enabled:
@@ -176,21 +197,29 @@ class FaultToleranceManager:
                 logger.warning("Ignoring FT fault for unknown rank %s", rank)
                 return
             self._ranks[rank].state = RankState.DEAD
-            for item in self._ranks:
-                if item.state == RankState.HEALTHY:
-                    item.state = RankState.PAUSED
-            self._instance_state = (
-                InstanceState.PAUSED
-                if any(item.state != RankState.DEAD for item in self._ranks)
-                else InstanceState.FAILED
-            )
-            self._admission_open = False
+            if self.on_error_strategy == "continue":
+                self._instance_state = (
+                    InstanceState.DEGRADED_RUNNING
+                    if any(item.state == RankState.HEALTHY for item in self._ranks)
+                    else InstanceState.FAILED
+                )
+                self._admission_open = self._instance_state == InstanceState.DEGRADED_RUNNING
+            else:
+                for item in self._ranks:
+                    if item.state == RankState.HEALTHY:
+                        item.state = RankState.PAUSED
+                self._instance_state = (
+                    InstanceState.PAUSED
+                    if any(item.state != RankState.DEAD for item in self._ranks)
+                    else InstanceState.FAILED
+                )
+                self._admission_open = False
             self._last_fault = FaultStatus(
                 rank=rank,
                 type="non_recoverable",
                 message=message or "scheduler process exited",
             )
-            self._last_message = message or "SGLang engine is paused by fault tolerance."
+            self._last_message = message or "SGLang engine is degraded by fault tolerance."
 
     def validate_retry(self) -> Optional[str]:
         if not self.enabled:
@@ -198,11 +227,6 @@ class FaultToleranceManager:
         with self._lock:
             if self._instance_state == InstanceState.RECOVERING:
                 return "fault tolerance recovery is already in progress"
-            if self._instance_state in (
-                InstanceState.RUNNING,
-                InstanceState.DEGRADED_RUNNING,
-            ):
-                return "already_running"
             if self._instance_state == InstanceState.FAILED:
                 return "fault tolerance instance is failed"
             dead_ranks = [
@@ -213,6 +237,8 @@ class FaultToleranceManager:
                     f"retry cannot be performed when ranks {dead_ranks} are dead; "
                     "use scale_down for process/rank failures"
                 )
+            if not any(item.state == RankState.PAUSED for item in self._ranks):
+                return "already_running"
             return None
 
     def begin_retry(self) -> Dict[str, Any]:
@@ -220,11 +246,13 @@ class FaultToleranceManager:
         if error is not None:
             return self._failure(error)
         with self._lock:
-            for item in self._ranks:
-                if item.state != RankState.DEAD:
-                    item.state = RankState.PAUSED
+            self._snapshot_recovery_locked()
+            if self.on_error_strategy != "continue":
+                for item in self._ranks:
+                    if item.state != RankState.DEAD:
+                        item.state = RankState.PAUSED
             self._instance_state = InstanceState.RECOVERING
-            self._admission_open = False
+            self._admission_open = self.on_error_strategy == "continue"
             self._last_message = "SGLang engine is recovering by fault tolerance."
             return self._success_locked("retry started")
 
@@ -238,6 +266,7 @@ class FaultToleranceManager:
             self._instance_state = InstanceState.RUNNING
             self._admission_open = True
             self._last_message = ""
+            self._recovery_snapshot = None
             return self._success_locked("retry succeeded")
 
     def validate_scale_down(self, ranks: Sequence[int]) -> Optional[str]:
@@ -268,11 +297,13 @@ class FaultToleranceManager:
         if error is not None:
             return self._failure(error)
         with self._lock:
+            self._snapshot_recovery_locked()
             for rank in set(ranks):
                 self._ranks[rank].state = RankState.DEAD
-            for item in self._ranks:
-                if item.state != RankState.DEAD:
-                    item.state = RankState.PAUSED
+            if self.on_error_strategy != "continue":
+                for item in self._ranks:
+                    if item.state != RankState.DEAD:
+                        item.state = RankState.PAUSED
             self._instance_state = InstanceState.RECOVERING
             self._admission_open = False
             self._last_message = "SGLang engine is recovering by fault tolerance."
@@ -292,7 +323,27 @@ class FaultToleranceManager:
             )
             self._admission_open = True
             self._last_message = ""
+            self._recovery_snapshot = None
             return self._success_locked("scale_down succeeded")
+
+    def rollback_recovery(self, message: str) -> Dict[str, Any]:
+        with self._lock:
+            if self._recovery_snapshot is None:
+                self._instance_state = InstanceState.FAILED
+                self._admission_open = False
+                self._last_message = message
+                return self._failure_locked(message)
+            states, instance_state, admission_open, last_fault, last_message = (
+                self._recovery_snapshot
+            )
+            for item, state in zip(self._ranks, states):
+                item.state = state
+            self._instance_state = instance_state
+            self._admission_open = admission_open
+            self._last_fault = last_fault
+            self._last_message = last_message or message
+            self._recovery_snapshot = None
+            return self._failure_locked(message)
 
     def fail_recovery(self, message: str) -> Dict[str, Any]:
         with self._lock:
@@ -318,3 +369,18 @@ class FaultToleranceManager:
             "message": message,
             "ranks": [rank.to_api() for rank in self._ranks],
         }
+
+    def _active_mask_locked(self) -> List[bool]:
+        return [rank.state == RankState.HEALTHY for rank in self._ranks]
+
+    def _live_mask_locked(self) -> List[bool]:
+        return [rank.state != RankState.DEAD for rank in self._ranks]
+
+    def _snapshot_recovery_locked(self) -> None:
+        self._recovery_snapshot = (
+            [item.state for item in self._ranks],
+            self._instance_state,
+            self._admission_open,
+            self._last_fault,
+            self._last_message,
+        )

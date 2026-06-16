@@ -565,7 +565,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
-            self.fault_tolerance.validate_routed_rank(obj.routed_dp_rank)
+            try:
+                self.fault_tolerance.validate_routed_rank(obj.routed_dp_rank)
+            except ValueError as exc:
+                raise fastapi.HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    detail=self.fault_tolerance.unavailable_error(),
+                ) from exc
 
         if (
             self.server_args.enable_fault_tolerance
@@ -2534,11 +2540,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.fault_tolerance.pause_all_active(
                 message, rank=recv_obj.rank, fault_type="recoverable"
             )
-            self.abort_request(abort_all=True)
             if self.event_loop is not None:
-                asyncio.run_coroutine_threadsafe(
-                    self._fault_tolerance_pause_active_ranks(), self.event_loop
-                )
+                if self.server_args.fault_tolerance_on_error_strategy == "continue":
+                    asyncio.run_coroutine_threadsafe(
+                        self._fault_tolerance_continue_after_recoverable_fault(),
+                        self.event_loop,
+                    )
+                else:
+                    self.abort_request(abort_all=True)
+                    asyncio.run_coroutine_threadsafe(
+                        self._fault_tolerance_pause_active_ranks(), self.event_loop
+                    )
         else:
             self.fault_tolerance.record_fault(recv_obj.rank, message)
             if self.event_loop is not None:
@@ -2578,12 +2590,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return True
 
     async def _fault_tolerance_handle_process_exit(self, rank: int, message: str):
-        await self._fault_tolerance_update_dp_routing()
-        self.abort_request(abort_all=True)
         if (
             self.server_args.fault_tolerance_on_error_strategy == "continue"
             and self.fault_tolerance.is_mooncake_backend
         ):
+            await self._fault_tolerance_update_dp_routing()
             await self.fault_tolerance_apply(
                 {
                     "fault_tolerance_instruction": "scale_down",
@@ -2603,6 +2614,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "paused until an explicit recovery instruction is applied",
                 rank,
             )
+            self.abort_request(abort_all=True)
+            await self._fault_tolerance_update_dp_routing()
+            await self._fault_tolerance_pause_active_ranks()
 
     async def _fault_tolerance_pause_active_ranks(self):
         try:
@@ -2619,6 +2633,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         except Exception:
             logger.exception(
                 "[FaultTolerance] failed to pause active ranks; triggering fail-stop"
+            )
+            os._exit(1)
+
+    async def _fault_tolerance_continue_after_recoverable_fault(self):
+        try:
+            await self._fault_tolerance_update_dp_routing()
+            active_ranks = [
+                rank
+                for rank, is_active in enumerate(self.fault_tolerance.active_mask())
+                if is_active
+            ]
+            if not active_ranks:
+                return
+            await self._fault_tolerance_send_command(
+                "apply_active_mask",
+                target_ranks=active_ranks,
+                active_mask=self.fault_tolerance.active_mask(),
+                timeout_sec=self.server_args.fault_tolerance_recovery_timeout_sec,
+            )
+        except Exception:
+            logger.exception(
+                "[FaultTolerance] failed to continue after recoverable fault; "
+                "triggering fail-stop"
             )
             os._exit(1)
 
@@ -2643,7 +2680,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         active_mask = (
             active_mask
             if active_mask is not None
-            else self.fault_tolerance.active_mask()
+            else self.fault_tolerance.live_mask()
         )
         active_ranks = [
             rank for rank, is_active in enumerate(active_mask) if is_active
@@ -2688,24 +2725,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self._fault_tolerance_pending_commands.pop(request_id, None)
 
     async def _fault_tolerance_run_retry(self, timeout_sec: int, params: Dict[str, Any]):
-        active_ranks = self.fault_tolerance.active_ranks()
+        active_ranks = self.fault_tolerance.paused_ranks()
+        command_params = dict(params or {})
+        command_params.setdefault("lightweight", True)
         await self._fault_tolerance_send_command(
             "prepare_retry",
             target_ranks=active_ranks,
             timeout_sec=timeout_sec,
-            params=params,
+            params=command_params,
         )
         await self._fault_tolerance_send_command(
             "resume",
             target_ranks=active_ranks,
             timeout_sec=timeout_sec,
-            params=params,
+            params=command_params,
         )
 
     async def _fault_tolerance_run_scale_down(
         self, timeout_sec: int, params: Dict[str, Any]
     ):
-        active_mask = self.fault_tolerance.active_mask()
+        active_mask = self.fault_tolerance.live_mask()
         active_ranks = self.fault_tolerance.active_ranks()
         command_params = dict(params or {})
         if len(active_ranks) < self.server_args.dp_size:
@@ -2765,11 +2804,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.fault_tolerance.begin_retry()
             try:
                 await self._fault_tolerance_run_retry(timeout_sec, params)
-            except Exception:
+            except Exception as exc:
                 logger.exception(
-                    "[FaultTolerance] retry failed; triggering fail-stop"
+                    "[FaultTolerance] retry failed; rolling back recovery state"
                 )
-                os._exit(1)
+                result = self.fault_tolerance.rollback_recovery(
+                    f"retry failed: {exc}"
+                )
+                await self._fault_tolerance_update_dp_routing()
+                return 500, result
             result = self.fault_tolerance.commit_retry()
             await self._fault_tolerance_update_dp_routing()
             return 200, result
