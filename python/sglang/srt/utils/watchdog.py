@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from multiprocessing import Process
+from multiprocessing import Process, connection
 from typing import Callable, List, Optional
 
 import psutil
@@ -204,29 +204,57 @@ class SubprocessWatchdog:
             self._thread = None
 
     def _monitor_loop(self) -> None:
+        sentinel_to_index = {
+            proc.sentinel: index
+            for index, proc in enumerate(self._processes)
+            if getattr(proc, "sentinel", None) is not None
+        }
+        remaining_sentinels = set(sentinel_to_index)
         try:
-            while not self._stop_event.wait(self._interval):
+            while not self._stop_event.is_set():
+                if remaining_sentinels:
+                    ready = connection.wait(
+                        list(remaining_sentinels), timeout=self._interval
+                    )
+                    for sentinel in ready:
+                        remaining_sentinels.discard(sentinel)
+                        index = sentinel_to_index[sentinel]
+                        if index in self._reported:
+                            continue
+                        proc = self._processes[index]
+                        if proc.exitcode is None:
+                            proc.join(timeout=0)
+                        if self._handle_process_exit(index, proc, self._names[index]):
+                            return
+
                 if self._check_processes():
                     return
         except Exception as e:
             logger.error(f"SubprocessWatchdog thread crashed: {e}", exc_info=True)
 
+    def _handle_process_exit(self, index: int, proc: Process, name: str) -> bool:
+        if proc.is_alive():
+            return False
+        if proc.exitcode == 0:
+            self._reported.add(index)
+            return False
+
+        if self._on_exit is not None and self._on_exit(index, proc, name):
+            self._reported.add(index)
+            return False
+
+        logger.error(
+            f"Subprocess {name} (pid={proc.pid}) crashed "
+            f"with exit code {proc.exitcode}. "
+            f"Triggering SIGQUIT for cleanup..."
+        )
+        os.kill(os.getpid(), signal.SIGQUIT)
+        return True
+
     def _check_processes(self) -> bool:
         for index, (proc, name) in enumerate(zip(self._processes, self._names)):
             if index in self._reported:
                 continue
-            if proc.is_alive() or proc.exitcode == 0:
-                continue
-
-            if self._on_exit is not None and self._on_exit(index, proc, name):
-                self._reported.add(index)
-                continue
-
-            logger.error(
-                f"Subprocess {name} (pid={proc.pid}) crashed "
-                f"with exit code {proc.exitcode}. "
-                f"Triggering SIGQUIT for cleanup..."
-            )
-            os.kill(os.getpid(), signal.SIGQUIT)
-            return True
+            if self._handle_process_exit(index, proc, name):
+                return True
         return False
