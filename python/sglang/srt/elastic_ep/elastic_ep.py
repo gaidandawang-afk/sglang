@@ -183,6 +183,31 @@ def _refresh_ep_members() -> None:
     EPBuffer._buffer.update_ep_member()
 
 
+def apply_active_rank_mask(mask: List[bool]) -> None:
+    state = ElasticEPStateManager.instance()
+    if state is None or state.active_ranks is None:
+        raise RuntimeError("elastic ep state is not initialized")
+    if len(mask) != state.active_ranks.numel() and state.active_ranks.numel() == 1:
+        # Native DP launches one-rank scheduler worlds. The FT control plane
+        # still carries a DP-rank mask, while each live scheduler only needs its
+        # local one-rank Mooncake mirror to stay active; DPC owns DP routing.
+        mask = [True]
+    if len(mask) != state.active_ranks.numel():
+        raise ValueError(
+            f"active mask size mismatch: got {len(mask)}, "
+            f"expected {state.active_ranks.numel()}"
+        )
+    tensor = torch.tensor(
+        [1 if item else 0 for item in mask],
+        dtype=state.active_ranks.dtype,
+        device=state.active_ranks.device,
+    )
+    state.active_ranks.copy_(tensor)
+    state.snapshot_active_to_last()
+    state.sync_active_to_cpu()
+    _refresh_ep_members()
+
+
 def try_recover_ranks(global_ranks: List[int]) -> bool:
     from mooncake import ep as mooncake_ep
 

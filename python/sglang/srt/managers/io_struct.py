@@ -1390,6 +1390,31 @@ class ContinueGenerationReqInput(BaseReq):
 
 
 @dataclass
+class FaultToleranceCommandReqInput(BaseReq):
+    request_id: str
+    command: Literal["pause", "apply_active_mask", "resume"]
+    target_ranks: List[int]
+    timeout_sec: int
+    active_mask: Optional[List[bool]] = None
+    reason: str = ""
+
+
+@dataclass
+class FaultToleranceCommandReqOutput(BaseReq):
+    request_id: str
+    rank: int
+    success: bool
+    message: str = ""
+
+
+@dataclass
+class FaultToleranceRankFaultOutput(BaseReq):
+    rank: int
+    fault_type: Literal["exception", "kill"]
+    message: str = ""
+
+
+@dataclass
 class TokenizerWorkerRegistration:
     """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
 

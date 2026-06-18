@@ -29,10 +29,13 @@ import zmq
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    FaultToleranceCommandReqInput,
+    FaultToleranceRankFaultOutput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -62,6 +65,7 @@ from sglang.srt.utils.network import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
+from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -144,6 +148,11 @@ class DataParallelController:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
+            self.send_to_tokenizer = get_zmq_socket(
+                self.context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+            )
+        else:
+            self.send_to_tokenizer = None
 
         # Dispatch method
         self.round_robin_counter = 0
@@ -179,6 +188,17 @@ class DataParallelController:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
 
+        self._ft_scheduler_watchdog = None
+        if server_args.enable_fault_tolerance and server_args.node_rank == 0:
+            self._ft_scheduler_watchdog = SubprocessWatchdog(
+                processes=self.scheduler_procs,
+                process_names=[
+                    f"scheduler_dp_{i}" for i in range(len(self.scheduler_procs))
+                ],
+                on_exit=self._handle_scheduler_process_exit,
+            )
+            self._ft_scheduler_watchdog.start()
+
         self.init_dispatcher()
 
         self.soft_watchdog = Watchdog.create(
@@ -200,6 +220,25 @@ class DataParallelController:
         # Send control messages to first worker of tp group
         for worker in self.workers[:: self.control_message_step]:
             worker.send_pyobj(obj)
+
+    def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
+        for rank in obj.target_ranks:
+            if 0 <= rank < len(self.workers) and self.status[rank]:
+                self.workers[rank].send_pyobj(obj)
+
+    def _handle_scheduler_process_exit(self, index, proc, name):
+        if self.send_to_tokenizer is None:
+            return False
+        if 0 <= index < len(self.status):
+            self.status[index] = False
+        self.send_to_tokenizer.send_pyobj(
+            FaultToleranceRankFaultOutput(
+                rank=index,
+                fault_type="kill",
+                message=f"{name} pid={proc.pid} exitcode={proc.exitcode}",
+            )
+        )
+        return True
 
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
@@ -233,6 +272,7 @@ class DataParallelController:
                 (ProfileReq, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (FaultToleranceCommandReqInput, self.send_fault_tolerance_command),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -563,51 +603,86 @@ class DataParallelController:
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
+            if not self.status[req.routed_dp_rank]:
+                self._reject_req(
+                    req, f"routed_dp_rank={req.routed_dp_rank} is inactive"
+                )
+                return True
             logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
             self.workers[req.routed_dp_rank].send_pyobj(req)
             return True
         return False
 
+    def _ensure_active_rank_available(self):
+        return any(self.status)
+
+    def _reject_req(self, req: Req, message: str):
+        logger.warning("Rejecting DP request %s: %s", getattr(req, "rid", ""), message)
+        if self.send_to_tokenizer is not None:
+            self.send_to_tokenizer.send_pyobj(
+                AbortReq(rid=req.rid, abort_message=message)
+            )
+
+    def _next_active_rank(self, preferred_rank: Optional[int] = None) -> int:
+        if not self._ensure_active_rank_available():
+            raise RuntimeError("No active DP rank available")
+        if preferred_rank is not None and self.status[preferred_rank]:
+            return preferred_rank
+        for offset in range(len(self.workers)):
+            rank = (self.round_robin_counter + offset) % len(self.workers)
+            if self.status[rank]:
+                self.round_robin_counter = (rank + 1) % len(self.workers)
+                return rank
+        raise RuntimeError("No active DP rank available")
+
     def round_robin_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
+        if not self._ensure_active_rank_available():
+            self._reject_req(req, "no active DP rank")
+            return
 
-        while True:
-            if self.status[self.round_robin_counter]:
-                logger.debug(f"Choose worker {self.round_robin_counter}")
-                self.workers[self.round_robin_counter].send_pyobj(req)
-                self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                    self.workers
-                )
-                break
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                self.workers
-            )
+        target_rank = self._next_active_rank()
+        logger.debug(f"Choose worker {target_rank}")
+        self.workers[target_rank].send_pyobj(req)
 
     def follow_bootstrap_room_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
+            return
+        if not self._ensure_active_rank_available():
+            self._reject_req(req, "no active DP rank")
             return
 
         assert req.bootstrap_room is not None, (
             "req.bootstrap_room should not be None. Do not send requests directly to "
             "prefill or decode instances; send to the router instead."
         )
-        target_rank = req.bootstrap_room % len(self.workers)
+        target_rank = self._next_active_rank(req.bootstrap_room % len(self.workers))
         self.workers[target_rank].send_pyobj(req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
+        if not self._ensure_active_rank_available():
+            self._reject_req(req, "no active DP rank")
+            return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
+        if not self.status[target_worker]:
+            target_worker = self._next_active_rank()
         self.workers[target_worker].send_pyobj(req)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
+        if not self._ensure_active_rank_available():
+            self._reject_req(req, "no active DP rank")
+            return
         estimated_tokens = len(req.input_ids)
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
+        if not self.status[target_worker]:
+            target_worker = self._next_active_rank()
         self.workers[target_worker].send_pyobj(req)
 
     def event_loop(self):

@@ -525,6 +525,11 @@ class ServerArgs:
     dp_size: int = 1
     load_balance_method: str = "auto"
 
+    # Fault tolerance
+    enable_fault_tolerance: bool = False
+    fault_tolerance_on_error_strategy: Literal["pause", "continue"] = "pause"
+    fault_tolerance_timeout: int = 60
+
     attn_cp_size: int = 1
     moe_dp_size: int = 1
 
@@ -960,6 +965,10 @@ class ServerArgs:
         self._handle_expert_distribution_metrics()
         self._handle_elastic_ep()
 
+        # Validate FT support only when MoE/Elastic-EP settings have settled.
+        # Disabled FT must keep noFT watchdog/fail-stop behavior.
+        self._handle_fault_tolerance()
+
         # Handle pipeline parallelism.
         self._handle_pipeline_parallelism()
 
@@ -1018,6 +1027,16 @@ class ServerArgs:
                 else "round_robin"
             )
             return
+
+    def _handle_fault_tolerance(self):
+        if not self.enable_fault_tolerance:
+            return
+
+        from sglang.srt.fault_tolerance.controller import is_ft_supported_config
+
+        supported, reason = is_ft_supported_config(self)
+        if not supported:
+            raise ValueError(f"Fault tolerance v5 unsupported config: {reason}")
 
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""
@@ -6501,6 +6520,24 @@ class ServerArgs:
             "--enable-dp-lm-head",
             action="store_true",
             help="Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention.",
+        )
+        parser.add_argument(
+            "--enable-fault-tolerance",
+            action="store_true",
+            help="Enable SGLang fault tolerance v5 control plane.",
+        )
+        parser.add_argument(
+            "--fault-tolerance-on-error-strategy",
+            type=str,
+            choices=["pause", "continue"],
+            default=ServerArgs.fault_tolerance_on_error_strategy,
+            help="Fault tolerance strategy for scheduler exceptions: pause or continue.",
+        )
+        parser.add_argument(
+            "--fault-tolerance-timeout",
+            type=int,
+            default=ServerArgs.fault_tolerance_timeout,
+            help="Timeout in seconds for fault tolerance control commands.",
         )
         parser.add_argument(
             "--enable-two-batch-overlap",

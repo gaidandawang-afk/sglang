@@ -105,6 +105,9 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
+    FaultToleranceCommandReqInput,
+    FaultToleranceCommandReqOutput,
+    FaultToleranceRankFaultOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     FreezeGCReq,
@@ -1472,6 +1475,7 @@ class Scheduler(
                 (GetLoadsReqInput, self.get_loads),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (FaultToleranceCommandReqInput, self.handle_fault_tolerance_command),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
                 (
@@ -1531,7 +1535,41 @@ class Scheduler(
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         with self.device_module.StreamContext(self.schedule_stream):
-            dispatch_event_loop(self)
+            if self.server_args.enable_fault_tolerance:
+                self._run_event_loop_fault_tolerance()
+            else:
+                dispatch_event_loop(self)
+
+    def _run_event_loop_fault_tolerance(self):
+        while True:
+            try:
+                dispatch_event_loop(self)
+            except Exception as exc:
+                self._ft_notify_fault("exception", str(exc))
+                if (
+                    self.server_args.fault_tolerance_on_error_strategy == "continue"
+                    and self._ft_continue_on_exception(exc)
+                ):
+                    continue
+                self._engine_paused = True
+
+    def _ft_rank(self) -> int:
+        return self.dp_rank if self.dp_rank is not None else 0
+
+    def _ft_notify_fault(self, fault_type: str, message: str):
+        self.send_to_tokenizer.send_output(
+            FaultToleranceRankFaultOutput(
+                rank=self._ft_rank(),
+                fault_type=fault_type,
+                message=message,
+            )
+        )
+
+    def _ft_continue_on_exception(self, exc: Exception) -> bool:
+        # v5 initial version intentionally keeps this a no-op hook. If local
+        # scheduler cleanup becomes necessary, it should be added here without
+        # changing the external FT_continue semantics.
+        return True
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -3717,6 +3755,43 @@ class Scheduler(
                 f"(freed {before_mb - after_mb:.1f} MB)"
             )
         self._engine_paused = False
+
+    def handle_fault_tolerance_command(
+        self, recv_req: FaultToleranceCommandReqInput
+    ) -> Optional[FaultToleranceCommandReqOutput]:
+        rank = self._ft_rank()
+        if rank not in recv_req.target_ranks:
+            return None
+
+        try:
+            if recv_req.command == "pause":
+                self._engine_paused = True
+                message = "paused"
+            elif recv_req.command == "resume":
+                self._engine_paused = False
+                message = "resumed"
+            elif recv_req.command == "apply_active_mask":
+                if recv_req.active_mask is None:
+                    raise ValueError("active_mask is required")
+                from sglang.srt.elastic_ep.elastic_ep import apply_active_rank_mask
+
+                apply_active_rank_mask(recv_req.active_mask)
+                message = "active mask applied"
+            else:
+                raise ValueError(f"unknown fault tolerance command: {recv_req.command}")
+            return FaultToleranceCommandReqOutput(
+                request_id=recv_req.request_id,
+                rank=rank,
+                success=True,
+                message=message,
+            )
+        except Exception as exc:
+            return FaultToleranceCommandReqOutput(
+                request_id=recv_req.request_id,
+                rank=rank,
+                success=False,
+                message=str(exc),
+            )
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput

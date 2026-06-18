@@ -179,10 +179,13 @@ class SubprocessWatchdog:
         processes: List[Process],
         process_names: Optional[List[str]] = None,
         interval: float = 1.0,
+        on_exit: Optional[Callable[[int, Process, str], bool]] = None,
     ):
         self._processes = processes
         self._names = process_names or [f"process_{i}" for i in range(len(processes))]
         self._interval = interval
+        self._on_exit = on_exit
+        self._reported: set[int] = set()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -209,8 +212,14 @@ class SubprocessWatchdog:
             logger.error(f"SubprocessWatchdog thread crashed: {e}", exc_info=True)
 
     def _check_processes(self) -> bool:
-        for proc, name in zip(self._processes, self._names):
+        for index, (proc, name) in enumerate(zip(self._processes, self._names)):
+            if index in self._reported:
+                continue
             if proc.is_alive() or proc.exitcode == 0:
+                continue
+
+            if self._on_exit is not None and self._on_exit(index, proc, name):
+                self._reported.add(index)
                 continue
 
             logger.error(
