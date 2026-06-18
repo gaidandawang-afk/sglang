@@ -36,8 +36,6 @@ def is_mooncake_active_rank_backend(server_args) -> bool:
 
 
 def is_ft_supported_config(server_args) -> Tuple[bool, str]:
-    if getattr(server_args, "tp_size", 1) != 1:
-        return False, "ft_requires_tp1"
     if getattr(server_args, "pp_size", 1) != 1:
         return False, "ft_requires_pp1"
     if getattr(server_args, "nnodes", 1) != 1:
