@@ -1619,12 +1619,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 active_mask,
                 timeout,
                 extra_targets=live_scale_down_targets,
+                update_routing=False,
             )
             await self._ft_send_command_collect(
                 command="resume",
                 target_ranks=resume_targets,
                 timeout_sec=timeout,
                 reason=instruction,
+            )
+            self.send_to_scheduler.send_pyobj(
+                ActiveRanksOutput(status=active_mask)
             )
         except Exception as exc:
             logger.exception("Fault tolerance apply failed; exiting: %s", exc)
@@ -2711,6 +2715,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         active_mask: List[bool],
         timeout: int,
         extra_targets: Optional[List[int]] = None,
+        update_routing: bool = True,
     ):
         if self.fault_tolerance is None:
             return
@@ -2729,7 +2734,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             active_mask=active_mask,
             reason="apply_active_mask",
         )
-        self.send_to_scheduler.send_pyobj(ActiveRanksOutput(status=active_mask))
+        if update_routing:
+            self.send_to_scheduler.send_pyobj(
+                ActiveRanksOutput(status=active_mask)
+            )
 
     async def _ft_send_command_collect(
         self,
