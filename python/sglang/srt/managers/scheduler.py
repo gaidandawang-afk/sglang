@@ -3832,7 +3832,7 @@ class Scheduler(
             # socket. Forward the synthetic target-rank event from that leader;
             # the actual target still raises below and exercises scheduler
             # exception recovery.
-            if self.send_to_tokenizer.socket is not None:
+            if rank == 0:
                 self.send_to_tokenizer.send_output(
                     FaultToleranceRankFaultOutput(
                         rank=target_rank,
