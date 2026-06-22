@@ -226,6 +226,14 @@ class DataParallelController:
     def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
         for rank in obj.target_ranks:
             if 0 <= rank < len(self.workers) and self.status[rank]:
+                logger.info(
+                    "DPC forwarding fault tolerance command: id=%s command=%s "
+                    "rank=%s reason=%s",
+                    obj.request_id,
+                    obj.command,
+                    rank,
+                    obj.reason,
+                )
                 if obj.command == "shutdown":
                     self._ft_suppressed_scheduler_exit_ranks.add(rank)
                 self.workers[rank].send_pyobj(obj)
@@ -237,6 +245,13 @@ class DataParallelController:
             if not self.status[index]:
                 return True
             if index in self._ft_suppressed_scheduler_exit_ranks:
+                logger.info(
+                    "DPC suppressed expected scheduler exit after FT shutdown: "
+                    "rank=%s pid=%s name=%s",
+                    index,
+                    getattr(proc, "pid", None),
+                    name,
+                )
                 self._ft_suppressed_scheduler_exit_ranks.discard(index)
                 self.status[index] = False
                 return True

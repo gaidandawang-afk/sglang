@@ -1603,6 +1603,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if error:
             return ft_error_status(error), ft_failure(error)
 
+        logger.info(
+            "Fault tolerance apply begin: instruction=%s ranks=%s timeout=%s",
+            instruction,
+            ranks,
+            timeout,
+        )
         live_scale_down_targets = []
         if instruction == "scale_down":
             live_scale_down_targets = [
@@ -1625,6 +1631,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             resume_targets = sorted(set(resume_targets + live_scale_down_targets))
+        logger.info(
+            "Fault tolerance apply plan: instruction=%s active_mask=%s "
+            "resume_targets=%s pending_scale_down=%s shutdown_live_targets=%s "
+            "live_scale_down_targets=%s",
+            instruction,
+            active_mask,
+            resume_targets,
+            pending_scale_down_ranks,
+            shutdown_live_targets,
+            live_scale_down_targets,
+        )
         try:
             await self._ft_apply_active_mask(
                 active_mask,
@@ -1651,7 +1668,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             logger.exception("Fault tolerance apply failed; exiting: %s", exc)
             os._exit(1)
 
-        return 200, self.fault_tolerance.commit_recover(pending_scale_down_ranks)
+        response = self.fault_tolerance.commit_recover(pending_scale_down_ranks)
+        logger.info(
+            "Fault tolerance apply committed: instruction=%s pending_scale_down=%s",
+            instruction,
+            pending_scale_down_ranks,
+        )
+        return 200, response
 
     async def update_weights_from_disk(
         self,
@@ -2619,6 +2642,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             pending.acked.add(output.rank)
         else:
             pending.failed[output.rank] = output.message
+        logger.info(
+            "Fault tolerance command ack: id=%s rank=%s success=%s message=%s "
+            "acked=%s/%s",
+            output.request_id,
+            output.rank,
+            output.success,
+            output.message,
+            len(pending.acked),
+            len(pending.target_ranks),
+        )
         pending.finish_if_ready()
 
     def _handle_ft_rank_fault(self, event: FaultToleranceRankFaultOutput):
@@ -2744,6 +2777,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if item.state != RankState.DEAD
         }
         targets.update(extra_targets or [])
+        logger.info(
+            "Fault tolerance active mask dispatch: mask=%s targets=%s "
+            "update_routing=%s",
+            active_mask,
+            sorted(targets),
+            update_routing,
+        )
         await self._ft_send_command_collect(
             command="apply_active_mask",
             target_ranks=sorted(targets),
@@ -2784,10 +2824,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             active_mask=active_mask,
             reason=reason,
         )
+        logger.info(
+            "Fault tolerance command dispatch: id=%s command=%s targets=%s "
+            "reason=%s timeout=%s",
+            request_id,
+            command,
+            sorted(target_set),
+            reason,
+            timeout_sec,
+        )
         await self.send_to_scheduler.send_pyobj(req)
         try:
             await asyncio.wait_for(pending.future, timeout=timeout_sec)
         except asyncio.TimeoutError:
+            logger.warning(
+                "Fault tolerance command timeout: id=%s command=%s acked=%s "
+                "pending=%s tolerate_timeout=%s",
+                request_id,
+                command,
+                sorted(pending.acked),
+                sorted(target_set - pending.acked),
+                tolerate_timeout,
+            )
             if not tolerate_timeout:
                 raise
         finally:
@@ -2798,6 +2856,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 f"fault tolerance command {command} failed: {pending.failed}"
             )
         timed_out = target_set - pending.acked
+        logger.info(
+            "Fault tolerance command completed: id=%s command=%s acked=%s "
+            "timed_out=%s",
+            request_id,
+            command,
+            sorted(pending.acked),
+            sorted(timed_out),
+        )
         return pending.acked, timed_out
 
     def _handle_open_session_req_output(self, recv_obj):

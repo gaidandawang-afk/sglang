@@ -3812,6 +3812,14 @@ class Scheduler(
             return None
 
         try:
+            logger.info(
+                "Scheduler received fault tolerance command: id=%s command=%s "
+                "rank=%s reason=%s",
+                recv_req.request_id,
+                recv_req.command,
+                rank,
+                recv_req.reason,
+            )
             if recv_req.command == "pause":
                 self._engine_paused = True
                 message = "paused"
