@@ -1546,10 +1546,11 @@ class Scheduler(
             try:
                 dispatch_event_loop(self)
             except Exception as exc:
+                recovered = self._ft_discard_current_batch(exc)
                 self._ft_notify_fault("exception", str(exc))
                 if (
                     self.server_args.fault_tolerance_on_error_strategy == "continue"
-                    and self._ft_continue_on_exception(exc)
+                    and recovered
                 ):
                     continue
                 self._engine_paused = True
@@ -1566,12 +1567,7 @@ class Scheduler(
             )
         )
 
-    def _ft_continue_on_exception(self, exc: Exception) -> bool:
-        if not self._ft_requeue_current_extend_batch(exc):
-            return False
-        return True
-
-    def _ft_requeue_current_extend_batch(self, exc: Exception) -> bool:
+    def _ft_discard_current_batch(self, exc: Exception) -> bool:
         batch = self.cur_batch
         if batch is None or batch.is_empty():
             return True
@@ -1580,41 +1576,44 @@ class Scheduler(
             if self.last_batch is batch:
                 self.last_batch = None
             return True
-        if not batch.forward_mode.is_extend():
-            logger.exception(
-                "FT continue cannot safely retry non-extend batch after exception",
-                exc_info=exc,
-            )
-            return False
-
-        retry_reqs = [req for req in batch.reqs if not req.finished()]
-        if not retry_reqs:
-            self.cur_batch = None
-            if self.last_batch is batch:
-                self.last_batch = None
-            return True
-
-        for req in retry_reqs:
+        discarded_reqs = [req for req in batch.reqs if not req.finished()]
+        success = True
+        for req in discarded_reqs:
             try:
                 release_kv_cache(req, self.tree_cache, is_insert=False)
-                req.reset_for_retract()
+                abort_reason = FINISH_ABORT(
+                    message=f"Request discarded after scheduler exception: {exc}",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    err_type="SchedulerFault",
+                )
+                req.finished_reason = abort_reason
+                self.send_to_tokenizer.send_output(
+                    AbortReq(
+                        finished_reason=abort_reason.to_json(),
+                        rid=req.rid,
+                    ),
+                    req,
+                )
             except Exception:
                 logger.exception(
-                    "FT continue failed to release failed request state: rid=%s",
+                    "FT failed to discard request state: rid=%s",
                     req.rid,
                 )
-                return False
+                success = False
 
-        self.waiting_queue = retry_reqs + self.waiting_queue
+        batch.filter_batch(keep_indices=[])
+        batch.batch_is_full = False
+        if self.chunked_req in discarded_reqs:
+            self.chunked_req = None
         self.cur_batch = None
         if self.last_batch is batch:
             self.last_batch = None
         logger.warning(
-            "FT continue requeued %d request(s) after scheduler exception: %s",
-            len(retry_reqs),
+            "FT discarded %d request(s) after scheduler exception: %s",
+            len(discarded_reqs),
             exc,
         )
-        return True
+        return success
 
     @DynamicGradMode()
     def event_loop_normal(self):
