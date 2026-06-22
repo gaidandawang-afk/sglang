@@ -1567,9 +1567,47 @@ class Scheduler(
         )
 
     def _ft_continue_on_exception(self, exc: Exception) -> bool:
-        # v5 initial version intentionally keeps this a no-op hook. If local
-        # scheduler cleanup becomes necessary, it should be added here without
-        # changing the external FT_continue semantics.
+        if not self._ft_requeue_current_extend_batch(exc):
+            return False
+        return True
+
+    def _ft_requeue_current_extend_batch(self, exc: Exception) -> bool:
+        batch = self.cur_batch
+        if batch is None or batch.is_empty():
+            return True
+        if not batch.forward_mode.is_extend():
+            logger.exception(
+                "FT continue cannot safely retry non-extend batch after exception",
+                exc_info=exc,
+            )
+            return False
+
+        retry_reqs = [req for req in batch.reqs if not req.finished()]
+        if not retry_reqs:
+            self.cur_batch = None
+            if self.last_batch is batch:
+                self.last_batch = None
+            return True
+
+        for req in retry_reqs:
+            try:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+            except Exception:
+                logger.exception(
+                    "FT continue failed to release failed request state: rid=%s",
+                    req.rid,
+                )
+                return False
+
+        self.waiting_queue = retry_reqs + self.waiting_queue
+        self.cur_batch = None
+        if self.last_batch is batch:
+            self.last_batch = None
+        logger.warning(
+            "FT continue requeued %d request(s) after scheduler exception: %s",
+            len(retry_reqs),
+            exc,
+        )
         return True
 
     @DynamicGradMode()
