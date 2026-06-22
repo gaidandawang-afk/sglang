@@ -1392,7 +1392,7 @@ class ContinueGenerationReqInput(BaseReq):
 @dataclass
 class FaultToleranceCommandReqInput(BaseReq):
     request_id: str
-    command: Literal["pause", "apply_active_mask", "resume"]
+    command: Literal["pause", "apply_active_mask", "resume", "shutdown"]
     target_ranks: List[int]
     timeout_sec: int
     active_mask: Optional[List[bool]] = None

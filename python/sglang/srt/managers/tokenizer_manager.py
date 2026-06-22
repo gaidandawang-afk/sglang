@@ -1610,17 +1610,34 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for rank in ranks or []
                 if self.fault_tolerance.ranks[rank].state != RankState.DEAD
             ]
-        active_mask, resume_targets = self.fault_tolerance.begin_recover(
-            instruction, ranks
+        active_mask, resume_targets, pending_scale_down_ranks = (
+            self.fault_tolerance.begin_recover(
+                instruction, ranks
+            )
         )
-        resume_targets = sorted(set(resume_targets + live_scale_down_targets))
+        shutdown_live_targets = (
+            instruction == "scale_down"
+            and envs.SGLANG_FT_SCALE_DOWN_SHUTDOWN_LIVE_RANK.get()
+        )
+        if shutdown_live_targets:
+            resume_targets = sorted(
+                set(resume_targets) - set(live_scale_down_targets)
+            )
+        else:
+            resume_targets = sorted(set(resume_targets + live_scale_down_targets))
         try:
             await self._ft_apply_active_mask(
                 active_mask,
                 timeout,
-                extra_targets=live_scale_down_targets,
                 update_routing=False,
             )
+            if shutdown_live_targets and live_scale_down_targets:
+                await self._ft_send_command_collect(
+                    command="shutdown",
+                    target_ranks=live_scale_down_targets,
+                    timeout_sec=timeout,
+                    reason=instruction,
+                )
             await self._ft_send_command_collect(
                 command="resume",
                 target_ranks=resume_targets,
@@ -1634,7 +1651,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             logger.exception("Fault tolerance apply failed; exiting: %s", exc)
             os._exit(1)
 
-        return 200, self.fault_tolerance.commit_recover()
+        return 200, self.fault_tolerance.commit_recover(pending_scale_down_ranks)
 
     async def update_weights_from_disk(
         self,

@@ -18,6 +18,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from collections import deque
 from contextlib import nullcontext
@@ -3821,6 +3822,9 @@ class Scheduler(
 
                 apply_active_rank_mask(recv_req.active_mask)
                 message = "active mask applied"
+            elif recv_req.command == "shutdown":
+                message = "shutdown scheduled"
+                threading.Timer(0.1, lambda: os._exit(0)).start()
             else:
                 raise ValueError(f"unknown fault tolerance command: {recv_req.command}")
             return FaultToleranceCommandReqOutput(

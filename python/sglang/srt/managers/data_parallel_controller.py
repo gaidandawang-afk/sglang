@@ -190,6 +190,7 @@ class DataParallelController:
             self.control_message_step = 1
 
         self._scheduler_watchdog = None
+        self._ft_suppressed_scheduler_exit_ranks = set()
         if self.scheduler_procs and server_args.node_rank == 0:
             self._scheduler_watchdog = SubprocessWatchdog(
                 processes=self.scheduler_procs,
@@ -225,6 +226,8 @@ class DataParallelController:
     def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
         for rank in obj.target_ranks:
             if 0 <= rank < len(self.workers) and self.status[rank]:
+                if obj.command == "shutdown":
+                    self._ft_suppressed_scheduler_exit_ranks.add(rank)
                 self.workers[rank].send_pyobj(obj)
 
     def _handle_scheduler_process_exit(self, index, proc, name):
@@ -232,6 +235,10 @@ class DataParallelController:
             return False
         if 0 <= index < len(self.status):
             if not self.status[index]:
+                return True
+            if index in self._ft_suppressed_scheduler_exit_ranks:
+                self._ft_suppressed_scheduler_exit_ranks.discard(index)
+                self.status[index] = False
                 return True
             self.status[index] = False
             if not self.server_args.enable_fault_tolerance:

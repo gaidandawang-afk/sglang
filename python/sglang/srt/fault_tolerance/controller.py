@@ -188,16 +188,26 @@ class FaultToleranceManager:
 
     def begin_recover(
         self, instruction: str, scale_down_ranks: Optional[List[int]] = None
-    ) -> Tuple[List[bool], List[int]]:
+    ) -> Tuple[List[bool], List[int], List[int]]:
         self.ft_operation_in_progress = True
+        pending_scale_down_ranks: List[int] = []
         if instruction == "scale_down":
-            for rank in set(scale_down_ranks or []):
-                self.ranks[rank].state = RankState.DEAD
-        active_mask = [item.state != RankState.DEAD for item in self.ranks]
+            pending_scale_down_ranks = sorted(set(scale_down_ranks or []))
+        pending = set(pending_scale_down_ranks)
+        active_mask = [
+            item.state != RankState.DEAD and item.rank not in pending
+            for item in self.ranks
+        ]
         resume_targets = self.paused_ranks()
-        return active_mask, resume_targets
+        return active_mask, resume_targets, pending_scale_down_ranks
 
-    def commit_recover(self) -> Dict[str, Any]:
+    def commit_recover(
+        self, pending_scale_down_ranks: Optional[List[int]] = None
+    ) -> Dict[str, Any]:
+        pending = set(pending_scale_down_ranks or [])
+        for rank in pending:
+            if 0 <= rank < self.dp_size:
+                self.ranks[rank].state = RankState.DEAD
         resumed_ranks = []
         for item in self.ranks:
             if item.state == RankState.PAUSED:
