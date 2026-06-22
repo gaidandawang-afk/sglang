@@ -1545,12 +1545,7 @@ class Scheduler(
             try:
                 dispatch_event_loop(self)
             except Exception as exc:
-                proxy_notified = getattr(
-                    self, "_test_recoverable_fault_proxy_notified", False
-                )
-                self._test_recoverable_fault_proxy_notified = False
-                if not proxy_notified:
-                    self._ft_notify_fault("exception", str(exc))
+                self._ft_notify_fault("exception", str(exc))
                 if (
                     self.server_args.fault_tolerance_on_error_strategy == "continue"
                     and self._ft_continue_on_exception(exc)
@@ -3822,36 +3817,11 @@ class Scheduler(
         except ValueError:
             return
 
-        if len(target_ranks) != 1:
-            logger.error(
-                "Recoverable FT test injection requires exactly one rank, got %s",
-                sorted(target_ranks),
-            )
+        rank = self._ft_rank()
+        if rank not in target_ranks:
             return
 
         self._test_recoverable_fault_injected = True
-        target_rank = next(iter(target_ranks))
-        rank = self._ft_rank()
-        if rank != target_rank:
-            # Under DP attention only the group leader owns the tokenizer PUSH
-            # socket. Forward the synthetic target-rank event from that leader;
-            # the actual target still raises below and exercises scheduler
-            # exception recovery.
-            if rank == 0:
-                self.send_to_tokenizer.send_output(
-                    FaultToleranceRankFaultOutput(
-                        rank=target_rank,
-                        fault_type="exception",
-                        message=(
-                            "Injected recoverable FT fault on scheduler rank "
-                            f"{target_rank}"
-                        ),
-                    )
-                )
-            return
-
-        if target_rank != 0:
-            self._test_recoverable_fault_proxy_notified = True
         done_file = os.environ.get(
             "SGLANG_TEST_FT_RECOVERABLE_FAULT_DONE_FILE", ""
         )
