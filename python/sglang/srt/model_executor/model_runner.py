@@ -3378,11 +3378,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
 
         trigger_file = os.environ.get("SGLANG_TEST_FT_RECOVERABLE_FAULT_FILE", "")
-        if trigger_file and not os.path.exists(trigger_file):
-            return
-        if getattr(self, "_test_forward_recoverable_fault_injected", False):
-            return
-
         try:
             target_ranks = {
                 int(item.strip())
@@ -3393,28 +3388,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
 
         rank = self.dp_rank if self.dp_rank is not None else self.tp_rank
-        if rank not in target_ranks:
+        local_trigger = (
+            rank in target_ranks
+            and not getattr(self, "_test_forward_recoverable_fault_injected", False)
+            and (not trigger_file or os.path.exists(trigger_file))
+        )
+        fault_flag = torch.tensor([int(local_trigger)], dtype=torch.int32)
+        if self.tp_group.world_size > 1:
+            dist.all_reduce(
+                fault_flag,
+                op=dist.ReduceOp.MAX,
+                group=self.tp_group.cpu_group,
+            )
+        if not fault_flag.item():
             return
 
-        self._test_forward_recoverable_fault_injected = True
-        done_file = os.environ.get(
-            "SGLANG_TEST_FT_RECOVERABLE_FAULT_DONE_FILE", ""
-        )
-        if done_file:
-            try:
-                with open(done_file, "a", encoding="utf-8") as file:
-                    file.write(
-                        f"pid={os.getpid()} rank={rank} forward_pass_id={self.forward_pass_id}\n"
+        if local_trigger:
+            self._test_forward_recoverable_fault_injected = True
+            done_file = os.environ.get(
+                "SGLANG_TEST_FT_RECOVERABLE_FAULT_DONE_FILE", ""
+            )
+            if done_file:
+                try:
+                    with open(done_file, "a", encoding="utf-8") as file:
+                        file.write(
+                            f"pid={os.getpid()} rank={rank} forward_pass_id={self.forward_pass_id}\n"
+                        )
+                except OSError:
+                    logger.warning(
+                        "Failed to record injected FT forward exception in %s",
+                        done_file,
+                        exc_info=True,
                     )
-            except OSError:
-                logger.warning(
-                    "Failed to record injected FT forward exception in %s",
-                    done_file,
-                    exc_info=True,
-                )
 
         raise RuntimeError(
-            f"Injected recoverable FT forward fault on model runner rank {rank}"
+            "Injected coordinated recoverable FT forward fault requested for "
+            f"model runner rank(s) {sorted(target_ranks)}"
         )
 
     def _forward_raw(

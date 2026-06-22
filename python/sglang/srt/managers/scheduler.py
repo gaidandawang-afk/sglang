@@ -1575,6 +1575,11 @@ class Scheduler(
         batch = self.cur_batch
         if batch is None or batch.is_empty():
             return True
+        if batch.forward_mode.is_idle():
+            self.cur_batch = None
+            if self.last_batch is batch:
+                self.last_batch = None
+            return True
         if not batch.forward_mode.is_extend():
             logger.exception(
                 "FT continue cannot safely retry non-extend batch after exception",
