@@ -36,6 +36,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
     FaultToleranceCommandReqInput,
+    FaultToleranceCommandReqOutput,
     FaultToleranceRankFaultOutput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
@@ -224,13 +225,45 @@ class DataParallelController:
             worker.send_pyobj(obj)
 
     def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
-        for rank in obj.target_ranks:
-            if (
-                obj.command == "shutdown"
-                and 0 <= rank < len(self.workers)
-                and self.status[rank]
-            ):
-                self._ft_suppressed_scheduler_exit_ranks.add(rank)
+        if obj.command == "shutdown":
+            for rank in obj.target_ranks:
+                success = True
+                message = "shutdown requested"
+                if not (0 <= rank < len(self.workers)):
+                    success = False
+                    message = "unknown rank"
+                else:
+                    proc = (
+                        self.scheduler_procs[rank]
+                        if rank < len(self.scheduler_procs)
+                        else None
+                    )
+                    if self.status[rank]:
+                        self._ft_suppressed_scheduler_exit_ranks.add(rank)
+                    self.status[rank] = False
+                    if proc is not None and proc.is_alive():
+                        logger.info(
+                            "DPC shutting down scheduler for fault tolerance: "
+                            "id=%s rank=%s pid=%s reason=%s",
+                            obj.request_id,
+                            rank,
+                            proc.pid,
+                            obj.reason,
+                        )
+                        proc.terminate()
+                    else:
+                        message = "already stopped"
+                if self.send_to_tokenizer is not None:
+                    self.send_to_tokenizer.send_pyobj(
+                        FaultToleranceCommandReqOutput(
+                            request_id=obj.request_id,
+                            rank=rank,
+                            success=success,
+                            message=message,
+                        )
+                    )
+            return
+
         # Fault-tolerance commands must enter the same control-message fanout
         # path as other scheduler control messages.  In DP-attention without
         # local control broadcast, only rank 0 receives from the DPC and then
