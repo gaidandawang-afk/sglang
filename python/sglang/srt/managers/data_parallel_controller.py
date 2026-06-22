@@ -16,7 +16,6 @@
 import faulthandler
 import logging
 import multiprocessing as mp
-import queue
 import signal
 import threading
 import time
@@ -175,8 +174,6 @@ class DataParallelController:
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
         self.status: List[bool] = [True] * server_args.dp_size
-        self._status_lock = threading.Lock()
-        self._scheduler_exit_events: queue.Queue[tuple[int, str]] = queue.Queue()
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
@@ -191,16 +188,16 @@ class DataParallelController:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
 
-        self._scheduler_watchdog = None
-        if self.scheduler_procs and server_args.node_rank == 0:
-            self._scheduler_watchdog = SubprocessWatchdog(
+        self._ft_scheduler_watchdog = None
+        if server_args.enable_fault_tolerance and server_args.node_rank == 0:
+            self._ft_scheduler_watchdog = SubprocessWatchdog(
                 processes=self.scheduler_procs,
                 process_names=[
                     f"scheduler_dp_{i}" for i in range(len(self.scheduler_procs))
                 ],
                 on_exit=self._handle_scheduler_process_exit,
             )
-            self._scheduler_watchdog.start()
+            self._ft_scheduler_watchdog.start()
 
         self.init_dispatcher()
 
@@ -215,9 +212,8 @@ class DataParallelController:
             start_cpu_monitor_thread("data_parallel_controller")
 
     def send_to_all_workers(self, obj):
-        status = self._current_status()
         for i, worker in enumerate(self.workers):
-            if status[i]:
+            if self.status[i]:
                 worker.send_pyobj(obj)
 
     def send_control_message(self, obj):
@@ -226,89 +222,29 @@ class DataParallelController:
             worker.send_pyobj(obj)
 
     def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
-        status = self._current_status()
         for rank in obj.target_ranks:
-            if 0 <= rank < len(self.workers) and status[rank]:
+            if 0 <= rank < len(self.workers) and self.status[rank]:
                 self.workers[rank].send_pyobj(obj)
 
     def _handle_scheduler_process_exit(self, index, proc, name):
-        message = f"{name} pid={proc.pid} exitcode={proc.exitcode}"
+        if self.send_to_tokenizer is None:
+            return False
         if 0 <= index < len(self.status):
-            self._mark_rank_inactive(index)
-            self._scheduler_exit_events.put((index, message))
-            return True
-        return False
-
-    def _current_status(self) -> List[bool]:
-        with self._status_lock:
-            return list(self.status)
-
-    def _mark_rank_inactive(self, rank: int) -> None:
-        with self._status_lock:
-            if 0 <= rank < len(self.status):
-                self.status[rank] = False
-
-    def _set_active_ranks(self, status: List[bool]) -> List[bool]:
-        normalized = list(status[: len(self.workers)])
-        if len(normalized) < len(self.workers):
-            normalized.extend([False] * (len(self.workers) - len(normalized)))
-        with self._status_lock:
-            self.status = normalized
-        return normalized
-
-    def _send_active_ranks_to_live_workers(self, status: List[bool]) -> None:
-        if self.server_args.elastic_ep_backend is None:
-            return
-        if not any(status):
-            return
-        active_ranks = ActiveRanksOutput(status=list(status))
-        for rank, worker in enumerate(self.workers):
-            if rank < len(status) and status[rank]:
-                worker.send_pyobj(active_ranks)
-
-    def _poll_scheduler_process_exits(self) -> None:
-        status = self._current_status()
-        for index, proc in enumerate(self.scheduler_procs):
-            if index >= len(status) or not status[index]:
-                continue
-            if proc.is_alive() or proc.exitcode == 0:
-                continue
-            self._handle_scheduler_process_exit(index, proc, f"scheduler_dp_{index}")
-
-    def _drain_scheduler_exit_events(self) -> None:
-        self._poll_scheduler_process_exits()
-        while True:
-            try:
-                rank, message = self._scheduler_exit_events.get_nowait()
-            except queue.Empty:
-                return
-
-            status = self._current_status()
-            logger.warning(
-                "Detected scheduler rank %s exit in DataParallelController: %s; "
-                "active_ranks=%s",
-                rank,
-                message,
-                status,
+            self.status[index] = False
+        self.send_to_tokenizer.send_pyobj(
+            FaultToleranceRankFaultOutput(
+                rank=index,
+                fault_type="kill",
+                message=f"{name} pid={proc.pid} exitcode={proc.exitcode}",
             )
-            if self.server_args.enable_fault_tolerance:
-                if self.send_to_tokenizer is not None:
-                    self.send_to_tokenizer.send_pyobj(
-                        FaultToleranceRankFaultOutput(
-                            rank=rank,
-                            fault_type="kill",
-                            message=message,
-                        )
-                    )
-            else:
-                self._send_active_ranks_to_live_workers(status)
-
-    def update_active_ranks(self, ranks: ActiveRanksOutput):
-        status = self._set_active_ranks(ranks.status)
-        self._send_active_ranks_to_live_workers(status)
+        )
+        return True
 
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
+
+    def update_active_ranks(self, ranks: ActiveRanksOutput):
+        self.status = ranks.status
 
     def dispatching_with_trace(self, req: Req):
         req.time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
@@ -667,13 +603,7 @@ class DataParallelController:
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
-            status = self._current_status()
-            if req.routed_dp_rank < 0 or req.routed_dp_rank >= len(status):
-                self._reject_req(
-                    req, f"routed_dp_rank={req.routed_dp_rank} is out of range"
-                )
-                return True
-            if not status[req.routed_dp_rank]:
+            if not self.status[req.routed_dp_rank]:
                 self._reject_req(
                     req, f"routed_dp_rank={req.routed_dp_rank} is inactive"
                 )
@@ -684,7 +614,7 @@ class DataParallelController:
         return False
 
     def _ensure_active_rank_available(self):
-        return any(self._current_status())
+        return any(self.status)
 
     def _reject_req(self, req: Req, message: str):
         logger.warning("Rejecting DP request %s: %s", getattr(req, "rid", ""), message)
@@ -694,14 +624,13 @@ class DataParallelController:
             )
 
     def _next_active_rank(self, preferred_rank: Optional[int] = None) -> int:
-        status = self._current_status()
-        if not any(status):
+        if not self._ensure_active_rank_available():
             raise RuntimeError("No active DP rank available")
-        if preferred_rank is not None and status[preferred_rank]:
+        if preferred_rank is not None and self.status[preferred_rank]:
             return preferred_rank
         for offset in range(len(self.workers)):
             rank = (self.round_robin_counter + offset) % len(self.workers)
-            if status[rank]:
+            if self.status[rank]:
                 self.round_robin_counter = (rank + 1) % len(self.workers)
                 return rank
         raise RuntimeError("No active DP rank available")
@@ -738,7 +667,7 @@ class DataParallelController:
             self._reject_req(req, "no active DP rank")
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        if not self._current_status()[target_worker]:
+        if not self.status[target_worker]:
             target_worker = self._next_active_rank()
         self.workers[target_worker].send_pyobj(req)
 
@@ -752,20 +681,18 @@ class DataParallelController:
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
-        if not self._current_status()[target_worker]:
+        if not self.status[target_worker]:
             target_worker = self._next_active_rank()
         self.workers[target_worker].send_pyobj(req)
 
     def event_loop(self):
         while True:
-            self._drain_scheduler_exit_events()
             while True:
                 self.soft_watchdog.feed()
                 try:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
-                self._drain_scheduler_exit_events()
                 self._request_dispatcher(recv_req)
 
 
