@@ -726,6 +726,10 @@ class DataParallelController:
             return
 
         self._test_recoverable_fault_reported = True
+        logger.warning(
+            "Reporting injected recoverable FT exception from DPC: rank=%s",
+            rank,
+        )
         self.send_to_tokenizer.send_pyobj(
             FaultToleranceRankFaultOutput(
                 rank=rank,

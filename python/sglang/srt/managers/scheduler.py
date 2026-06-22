@@ -3836,6 +3836,9 @@ class Scheduler(
                     exc_info=True,
                 )
 
+        if self.server_args.fault_tolerance_on_error_strategy == "pause":
+            return
+
         raise RuntimeError(f"Injected recoverable FT fault on scheduler rank {rank}")
 
     def load_lora_adapter(
