@@ -1643,11 +1643,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             live_scale_down_targets,
         )
         try:
-            await self._ft_apply_active_mask(
-                active_mask,
-                timeout,
-                update_routing=False,
-            )
             if shutdown_live_targets and live_scale_down_targets:
                 await self._ft_send_command_collect(
                     command="shutdown",
@@ -1655,6 +1650,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     timeout_sec=timeout,
                     reason=instruction,
                 )
+            await self._ft_apply_active_mask(
+                active_mask,
+                timeout,
+                exclude_targets=(
+                    live_scale_down_targets if shutdown_live_targets else None
+                ),
+                update_routing=False,
+            )
             await self._ft_send_command_collect(
                 command="resume",
                 target_ranks=resume_targets,
@@ -2765,6 +2768,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         active_mask: List[bool],
         timeout: int,
         extra_targets: Optional[List[int]] = None,
+        exclude_targets: Optional[List[int]] = None,
         update_routing: bool = True,
     ):
         if self.fault_tolerance is None:
@@ -2777,11 +2781,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if item.state != RankState.DEAD
         }
         targets.update(extra_targets or [])
+        targets.difference_update(exclude_targets or [])
         logger.info(
             "Fault tolerance active mask dispatch: mask=%s targets=%s "
-            "update_routing=%s",
+            "exclude_targets=%s update_routing=%s",
             active_mask,
             sorted(targets),
+            sorted(exclude_targets or []),
             update_routing,
         )
         await self._ft_send_command_collect(
