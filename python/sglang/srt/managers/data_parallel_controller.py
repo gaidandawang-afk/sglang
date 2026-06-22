@@ -36,6 +36,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
     FaultToleranceCommandReqInput,
+    FaultToleranceCommandReqOutput,
     FaultToleranceRankFaultOutput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
@@ -231,6 +232,36 @@ class DataParallelController:
             worker.send_pyobj(obj)
 
     def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
+        if obj.command == "shutdown":
+            for rank in obj.target_ranks:
+                success = False
+                message = "rank unavailable"
+                if 0 <= rank < len(self.scheduler_procs):
+                    proc = self.scheduler_procs[rank]
+                    if 0 <= rank < len(self.status):
+                        self.status[rank] = False
+                    try:
+                        if proc.is_alive():
+                            proc.terminate()
+                            proc.join(timeout=5)
+                        if proc.is_alive():
+                            proc.kill()
+                            proc.join(timeout=5)
+                        success = True
+                        message = "shutdown"
+                    except Exception as exc:
+                        message = str(exc)
+                if self.send_to_tokenizer is not None:
+                    self.send_to_tokenizer.send_pyobj(
+                        FaultToleranceCommandReqOutput(
+                            request_id=obj.request_id,
+                            rank=rank,
+                            success=success,
+                            message=message,
+                        )
+                    )
+            return
+
         for rank in obj.target_ranks:
             if 0 <= rank < len(self.workers) and self.status[rank]:
                 self.workers[rank].send_pyobj(obj)
@@ -239,6 +270,8 @@ class DataParallelController:
         if self.send_to_tokenizer is None:
             return False
         if 0 <= index < len(self.status):
+            if not self.status[index]:
+                return True
             self.status[index] = False
         self.send_to_tokenizer.send_pyobj(
             FaultToleranceRankFaultOutput(
