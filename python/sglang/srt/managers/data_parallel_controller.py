@@ -198,16 +198,16 @@ class DataParallelController:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
 
-        self._ft_scheduler_watchdog = None
-        if server_args.enable_fault_tolerance and server_args.node_rank == 0:
-            self._ft_scheduler_watchdog = SubprocessWatchdog(
+        self._scheduler_watchdog = None
+        if self.scheduler_procs and server_args.node_rank == 0:
+            self._scheduler_watchdog = SubprocessWatchdog(
                 processes=self.scheduler_procs,
                 process_names=[
                     f"scheduler_dp_{i}" for i in range(len(self.scheduler_procs))
                 ],
                 on_exit=self._handle_scheduler_process_exit,
             )
-            self._ft_scheduler_watchdog.start()
+            self._scheduler_watchdog.start()
 
         self.init_dispatcher()
 
@@ -273,6 +273,9 @@ class DataParallelController:
             if not self.status[index]:
                 return True
             self.status[index] = False
+            if not self.server_args.enable_fault_tolerance:
+                self._send_active_ranks_to_live_workers()
+                return True
         self.send_to_tokenizer.send_pyobj(
             FaultToleranceRankFaultOutput(
                 rank=index,
@@ -281,6 +284,14 @@ class DataParallelController:
             )
         )
         return True
+
+    def _send_active_ranks_to_live_workers(self):
+        if self.server_args.elastic_ep_backend is None:
+            return
+        active_ranks = ActiveRanksOutput(status=list(self.status))
+        for rank, worker in enumerate(self.workers):
+            if rank < len(self.status) and self.status[rank]:
+                worker.send_pyobj(active_ranks)
 
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)

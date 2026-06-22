@@ -1475,6 +1475,7 @@ class Scheduler(
                 (GetLoadsReqInput, self.get_loads),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (ActiveRanksOutput, self.handle_active_ranks_update),
                 (FaultToleranceCommandReqInput, self.handle_fault_tolerance_command),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
@@ -3795,6 +3796,11 @@ class Scheduler(
                 success=False,
                 message=str(exc),
             )
+
+    def handle_active_ranks_update(self, recv_req: ActiveRanksOutput) -> None:
+        from sglang.srt.elastic_ep.elastic_ep import apply_active_rank_mask
+
+        apply_active_rank_mask(recv_req.status)
 
     def _maybe_inject_test_recoverable_fault(self) -> None:
         """Inject one scheduler exception for explicit remote FT tests only."""
