@@ -1545,7 +1545,12 @@ class Scheduler(
             try:
                 dispatch_event_loop(self)
             except Exception as exc:
-                self._ft_notify_fault("exception", str(exc))
+                proxy_notified = getattr(
+                    self, "_test_recoverable_fault_proxy_notified", False
+                )
+                self._test_recoverable_fault_proxy_notified = False
+                if not proxy_notified:
+                    self._ft_notify_fault("exception", str(exc))
                 if (
                     self.server_args.fault_tolerance_on_error_strategy == "continue"
                     and self._ft_continue_on_exception(exc)
@@ -3845,6 +3850,8 @@ class Scheduler(
                 )
             return
 
+        if target_rank != 0:
+            self._test_recoverable_fault_proxy_notified = True
         done_file = os.environ.get(
             "SGLANG_TEST_FT_RECOVERABLE_FAULT_DONE_FILE", ""
         )
