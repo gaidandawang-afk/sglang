@@ -2625,8 +2625,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self.fault_tolerance is None:
             return
         if self.fault_tolerance.ft_operation_in_progress:
-            logger.error("FT received exception while another operation is active")
-            os._exit(1)
+            logger.warning(
+                "Ignoring duplicate FT exception while another operation is active: "
+                "rank=%s message=%s",
+                event.rank,
+                event.message,
+            )
+            return
 
         targets = self.fault_tolerance.begin_exception_pause(
             event.rank, event.message
