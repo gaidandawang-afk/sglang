@@ -1603,25 +1603,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if error:
             return ft_error_status(error), ft_failure(error)
 
-        shutdown_targets = []
-        if instruction == "scale_down":
-            shutdown_targets = [
-                rank
-                for rank in ranks or []
-                if 0 <= rank < len(self.fault_tolerance.ranks)
-                and self.fault_tolerance.ranks[rank].state != RankState.DEAD
-            ]
         active_mask, resume_targets = self.fault_tolerance.begin_recover(
             instruction, ranks
         )
         try:
-            if shutdown_targets:
-                await self._ft_send_command_collect(
-                    command="shutdown",
-                    target_ranks=shutdown_targets,
-                    timeout_sec=timeout,
-                    reason=instruction,
-                )
             await self._ft_apply_active_mask(active_mask, timeout)
             await self._ft_send_command_collect(
                 command="resume",
