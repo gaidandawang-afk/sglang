@@ -224,7 +224,10 @@ class DataParallelController:
 
     def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
         for rank in obj.target_ranks:
-            if 0 <= rank < len(self.workers) and self.status[rank]:
+            if (
+                0 <= rank < len(self.workers)
+                and self.scheduler_procs[rank].is_alive()
+            ):
                 self.workers[rank].send_pyobj(obj)
 
     def _handle_scheduler_process_exit(self, index, proc, name):

@@ -1603,11 +1603,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if error:
             return ft_error_status(error), ft_failure(error)
 
+        live_scale_down_targets = []
+        if instruction == "scale_down":
+            live_scale_down_targets = [
+                rank
+                for rank in ranks or []
+                if self.fault_tolerance.ranks[rank].state != RankState.DEAD
+            ]
         active_mask, resume_targets = self.fault_tolerance.begin_recover(
             instruction, ranks
         )
+        resume_targets = sorted(set(resume_targets + live_scale_down_targets))
         try:
-            await self._ft_apply_active_mask(active_mask, timeout)
+            await self._ft_apply_active_mask(
+                active_mask,
+                timeout,
+                extra_targets=live_scale_down_targets,
+            )
             await self._ft_send_command_collect(
                 command="resume",
                 target_ranks=resume_targets,
@@ -2694,19 +2706,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             active_mask, self.server_args.fault_tolerance_timeout
         )
 
-    async def _ft_apply_active_mask(self, active_mask: List[bool], timeout: int):
+    async def _ft_apply_active_mask(
+        self,
+        active_mask: List[bool],
+        timeout: int,
+        extra_targets: Optional[List[int]] = None,
+    ):
         if self.fault_tolerance is None:
             return
         if not any(active_mask):
             raise RuntimeError("fault tolerance active mask has no live rank")
-        targets = [
+        targets = {
             item.rank
             for item in self.fault_tolerance.ranks
             if item.state != RankState.DEAD
-        ]
+        }
+        targets.update(extra_targets or [])
         await self._ft_send_command_collect(
             command="apply_active_mask",
-            target_ranks=targets,
+            target_ranks=sorted(targets),
             timeout_sec=timeout,
             active_mask=active_mask,
             reason="apply_active_mask",
