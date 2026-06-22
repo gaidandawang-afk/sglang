@@ -1643,19 +1643,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             live_scale_down_targets,
         )
         try:
-            if shutdown_live_targets and live_scale_down_targets:
-                await self._ft_send_command_collect(
-                    command="shutdown",
-                    target_ranks=live_scale_down_targets,
-                    timeout_sec=timeout,
-                    reason=instruction,
-                )
             await self._ft_apply_active_mask(
                 active_mask,
                 timeout,
-                exclude_targets=(
-                    live_scale_down_targets if shutdown_live_targets else None
-                ),
                 update_routing=False,
             )
             await self._ft_send_command_collect(
@@ -1667,6 +1657,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.send_to_scheduler.send_pyobj(
                 ActiveRanksOutput(status=active_mask)
             )
+            if shutdown_live_targets and live_scale_down_targets:
+                await self._ft_send_command_collect(
+                    command="shutdown",
+                    target_ranks=live_scale_down_targets,
+                    timeout_sec=timeout,
+                    reason=instruction,
+                )
         except Exception as exc:
             logger.exception("Fault tolerance apply failed; exiting: %s", exc)
             os._exit(1)
@@ -2768,7 +2765,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         active_mask: List[bool],
         timeout: int,
         extra_targets: Optional[List[int]] = None,
-        exclude_targets: Optional[List[int]] = None,
         update_routing: bool = True,
     ):
         if self.fault_tolerance is None:
@@ -2781,13 +2777,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if item.state != RankState.DEAD
         }
         targets.update(extra_targets or [])
-        targets.difference_update(exclude_targets or [])
         logger.info(
             "Fault tolerance active mask dispatch: mask=%s targets=%s "
-            "exclude_targets=%s update_routing=%s",
+            "update_routing=%s",
             active_mask,
             sorted(targets),
-            sorted(exclude_targets or []),
             update_routing,
         )
         await self._ft_send_command_collect(
