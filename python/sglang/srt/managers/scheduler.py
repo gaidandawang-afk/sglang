@@ -1597,6 +1597,7 @@ class Scheduler(
         for req in retry_reqs:
             try:
                 release_kv_cache(req, self.tree_cache, is_insert=False)
+                req.reset_for_retract()
             except Exception:
                 logger.exception(
                     "FT continue failed to release failed request state: rid=%s",
