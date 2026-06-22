@@ -3374,7 +3374,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _maybe_inject_test_forward_recoverable_fault(self) -> None:
         """Inject one ModelRunner forward exception for explicit FT tests only."""
         target_raw = os.environ.get("SGLANG_TEST_FT_RECOVERABLE_FAULT_RANK")
-        if target_raw is None:
+        if target_raw is None or getattr(
+            self, "_test_forward_recoverable_fault_injected", False
+        ):
             return
 
         trigger_file = os.environ.get("SGLANG_TEST_FT_RECOVERABLE_FAULT_FILE", "")
@@ -3390,7 +3392,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         rank = self.dp_rank if self.dp_rank is not None else self.tp_rank
         local_trigger = (
             rank in target_ranks
-            and not getattr(self, "_test_forward_recoverable_fault_injected", False)
             and (not trigger_file or os.path.exists(trigger_file))
         )
         fault_flag = torch.tensor([int(local_trigger)], dtype=torch.int32)
@@ -3403,8 +3404,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not fault_flag.item():
             return
 
+        self._test_forward_recoverable_fault_injected = True
         if local_trigger:
-            self._test_forward_recoverable_fault_injected = True
             done_file = os.environ.get(
                 "SGLANG_TEST_FT_RECOVERABLE_FAULT_DONE_FILE", ""
             )
