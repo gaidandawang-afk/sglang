@@ -18,7 +18,6 @@ import logging
 import os
 import signal
 import sys
-import threading
 import time
 from collections import deque
 from contextlib import nullcontext
@@ -1067,6 +1066,7 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+        self._ft_shutdown_requested = False
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1946,6 +1946,9 @@ class Scheduler(
         self._check_pending_flush()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
+        if self._ft_shutdown_requested:
+            logger.warning("Fault tolerance shutdown command acknowledged; exiting scheduler.")
+            os._exit(0)
 
     def init_req_max_new_tokens(self, req):
         input_len = len(req.origin_input_ids)
@@ -3824,7 +3827,7 @@ class Scheduler(
                 message = "active mask applied"
             elif recv_req.command == "shutdown":
                 message = "shutdown scheduled"
-                threading.Timer(0.1, lambda: os._exit(0)).start()
+                self._ft_shutdown_requested = True
             else:
                 raise ValueError(f"unknown fault tolerance command: {recv_req.command}")
             return FaultToleranceCommandReqOutput(
