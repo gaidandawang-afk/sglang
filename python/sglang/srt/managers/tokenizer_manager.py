@@ -1603,19 +1603,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if error:
             return ft_error_status(error), ft_failure(error)
 
-        # For scale_down after a recoverable exception, the rank being scaled
-        # down is still a live paused scheduler process. It must receive the
-        # active-mask update as part of the EP/Mooncake reconfiguration even
-        # though it should not be resumed afterward. For kill-based scale_down,
-        # the killed rank is already DEAD and therefore absent here.
-        active_mask_targets = self.fault_tolerance.non_dead_ranks()
         active_mask, resume_targets = self.fault_tolerance.begin_recover(
             instruction, ranks
         )
         try:
-            await self._ft_apply_active_mask(
-                active_mask, timeout, target_ranks=active_mask_targets
-            )
+            await self._ft_apply_active_mask(active_mask, timeout)
             await self._ft_send_command_collect(
                 command="resume",
                 target_ranks=resume_targets,
@@ -2702,23 +2694,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             active_mask, self.server_args.fault_tolerance_timeout
         )
 
-    async def _ft_apply_active_mask(
-        self,
-        active_mask: List[bool],
-        timeout: int,
-        target_ranks: Optional[List[int]] = None,
-    ):
+    async def _ft_apply_active_mask(self, active_mask: List[bool], timeout: int):
         if self.fault_tolerance is None:
             return
         if not any(active_mask):
             raise RuntimeError("fault tolerance active mask has no live rank")
-        targets = target_ranks
-        if targets is None:
-            targets = [
-                item.rank
-                for item in self.fault_tolerance.ranks
-                if item.state != RankState.DEAD
-            ]
+        targets = [
+            item.rank
+            for item in self.fault_tolerance.ranks
+            if item.state != RankState.DEAD
+        ]
         await self._ft_send_command_collect(
             command="apply_active_mask",
             target_ranks=targets,
