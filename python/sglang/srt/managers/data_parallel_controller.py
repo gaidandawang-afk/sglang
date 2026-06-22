@@ -156,14 +156,6 @@ class DataParallelController:
         else:
             self.send_to_tokenizer = None
 
-        self._test_recoverable_fault_rank = os.environ.get(
-            "SGLANG_TEST_FT_RECOVERABLE_FAULT_RANK", ""
-        ).strip()
-        self._test_recoverable_fault_file = os.environ.get(
-            "SGLANG_TEST_FT_RECOVERABLE_FAULT_FILE", ""
-        )
-        self._test_recoverable_fault_reported = False
-
         # Dispatch method
         self.round_robin_counter = 0
         dispatch_lookup = {
@@ -740,7 +732,6 @@ class DataParallelController:
 
     def event_loop(self):
         while True:
-            self._maybe_report_test_recoverable_fault()
             while True:
                 self.soft_watchdog.feed()
                 try:
@@ -748,39 +739,6 @@ class DataParallelController:
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
-
-    def _maybe_report_test_recoverable_fault(self) -> None:
-        if (
-            self._test_recoverable_fault_reported
-            or not self._test_recoverable_fault_rank
-            or self.send_to_tokenizer is None
-        ):
-            return
-        if self._test_recoverable_fault_file and not os.path.exists(
-            self._test_recoverable_fault_file
-        ):
-            return
-        try:
-            rank = int(self._test_recoverable_fault_rank)
-        except ValueError:
-            self._test_recoverable_fault_reported = True
-            return
-        if rank < 0 or rank >= len(self.workers):
-            self._test_recoverable_fault_reported = True
-            return
-
-        self._test_recoverable_fault_reported = True
-        logger.warning(
-            "Reporting injected recoverable FT exception from DPC: rank=%s",
-            rank,
-        )
-        self.send_to_tokenizer.send_pyobj(
-            FaultToleranceRankFaultOutput(
-                rank=rank,
-                fault_type="exception",
-                message=f"Injected recoverable FT fault on scheduler rank {rank}",
-            )
-        )
 
 
 def run_data_parallel_controller_process(

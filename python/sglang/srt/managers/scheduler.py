@@ -1697,9 +1697,6 @@ class Scheduler(
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
 
-        if self.server_args.enable_fault_tolerance:
-            self._maybe_inject_test_recoverable_fault()
-
         if self.recv_skipper is not None:
             last_forward_mode = (
                 self.last_batch.forward_mode if self.last_batch is not None else None
@@ -3801,51 +3798,6 @@ class Scheduler(
         from sglang.srt.elastic_ep.elastic_ep import apply_active_rank_mask
 
         apply_active_rank_mask(recv_req.status)
-
-    def _maybe_inject_test_recoverable_fault(self) -> None:
-        """Inject one scheduler exception for explicit remote FT tests only."""
-        target_raw = os.environ.get("SGLANG_TEST_FT_RECOVERABLE_FAULT_RANK")
-        if target_raw is None:
-            return
-
-        trigger_file = os.environ.get("SGLANG_TEST_FT_RECOVERABLE_FAULT_FILE", "")
-        if trigger_file and not os.path.exists(trigger_file):
-            return
-        if getattr(self, "_test_recoverable_fault_injected", False):
-            return
-
-        try:
-            target_ranks = {
-                int(item.strip())
-                for item in target_raw.split(",")
-                if item.strip()
-            }
-        except ValueError:
-            return
-
-        rank = self._ft_rank()
-        if rank not in target_ranks:
-            return
-
-        self._test_recoverable_fault_injected = True
-        done_file = os.environ.get(
-            "SGLANG_TEST_FT_RECOVERABLE_FAULT_DONE_FILE", ""
-        )
-        if done_file:
-            try:
-                with open(done_file, "a", encoding="utf-8") as file:
-                    file.write(f"pid={os.getpid()} rank={rank}\n")
-            except OSError:
-                logger.warning(
-                    "Failed to record injected FT exception in %s",
-                    done_file,
-                    exc_info=True,
-                )
-
-        if self.server_args.fault_tolerance_on_error_strategy == "pause":
-            return
-
-        raise RuntimeError(f"Injected recoverable FT fault on scheduler rank {rank}")
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput

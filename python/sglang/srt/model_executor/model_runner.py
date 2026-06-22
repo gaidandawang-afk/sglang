@@ -3299,6 +3299,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
+        self._maybe_inject_test_forward_recoverable_fault()
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
@@ -3369,6 +3370,52 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.maybe_recover_ep_ranks()
 
         return output
+
+    def _maybe_inject_test_forward_recoverable_fault(self) -> None:
+        """Inject one ModelRunner forward exception for explicit FT tests only."""
+        target_raw = os.environ.get("SGLANG_TEST_FT_RECOVERABLE_FAULT_RANK")
+        if target_raw is None:
+            return
+
+        trigger_file = os.environ.get("SGLANG_TEST_FT_RECOVERABLE_FAULT_FILE", "")
+        if trigger_file and not os.path.exists(trigger_file):
+            return
+        if getattr(self, "_test_forward_recoverable_fault_injected", False):
+            return
+
+        try:
+            target_ranks = {
+                int(item.strip())
+                for item in target_raw.split(",")
+                if item.strip()
+            }
+        except ValueError:
+            return
+
+        rank = self.dp_rank if self.dp_rank is not None else self.tp_rank
+        if rank not in target_ranks:
+            return
+
+        self._test_forward_recoverable_fault_injected = True
+        done_file = os.environ.get(
+            "SGLANG_TEST_FT_RECOVERABLE_FAULT_DONE_FILE", ""
+        )
+        if done_file:
+            try:
+                with open(done_file, "a", encoding="utf-8") as file:
+                    file.write(
+                        f"pid={os.getpid()} rank={rank} forward_pass_id={self.forward_pass_id}\n"
+                    )
+            except OSError:
+                logger.warning(
+                    "Failed to record injected FT forward exception in %s",
+                    done_file,
+                    exc_info=True,
+                )
+
+        raise RuntimeError(
+            f"Injected recoverable FT forward fault on model runner rank {rank}"
+        )
 
     def _forward_raw(
         self,
