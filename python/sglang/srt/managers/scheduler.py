@@ -3817,11 +3817,34 @@ class Scheduler(
         except ValueError:
             return
 
-        rank = self._ft_rank()
-        if rank not in target_ranks:
+        if len(target_ranks) != 1:
+            logger.error(
+                "Recoverable FT test injection requires exactly one rank, got %s",
+                sorted(target_ranks),
+            )
             return
 
         self._test_recoverable_fault_injected = True
+        target_rank = next(iter(target_ranks))
+        rank = self._ft_rank()
+        if rank != target_rank:
+            # Under DP attention only the group leader owns the tokenizer PUSH
+            # socket. Forward the synthetic target-rank event from that leader;
+            # the actual target still raises below and exercises scheduler
+            # exception recovery.
+            if self.send_to_tokenizer.socket is not None:
+                self.send_to_tokenizer.send_output(
+                    FaultToleranceRankFaultOutput(
+                        rank=target_rank,
+                        fault_type="exception",
+                        message=(
+                            "Injected recoverable FT fault on scheduler rank "
+                            f"{target_rank}"
+                        ),
+                    )
+                )
+            return
+
         done_file = os.environ.get(
             "SGLANG_TEST_FT_RECOVERABLE_FAULT_DONE_FILE", ""
         )
