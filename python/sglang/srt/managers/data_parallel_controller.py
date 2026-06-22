@@ -225,17 +225,28 @@ class DataParallelController:
 
     def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
         for rank in obj.target_ranks:
-            if 0 <= rank < len(self.workers) and self.status[rank]:
+            if (
+                obj.command == "shutdown"
+                and 0 <= rank < len(self.workers)
+                and self.status[rank]
+            ):
+                self._ft_suppressed_scheduler_exit_ranks.add(rank)
+        # Fault-tolerance commands must enter the same control-message fanout
+        # path as other scheduler control messages.  In DP-attention without
+        # local control broadcast, only rank 0 receives from the DPC and then
+        # broadcasts control_reqs over the full tp_group.  Sending directly to
+        # a non-root target rank would be ignored by recv_requests().
+        for rank in range(0, len(self.workers), self.control_message_step):
+            if self.status[rank]:
                 logger.info(
                     "DPC forwarding fault tolerance command: id=%s command=%s "
-                    "rank=%s reason=%s",
+                    "control_rank=%s targets=%s reason=%s",
                     obj.request_id,
                     obj.command,
                     rank,
+                    obj.target_ranks,
                     obj.reason,
                 )
-                if obj.command == "shutdown":
-                    self._ft_suppressed_scheduler_exit_ranks.add(rank)
                 self.workers[rank].send_pyobj(obj)
 
     def _handle_scheduler_process_exit(self, index, proc, name):
