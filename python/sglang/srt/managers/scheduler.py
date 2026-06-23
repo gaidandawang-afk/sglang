@@ -3833,6 +3833,10 @@ class Scheduler(
 
                 apply_active_rank_mask(recv_req.active_mask)
                 message = "active mask applied"
+            elif recv_req.command == "park_idle":
+                self._ft_response_barrier_cleanup()
+                self._engine_paused = True
+                message = "parked idle"
             elif recv_req.command == "shutdown":
                 message = "shutdown scheduled"
                 self._ft_shutdown_requested = True
@@ -3851,6 +3855,20 @@ class Scheduler(
                 success=False,
                 message=str(exc),
             )
+
+    def _ft_response_barrier_cleanup(self) -> None:
+        seen_batches = set()
+        for batch in (self.running_batch, self.last_batch, self.cur_batch):
+            if batch is None or id(batch) in seen_batches:
+                continue
+            seen_batches.add(id(batch))
+            batch.filter_batch(v1_spec_info_filtered=True)
+            if batch.is_empty():
+                batch.batch_is_full = False
+        if self.last_batch is not None and self.last_batch.is_empty():
+            self.last_batch = None
+        if self.cur_batch is not None and self.cur_batch.is_empty():
+            self.cur_batch = None
 
     def handle_active_ranks_update(self, recv_req: ActiveRanksOutput) -> None:
         from sglang.srt.elastic_ep.elastic_ep import apply_active_rank_mask

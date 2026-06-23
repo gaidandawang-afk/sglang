@@ -409,6 +409,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_fault_tolerance(self):
         self.fault_tolerance: Optional[FaultToleranceManager] = None
         self._ft_pending_commands: Dict[str, PendingFTCommand] = {}
+        self._ft_schedulers_parked = False
+        self._ft_scheduler_park_lock = asyncio.Lock()
         if not self.server_args.enable_fault_tolerance:
             return
         self.fault_tolerance = FaultToleranceManager(
@@ -589,6 +591,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and self.fault_tolerance.should_reject_admission()
         ):
             raise RuntimeError("fault_tolerance_paused")
+
+        await self._ft_resume_parked_schedulers_before_request()
 
         self._init_req_state(obj, request)
         if self.server_args.language_only:
@@ -1412,6 +1416,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         yield abort_out
                         break
 
+                await self._ft_barrier_before_final_response(obj, is_stream=is_stream)
                 yield out
                 break
 
@@ -1654,6 +1659,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 timeout_sec=timeout,
                 reason=instruction,
             )
+            self._ft_schedulers_parked = False
             self.send_to_scheduler.send_pyobj(
                 ActiveRanksOutput(status=active_mask)
             )
@@ -1674,7 +1680,87 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             instruction,
             pending_scale_down_ranks,
         )
+        if instruction == "scale_down":
+            try:
+                await self._ft_park_active_schedulers(reason="scale_down")
+            except Exception as exc:
+                logger.exception("Fault tolerance scale_down parking failed: %s", exc)
+                os._exit(1)
         return 200, response
+
+    def _ft_should_park_schedulers(self) -> bool:
+        return (
+            self.fault_tolerance is not None
+            and self.server_args.enable_fault_tolerance
+            and self.server_args.dp_size > 1
+            and self.fault_tolerance.is_mooncake_backend
+        )
+
+    async def _ft_resume_parked_schedulers_before_request(self) -> None:
+        if not self._ft_should_park_schedulers():
+            return
+        async with self._ft_scheduler_park_lock:
+            if not self._ft_schedulers_parked:
+                return
+            active_ranks = [
+                item.rank
+                for item in self.fault_tolerance.ranks
+                if item.state == RankState.HEALTHY
+            ]
+            await self._ft_send_command_collect(
+                command="resume",
+                target_ranks=active_ranks,
+                timeout_sec=self.server_args.fault_tolerance_timeout,
+                reason="before_request",
+            )
+            self._ft_schedulers_parked = False
+
+    async def _ft_park_active_schedulers(
+        self,
+        *,
+        reason: str,
+        is_stream: bool = False,
+    ) -> None:
+        if not self._ft_should_park_schedulers():
+            return
+        async with self._ft_scheduler_park_lock:
+            if self._ft_schedulers_parked:
+                return
+            active_ranks = [
+                item.rank
+                for item in self.fault_tolerance.ranks
+                if item.state == RankState.HEALTHY
+            ]
+            if not active_ranks:
+                return
+            try:
+                await self._ft_send_command_collect(
+                    command="park_idle",
+                    target_ranks=active_ranks,
+                    timeout_sec=self.server_args.fault_tolerance_timeout,
+                    reason=reason,
+                )
+                self._ft_schedulers_parked = True
+            except Exception as exc:
+                logger.exception("Failed to park FT schedulers: reason=%s", reason)
+                if not is_stream:
+                    raise fastapi.HTTPException(
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                        detail=f"failed to park fault-tolerance schedulers: {exc}",
+                    ) from exc
+
+    async def _ft_barrier_before_final_response(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        *,
+        is_stream: bool,
+    ) -> None:
+        if is_health_check_generate_req(obj):
+            return
+        await self._ft_park_active_schedulers(
+            reason="final_response",
+            is_stream=is_stream,
+        )
 
     async def update_weights_from_disk(
         self,

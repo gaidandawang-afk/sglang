@@ -203,7 +203,6 @@ def apply_active_rank_mask(mask: List[bool]) -> None:
         device=state.active_ranks.device,
     )
     state.active_ranks.copy_(tensor)
-    state.snapshot_active_to_last()
     state.sync_active_to_cpu()
     _refresh_ep_members()
 
