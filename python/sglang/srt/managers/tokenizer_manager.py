@@ -1665,6 +1665,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.send_to_scheduler.send_pyobj(
                 ActiveRanksOutput(status=active_mask)
             )
+            if instruction == "scale_down":
+                await asyncio.sleep(1)
             if shutdown_live_targets and live_scale_down_targets:
                 await self._ft_send_command_collect(
                     command="shutdown",
@@ -1710,11 +1712,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         async with self._ft_scheduler_park_lock:
             if not self._ft_schedulers_parked:
                 return
-            target_ranks = self._ft_parked_scheduler_ranks or [
+            healthy_ranks = [
                 item.rank
                 for item in self.fault_tolerance.ranks
                 if item.state == RankState.HEALTHY
             ]
+            healthy_rank_set = set(healthy_ranks)
+            target_ranks = [
+                rank
+                for rank in self._ft_parked_scheduler_ranks
+                if rank in healthy_rank_set
+            ] or healthy_ranks
+            if not target_ranks:
+                self._ft_schedulers_parked = False
+                self._ft_parked_scheduler_ranks = []
+                return
             await self._ft_send_command_collect(
                 command="resume",
                 target_ranks=target_ranks,
