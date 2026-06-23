@@ -211,6 +211,16 @@ class _MooncakeEPDispatcherImpl:
         elastic_ep_state = ElasticEPStateManager.instance()
         elastic_ep_state.maybe_inject_test_rank_fault()
         active_ranks = elastic_ep_state.active_ranks
+        if envs.SGLANG_FT_DEBUG_FLOW.get():
+            logger.info(
+                "FT debug mooncake dispatch begin: rank=%s first=%s "
+                "hidden_shape=%s topk_shape=%s active=%s",
+                dist.get_rank(),
+                self.first_execution,
+                list(hidden_states.shape),
+                list(topk_ids.shape),
+                active_ranks.detach().cpu().tolist(),
+            )
         packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,
@@ -224,6 +234,14 @@ class _MooncakeEPDispatcherImpl:
                 return_recv_hook=self.return_recv_hook,
             )
         )
+        if envs.SGLANG_FT_DEBUG_FLOW.get():
+            logger.info(
+                "FT debug mooncake dispatch done: rank=%s recv_hidden_shape=%s "
+                "recv_count_shape=%s",
+                dist.get_rank(),
+                list(packed_recv_hidden.shape),
+                list(packed_recv_count.shape),
+            )
         return packed_recv_hidden, packed_recv_count, event, hook
 
     def _should_use_fp8_dispatch(self) -> bool:
@@ -259,6 +277,17 @@ class _MooncakeEPDispatcherImpl:
         elastic_ep_state = ElasticEPStateManager.instance()
         elastic_ep_state.maybe_inject_test_rank_fault()
         active_ranks = elastic_ep_state.active_ranks
+        if envs.SGLANG_FT_DEBUG_FLOW.get():
+            logger.info(
+                "FT debug mooncake combine begin: rank=%s first=%s "
+                "hidden_shape=%s topk_shape=%s active=%s handle_set=%s",
+                dist.get_rank(),
+                self.first_execution,
+                list(hidden_states.shape),
+                list(topk_ids.shape),
+                active_ranks.detach().cpu().tolist(),
+                self.handle is not None,
+            )
         combined_hidden_states, event, hook = buffer.combine(
             hidden_states,
             topk_ids,
@@ -269,6 +298,12 @@ class _MooncakeEPDispatcherImpl:
             async_finish=not self.return_recv_hook,
             return_recv_hook=self.return_recv_hook,
         )
+        if envs.SGLANG_FT_DEBUG_FLOW.get():
+            logger.info(
+                "FT debug mooncake combine done: rank=%s combined_shape=%s",
+                dist.get_rank(),
+                list(combined_hidden_states.shape),
+            )
         self.first_execution = False
         self.handle = None
         return combined_hidden_states, event, hook

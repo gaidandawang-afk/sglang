@@ -3098,6 +3098,37 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
+        ft_debug_flow = envs.SGLANG_FT_DEBUG_FLOW.get()
+        if ft_debug_flow:
+            active_ranks = None
+            last_active_ranks = None
+            try:
+                from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+                elastic_ep_state = ElasticEPStateManager.instance()
+                if elastic_ep_state is not None:
+                    if elastic_ep_state.active_ranks is not None:
+                        active_ranks = (
+                            elastic_ep_state.active_ranks.detach().cpu().tolist()
+                        )
+                    if elastic_ep_state.last_active_ranks is not None:
+                        last_active_ranks = (
+                            elastic_ep_state.last_active_ranks.detach().cpu().tolist()
+                        )
+            except Exception:
+                logger.exception("FT debug failed to read elastic EP state")
+            logger.info(
+                "FT debug run_batch begin: rank=%s iter=%s mode=%s batch_size=%s "
+                "active=%s last_active=%s rids=%s",
+                self._ft_rank(),
+                batch.forward_iter,
+                batch.forward_mode,
+                batch.batch_size(),
+                active_ranks,
+                last_active_ranks,
+                [req.rid for req in batch.reqs],
+            )
+
         # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:
@@ -3164,6 +3195,16 @@ class Scheduler(
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
+
+            if ft_debug_flow:
+                logger.info(
+                    "FT debug run_batch forward done: rank=%s iter=%s mode=%s "
+                    "batch_size=%s",
+                    self._ft_rank(),
+                    batch.forward_iter,
+                    batch.forward_mode,
+                    batch.batch_size(),
+                )
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].

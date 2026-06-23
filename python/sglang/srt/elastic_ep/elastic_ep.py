@@ -9,6 +9,7 @@ from typing import Iterator, List, Optional
 import torch
 
 from sglang.srt.distributed import parallel_state
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ServerArgs
 from sglang.srt.utils import is_cpu, is_cuda
 
@@ -204,6 +205,18 @@ def apply_active_rank_mask(mask: List[bool]) -> None:
     )
     state.active_ranks.copy_(tensor)
     state.sync_active_to_cpu()
+    if envs.SGLANG_FT_DEBUG_FLOW.get():
+        last_active = (
+            state.last_active_ranks.detach().cpu().tolist()
+            if state.last_active_ranks is not None
+            else None
+        )
+        logger.info(
+            "FT debug active mask applied: rank=%s active=%s last_active=%s",
+            torch.distributed.get_rank(),
+            state.active_ranks.detach().cpu().tolist(),
+            last_active,
+        )
     _refresh_ep_members()
 
 
