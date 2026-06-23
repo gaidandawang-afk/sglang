@@ -410,6 +410,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.fault_tolerance: Optional[FaultToleranceManager] = None
         self._ft_pending_commands: Dict[str, PendingFTCommand] = {}
         self._ft_schedulers_parked = False
+        self._ft_parked_scheduler_ranks: List[int] = []
         self._ft_scheduler_park_lock = asyncio.Lock()
         if not self.server_args.enable_fault_tolerance:
             return
@@ -1660,6 +1661,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 reason=instruction,
             )
             self._ft_schedulers_parked = False
+            self._ft_parked_scheduler_ranks = []
             self.send_to_scheduler.send_pyobj(
                 ActiveRanksOutput(status=active_mask)
             )
@@ -1682,7 +1684,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
         if instruction == "scale_down":
             try:
-                await self._ft_park_active_schedulers(reason="scale_down")
+                park_extra_targets = (
+                    live_scale_down_targets if not shutdown_live_targets else None
+                )
+                await self._ft_park_active_schedulers(
+                    reason="scale_down",
+                    extra_target_ranks=park_extra_targets,
+                )
             except Exception as exc:
                 logger.exception("Fault tolerance scale_down parking failed: %s", exc)
                 os._exit(1)
@@ -1702,24 +1710,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         async with self._ft_scheduler_park_lock:
             if not self._ft_schedulers_parked:
                 return
-            active_ranks = [
+            target_ranks = self._ft_parked_scheduler_ranks or [
                 item.rank
                 for item in self.fault_tolerance.ranks
                 if item.state == RankState.HEALTHY
             ]
             await self._ft_send_command_collect(
                 command="resume",
-                target_ranks=active_ranks,
+                target_ranks=target_ranks,
                 timeout_sec=self.server_args.fault_tolerance_timeout,
                 reason="before_request",
             )
             self._ft_schedulers_parked = False
+            self._ft_parked_scheduler_ranks = []
 
     async def _ft_park_active_schedulers(
         self,
         *,
         reason: str,
         is_stream: bool = False,
+        extra_target_ranks: Optional[List[int]] = None,
     ) -> None:
         if not self._ft_should_park_schedulers():
             return
@@ -1731,6 +1741,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for item in self.fault_tolerance.ranks
                 if item.state == RankState.HEALTHY
             ]
+            if extra_target_ranks:
+                active_ranks = sorted(set(active_ranks + extra_target_ranks))
             if not active_ranks:
                 return
             try:
@@ -1741,6 +1753,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     reason=reason,
                 )
                 self._ft_schedulers_parked = True
+                self._ft_parked_scheduler_ranks = active_ranks
             except Exception as exc:
                 logger.exception("Failed to park FT schedulers: reason=%s", reason)
                 if not is_stream:
