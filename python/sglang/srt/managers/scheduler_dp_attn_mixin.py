@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 
+logger = logging.getLogger(__name__)
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
 
@@ -185,6 +187,7 @@ def prepare_mlp_sync_batch_raw(
         device = "cpu"
 
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
+    ft_debug_flow = envs.SGLANG_FT_DEBUG_FLOW.get()
 
     mlp_sync_info = MLPSyncBatchInfo(
         dp_size=dp_size,
@@ -199,7 +202,26 @@ def prepare_mlp_sync_batch_raw(
     )
 
     if not skip_all_gather:
+        if ft_debug_flow:
+            logger.info(
+                "FT debug mlp sync gather begin: rank=%s local_batch=%s "
+                "mode=%s num_tokens=%s device=%s",
+                torch.distributed.get_rank(),
+                local_batch is not None,
+                None if local_batch is None else local_batch.forward_mode,
+                num_tokens,
+                device,
+            )
         mlp_sync_info.all_gather(device=device, group=group)
+        if ft_debug_flow:
+            logger.info(
+                "FT debug mlp sync gather done: rank=%s global_tokens=%s "
+                "global_modes=%s active=%s",
+                torch.distributed.get_rank(),
+                mlp_sync_info.global_num_tokens,
+                mlp_sync_info.tp0_info[:, 5].detach().cpu().tolist(),
+                tp_group.active_ranks.detach().cpu().tolist(),
+            )
 
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
@@ -208,10 +230,24 @@ def prepare_mlp_sync_batch_raw(
         )
 
     need_idle_batch = skip_all_gather or max(mlp_sync_info.global_num_tokens) > 0
+    if ft_debug_flow and (need_idle_batch or local_batch is not None):
+        logger.info(
+            "FT debug mlp sync decision: rank=%s need_idle=%s local_batch=%s "
+            "global_tokens=%s",
+            torch.distributed.get_rank(),
+            need_idle_batch,
+            local_batch is not None,
+            mlp_sync_info.global_num_tokens,
+        )
     if need_idle_batch:
         batch_to_gather = local_batch
         if local_batch is None:
             batch_to_gather = local_batch = get_idle_batch()
+            if ft_debug_flow:
+                logger.info(
+                    "FT debug mlp sync created idle batch: rank=%s",
+                    torch.distributed.get_rank(),
+                )
         elif local_batch.forward_mode.is_prebuilt():
             # NOTE: for prebuilt batch, we add an inner idle batch to run MLP sync
             batch_to_gather = local_batch.inner_idle_batch = get_idle_batch()

@@ -1067,6 +1067,7 @@ class Scheduler(
         self.forward_sleep_time = None
         self._engine_paused = False
         self._ft_shutdown_requested = False
+        self._ft_debug_loop_log_remaining = 0
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1623,12 +1624,40 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            if (
+                envs.SGLANG_FT_DEBUG_FLOW.get()
+                and self._ft_debug_loop_log_remaining > 0
+            ):
+                logger.info(
+                    "FT debug scheduler loop: rank=%s paused=%s recv=%s "
+                    "waiting=%s running=%s last=%s cur=%s",
+                    self._ft_rank(),
+                    self._engine_paused,
+                    len(recv_reqs),
+                    len(self.waiting_queue),
+                    self.running_batch.batch_size(),
+                    None if self.last_batch is None else self.last_batch.forward_mode,
+                    None if self.cur_batch is None else self.cur_batch.forward_mode,
+                )
+                self._ft_debug_loop_log_remaining -= 1
             if self._engine_paused:
                 continue
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+            if (
+                envs.SGLANG_FT_DEBUG_FLOW.get()
+                and self._ft_debug_loop_log_remaining > 0
+            ):
+                logger.info(
+                    "FT debug scheduler next_batch: rank=%s batch=%s mode=%s "
+                    "batch_size=%s",
+                    self._ft_rank(),
+                    batch is not None,
+                    None if batch is None else batch.forward_mode,
+                    0 if batch is None else batch.batch_size(),
+                )
 
             # Launch the current batch
             if batch:
@@ -3867,6 +3896,8 @@ class Scheduler(
             elif recv_req.command == "resume":
                 self._engine_paused = False
                 message = "resumed"
+                if envs.SGLANG_FT_DEBUG_FLOW.get():
+                    self._ft_debug_loop_log_remaining = 6
             elif recv_req.command == "apply_active_mask":
                 if recv_req.active_mask is None:
                     raise ValueError("active_mask is required")
@@ -3874,10 +3905,14 @@ class Scheduler(
 
                 apply_active_rank_mask(recv_req.active_mask)
                 message = "active mask applied"
+                if envs.SGLANG_FT_DEBUG_FLOW.get():
+                    self._ft_debug_loop_log_remaining = 6
             elif recv_req.command == "park_idle":
                 self._ft_response_barrier_cleanup()
                 self._engine_paused = True
                 message = "parked idle"
+                if envs.SGLANG_FT_DEBUG_FLOW.get():
+                    self._ft_debug_loop_log_remaining = 6
             elif recv_req.command == "shutdown":
                 message = "shutdown scheduled"
                 self._ft_shutdown_requested = True
