@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import NamedTuple, Optional
+from typing import Any, NamedTuple, Optional
 
 import torch
 import torch.distributed as dist
@@ -24,6 +24,20 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
+
+
+def _ft_debug_shape(value: Any):
+    if hasattr(value, "shape"):
+        return list(value.shape)
+    if isinstance(value, (tuple, list)):
+        return [_ft_debug_shape(item) for item in value]
+    return type(value).__name__
+
+
+def _ft_debug_active_ranks(active_ranks: Optional[torch.Tensor]):
+    if active_ranks is None:
+        return None
+    return active_ranks.detach().cpu().tolist()
 
 
 class MooncakeDispatchOutput(NamedTuple):
@@ -217,9 +231,9 @@ class _MooncakeEPDispatcherImpl:
                 "hidden_shape=%s topk_shape=%s active=%s",
                 dist.get_rank(),
                 self.first_execution,
-                list(hidden_states.shape),
-                list(topk_ids.shape),
-                active_ranks.detach().cpu().tolist(),
+                _ft_debug_shape(hidden_states),
+                _ft_debug_shape(topk_ids),
+                _ft_debug_active_ranks(active_ranks),
             )
         packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
@@ -239,8 +253,8 @@ class _MooncakeEPDispatcherImpl:
                 "FT debug mooncake dispatch done: rank=%s recv_hidden_shape=%s "
                 "recv_count_shape=%s",
                 dist.get_rank(),
-                list(packed_recv_hidden.shape),
-                list(packed_recv_count.shape),
+                _ft_debug_shape(packed_recv_hidden),
+                _ft_debug_shape(packed_recv_count),
             )
         return packed_recv_hidden, packed_recv_count, event, hook
 
@@ -283,9 +297,9 @@ class _MooncakeEPDispatcherImpl:
                 "hidden_shape=%s topk_shape=%s active=%s handle_set=%s",
                 dist.get_rank(),
                 self.first_execution,
-                list(hidden_states.shape),
-                list(topk_ids.shape),
-                active_ranks.detach().cpu().tolist(),
+                _ft_debug_shape(hidden_states),
+                _ft_debug_shape(topk_ids),
+                _ft_debug_active_ranks(active_ranks),
                 self.handle is not None,
             )
         combined_hidden_states, event, hook = buffer.combine(
@@ -302,7 +316,7 @@ class _MooncakeEPDispatcherImpl:
             logger.info(
                 "FT debug mooncake combine done: rank=%s combined_shape=%s",
                 dist.get_rank(),
-                list(combined_hidden_states.shape),
+                _ft_debug_shape(combined_hidden_states),
             )
         self.first_execution = False
         self.handle = None
