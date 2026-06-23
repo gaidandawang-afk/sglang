@@ -1684,18 +1684,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             instruction,
             pending_scale_down_ranks,
         )
-        if instruction == "scale_down":
-            try:
-                park_extra_targets = (
-                    live_scale_down_targets if not shutdown_live_targets else None
-                )
-                await self._ft_park_active_schedulers(
-                    reason="scale_down",
-                    extra_target_ranks=park_extra_targets,
-                )
-            except Exception as exc:
-                logger.exception("Fault tolerance scale_down parking failed: %s", exc)
-                os._exit(1)
         return 200, response
 
     def _ft_should_park_schedulers(self) -> bool:
