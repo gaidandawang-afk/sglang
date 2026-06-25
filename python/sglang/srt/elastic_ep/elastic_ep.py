@@ -34,7 +34,11 @@ class ElasticEPState:
 
     def reset(self):
         if self.active_ranks is not None:
-            self.active_ranks.fill_(1)
+            self.active_ranks = torch.ones(
+                self.active_ranks.shape,
+                dtype=self.active_ranks.dtype,
+                device=self.active_ranks.device,
+            )
             self.snapshot_active_to_last()
             self.sync_active_to_cpu()
 
@@ -177,9 +181,20 @@ def _maybe_create_message_queue(group) -> None:
     )
 
 
-def _refresh_ep_members() -> None:
+def _refresh_ep_members(*, allow_missing_buffer_in_fallback: bool = False) -> None:
     from sglang.srt.layers.moe.token_dispatcher.mooncake import EPBuffer
 
+    if EPBuffer._buffer is None:
+        if (
+            allow_missing_buffer_in_fallback
+            and os.environ.get("MOONCAKE_EP_FORCE_FALLBACK") == "1"
+        ):
+            logger.info(
+                "Skip Mooncake EP member refresh before EPBuffer initialization "
+                "in Mooncake forced fallback rejoin path."
+            )
+            return
+        raise RuntimeError("Mooncake EPBuffer is not initialized")
     EPBuffer._buffer.update_ep_member()
 
 
@@ -261,4 +276,4 @@ def join_process_groups():
         )
         _maybe_create_message_queue(group)
 
-    _refresh_ep_members()
+    _refresh_ep_members(allow_missing_buffer_in_fallback=True)
