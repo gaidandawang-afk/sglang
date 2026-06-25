@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -333,6 +334,13 @@ def broadcast_global_expert_location_metadata(
     metadata = get_global_expert_location_metadata()
     assert metadata is not None
 
+    if group is None and os.environ.get("MOONCAKE_EP_FORCE_FALLBACK") == "1":
+        _broadcast_global_expert_location_metadata_via_cpu_group(
+            metadata=metadata,
+            src_rank=src_rank,
+        )
+        return
+
     # Ensure device tensors are contiguous before broadcasting in-place
     metadata.physical_to_logical_map = metadata.physical_to_logical_map.contiguous()
     metadata.logical_to_all_physical_map = (
@@ -362,6 +370,74 @@ def broadcast_global_expert_location_metadata(
     metadata.logical_to_all_physical_map_cpu = (
         metadata.logical_to_all_physical_map.cpu()
     )
+
+
+def _broadcast_global_expert_location_metadata_via_cpu_group(
+    metadata: ExpertLocationMetadata,
+    src_rank: int,
+):
+    from sglang.srt.distributed.parallel_state import get_world_group
+
+    logger.info(
+        "Broadcast expert location metadata over CPU group in Mooncake forced "
+        "fallback path."
+    )
+
+    physical_to_logical_map_cpu = metadata.physical_to_logical_map_cpu.contiguous()
+    logical_to_all_physical_map_cpu = (
+        metadata.logical_to_all_physical_map_cpu.contiguous()
+    )
+
+    torch.distributed.broadcast(
+        physical_to_logical_map_cpu,
+        src=src_rank,
+        group=get_world_group().cpu_group,
+    )
+    torch.distributed.broadcast(
+        logical_to_all_physical_map_cpu,
+        src=src_rank,
+        group=get_world_group().cpu_group,
+    )
+
+    logical_to_all_physical_map_num_valid_cpu = torch.count_nonzero(
+        logical_to_all_physical_map_cpu != -1,
+        dim=-1,
+    )
+
+    logical_to_rank_dispatch_physical_map_cpu = None
+    if metadata.logical_to_rank_dispatch_physical_map is not None:
+        logical_to_rank_dispatch_physical_map_cpu = (
+            metadata.logical_to_rank_dispatch_physical_map.detach().cpu().contiguous()
+        )
+        torch.distributed.broadcast(
+            logical_to_rank_dispatch_physical_map_cpu,
+            src=src_rank,
+            group=get_world_group().cpu_group,
+        )
+
+    metadata.physical_to_logical_map_cpu = physical_to_logical_map_cpu
+    metadata.logical_to_all_physical_map_cpu = logical_to_all_physical_map_cpu
+    metadata.physical_to_logical_map = physical_to_logical_map_cpu.to(
+        device=metadata.physical_to_logical_map.device,
+        non_blocking=True,
+    )
+    metadata.logical_to_all_physical_map = logical_to_all_physical_map_cpu.to(
+        device=metadata.logical_to_all_physical_map.device,
+        non_blocking=True,
+    )
+    metadata.logical_to_all_physical_map_num_valid = (
+        logical_to_all_physical_map_num_valid_cpu.to(
+            device=metadata.logical_to_all_physical_map_num_valid.device,
+            non_blocking=True,
+        )
+    )
+    if logical_to_rank_dispatch_physical_map_cpu is not None:
+        metadata.logical_to_rank_dispatch_physical_map = (
+            logical_to_rank_dispatch_physical_map_cpu.to(
+                device=metadata.logical_to_rank_dispatch_physical_map.device,
+                non_blocking=True,
+            )
+        )
 
 
 def _compute_logical_to_all_physical_map(
