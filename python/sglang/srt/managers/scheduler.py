@@ -3845,6 +3845,11 @@ class Scheduler(
             )
 
     def _ft_response_barrier_cleanup(self) -> None:
+        if self.enable_overlap and getattr(self, "result_queue", None):
+            while self.result_queue:
+                tmp_batch, tmp_result = self.result_queue.popleft()
+                self.process_batch_result(tmp_batch, tmp_result)
+
         seen_batches = set()
         for batch in (self.running_batch, self.last_batch, self.cur_batch):
             if batch is None or id(batch) in seen_batches:

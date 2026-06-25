@@ -410,12 +410,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._ft_pending_commands: Dict[str, PendingFTCommand] = {}
         self._ft_parked_scheduler_ranks: List[int] = []
         self._ft_scheduler_park_lock = asyncio.Lock()
+        self._ft_last_dispatched_active_mask: Optional[List[bool]] = None
         if not self.server_args.enable_fault_tolerance:
             return
         self.fault_tolerance = FaultToleranceManager(
             dp_size=self.server_args.dp_size,
             strategy=self.server_args.fault_tolerance_on_error_strategy,
         )
+        self._ft_last_dispatched_active_mask = [True] * self.server_args.dp_size
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
@@ -1413,7 +1415,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         yield abort_out
                         break
 
-                await self._ft_barrier_before_final_response(obj, is_stream=is_stream)
                 yield out
                 break
 
@@ -1644,6 +1645,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 timeout,
                 update_routing=False,
             )
+            resume_targets = sorted(
+                set(resume_targets) | set(self._ft_parked_scheduler_ranks)
+            )
+            if shutdown_live_targets:
+                resume_targets = sorted(
+                    set(resume_targets) - set(live_scale_down_targets)
+                )
             await self._ft_send_command_collect(
                 command="resume",
                 target_ranks=resume_targets,
@@ -1701,9 +1709,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             self._ft_parked_scheduler_ranks.clear()
 
-    async def _ft_park_active_schedulers(
+    async def _ft_park_schedulers_for_topology_change(
         self,
         *,
+        target_ranks: List[int],
         is_stream: bool = False,
     ) -> None:
         if not self._ft_should_park_schedulers():
@@ -1711,16 +1720,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         async with self._ft_scheduler_park_lock:
             if self._ft_parked_scheduler_ranks:
                 return
-            active_ranks = self.fault_tolerance.healthy_ranks()
-            if not active_ranks:
+            if not target_ranks:
                 return
             try:
                 await self._ft_send_command_collect(
                     command="park_idle",
-                    target_ranks=active_ranks,
+                    target_ranks=target_ranks,
                     timeout_sec=self.server_args.fault_tolerance_timeout,
                 )
-                self._ft_parked_scheduler_ranks = active_ranks
+                self._ft_parked_scheduler_ranks = target_ranks
             except Exception as exc:
                 logger.exception("Failed to park FT schedulers")
                 if not is_stream:
@@ -1728,18 +1736,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                         detail=f"failed to park fault-tolerance schedulers: {exc}",
                     ) from exc
-
-    async def _ft_barrier_before_final_response(
-        self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        *,
-        is_stream: bool,
-    ) -> None:
-        if is_health_check_generate_req(obj):
-            return
-        await self._ft_park_active_schedulers(
-            is_stream=is_stream,
-        )
 
     async def update_weights_from_disk(
         self,
@@ -2802,12 +2798,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         if not any(active_mask):
             raise RuntimeError("fault tolerance active mask has no live rank")
+        previous_mask = self._ft_last_dispatched_active_mask
+        if previous_mask is None or list(active_mask) != previous_mask:
+            await self._ft_park_schedulers_for_topology_change(
+                target_ranks=self.fault_tolerance.live_ranks(),
+            )
         await self._ft_send_command_collect(
             command="apply_active_mask",
             target_ranks=self.fault_tolerance.live_ranks(),
             timeout_sec=timeout,
             active_mask=active_mask,
         )
+        self._ft_last_dispatched_active_mask = list(active_mask)
         if update_routing:
             self.send_to_scheduler.send_pyobj(
                 ActiveRanksOutput(status=active_mask)
