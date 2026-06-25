@@ -7820,15 +7820,16 @@ class PortArgs:
 
             try:
                 if dp_rank is None:
-                    wait_port_available(dist_init_port, "dist_init_port")
-                    wait_port_available(port_base, "port_base")
-                    wait_port_available(detokenizer_port, "detokenizer_port")
-                    wait_port_available(nccl_port, "nccl_port")
+                    if not server_args.elastic_ep_rejoin:
+                        wait_port_available(dist_init_port, "dist_init_port")
+                        wait_port_available(port_base, "port_base")
+                        wait_port_available(detokenizer_port, "detokenizer_port")
+                        wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_port, "metrics_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
-                if dp_rank is None or worker_ports is None:
+                if not server_args.elastic_ep_rejoin and (dp_rank is None or worker_ports is None):
                     wait_port_available(scheduler_input_port, "scheduler_input_port")
             except ValueError:
                 logger.exception(
