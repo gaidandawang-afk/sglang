@@ -50,7 +50,6 @@ from sglang.srt.fault_tolerance.controller import (
     RankState,
     ft_error_status,
     ft_failure,
-    is_mooncake_active_rank_backend,
 )
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
@@ -217,7 +216,7 @@ class PendingFTCommand:
     def finish_if_ready(self):
         if self.future.done():
             return
-        if self.acked | set(self.failed.keys()) >= self.target_ranks:
+        if self.acked.union(self.failed) >= self.target_ranks:
             self.future.set_result(None)
 
 
@@ -409,16 +408,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_fault_tolerance(self):
         self.fault_tolerance: Optional[FaultToleranceManager] = None
         self._ft_pending_commands: Dict[str, PendingFTCommand] = {}
-        self._ft_schedulers_parked = False
         self._ft_parked_scheduler_ranks: List[int] = []
         self._ft_scheduler_park_lock = asyncio.Lock()
         if not self.server_args.enable_fault_tolerance:
             return
         self.fault_tolerance = FaultToleranceManager(
-            enabled=True,
             dp_size=self.server_args.dp_size,
             strategy=self.server_args.fault_tolerance_on_error_strategy,
-            is_mooncake_backend=is_mooncake_active_rank_backend(self.server_args),
         )
 
     def init_request_logging_and_dumping(self):
@@ -1609,18 +1605,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if error:
             return ft_error_status(error), ft_failure(error)
 
-        logger.info(
-            "Fault tolerance apply begin: instruction=%s ranks=%s timeout=%s",
-            instruction,
-            ranks,
-            timeout,
-        )
         live_scale_down_targets = []
         if instruction == "scale_down":
             live_scale_down_targets = [
                 rank
                 for rank in ranks or []
-                if self.fault_tolerance.ranks[rank].state != RankState.DEAD
+                if self.fault_tolerance.rank_states[rank] != RankState.DEAD
             ]
         active_mask, resume_targets, pending_scale_down_ranks = (
             self.fault_tolerance.begin_recover(
@@ -1658,10 +1648,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 command="resume",
                 target_ranks=resume_targets,
                 timeout_sec=timeout,
-                reason=instruction,
             )
-            self._ft_schedulers_parked = False
-            self._ft_parked_scheduler_ranks = []
+            self._ft_parked_scheduler_ranks.clear()
             self.send_to_scheduler.send_pyobj(
                 ActiveRanksOutput(status=active_mask)
             )
@@ -1672,7 +1660,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     command="shutdown",
                     target_ranks=live_scale_down_targets,
                     timeout_sec=timeout,
-                    reason=instruction,
                 )
         except Exception as exc:
             logger.exception("Fault tolerance apply failed; exiting: %s", exc)
@@ -1689,60 +1676,42 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _ft_should_park_schedulers(self) -> bool:
         return (
             self.fault_tolerance is not None
-            and self.server_args.enable_fault_tolerance
             and self.server_args.dp_size > 1
-            and self.fault_tolerance.is_mooncake_backend
         )
 
     async def _ft_resume_parked_schedulers_before_request(self) -> None:
         if not self._ft_should_park_schedulers():
             return
         async with self._ft_scheduler_park_lock:
-            if not self._ft_schedulers_parked:
+            if not self._ft_parked_scheduler_ranks:
                 return
-            healthy_ranks = [
-                item.rank
-                for item in self.fault_tolerance.ranks
-                if item.state == RankState.HEALTHY
-            ]
-            healthy_rank_set = set(healthy_ranks)
+            healthy_rank_set = set(self.fault_tolerance.healthy_ranks())
             target_ranks = [
                 rank
                 for rank in self._ft_parked_scheduler_ranks
                 if rank in healthy_rank_set
-            ] or healthy_ranks
+            ]
             if not target_ranks:
-                self._ft_schedulers_parked = False
-                self._ft_parked_scheduler_ranks = []
+                self._ft_parked_scheduler_ranks.clear()
                 return
             await self._ft_send_command_collect(
                 command="resume",
                 target_ranks=target_ranks,
                 timeout_sec=self.server_args.fault_tolerance_timeout,
-                reason="before_request",
             )
-            self._ft_schedulers_parked = False
-            self._ft_parked_scheduler_ranks = []
+            self._ft_parked_scheduler_ranks.clear()
 
     async def _ft_park_active_schedulers(
         self,
         *,
-        reason: str,
         is_stream: bool = False,
-        extra_target_ranks: Optional[List[int]] = None,
     ) -> None:
         if not self._ft_should_park_schedulers():
             return
         async with self._ft_scheduler_park_lock:
-            if self._ft_schedulers_parked:
+            if self._ft_parked_scheduler_ranks:
                 return
-            active_ranks = [
-                item.rank
-                for item in self.fault_tolerance.ranks
-                if item.state == RankState.HEALTHY
-            ]
-            if extra_target_ranks:
-                active_ranks = sorted(set(active_ranks + extra_target_ranks))
+            active_ranks = self.fault_tolerance.healthy_ranks()
             if not active_ranks:
                 return
             try:
@@ -1750,12 +1719,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     command="park_idle",
                     target_ranks=active_ranks,
                     timeout_sec=self.server_args.fault_tolerance_timeout,
-                    reason=reason,
                 )
-                self._ft_schedulers_parked = True
                 self._ft_parked_scheduler_ranks = active_ranks
             except Exception as exc:
-                logger.exception("Failed to park FT schedulers: reason=%s", reason)
+                logger.exception("Failed to park FT schedulers")
                 if not is_stream:
                     raise fastapi.HTTPException(
                         status_code=HTTPStatus.SERVICE_UNAVAILABLE,
@@ -1771,7 +1738,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if is_health_check_generate_req(obj):
             return
         await self._ft_park_active_schedulers(
-            reason="final_response",
             is_stream=is_stream,
         )
 
@@ -2741,16 +2707,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             pending.acked.add(output.rank)
         else:
             pending.failed[output.rank] = output.message
-        logger.info(
-            "Fault tolerance command ack: id=%s rank=%s success=%s message=%s "
-            "acked=%s/%s",
-            output.request_id,
-            output.rank,
-            output.success,
-            output.message,
-            len(pending.acked),
-            len(pending.target_ranks),
-        )
         pending.finish_if_ready()
 
     def _handle_ft_rank_fault(self, event: FaultToleranceRankFaultOutput):
@@ -2776,8 +2732,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         event = FaultToleranceRankFaultOutput(
             rank=rank,
             fault_type="kill",
-            message=f"{name or 'scheduler'} pid={getattr(proc, 'pid', None)} "
-            f"exitcode={getattr(proc, 'exitcode', None)}",
         )
 
         def schedule():
@@ -2798,97 +2752,61 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             return
 
-        targets = self.fault_tolerance.begin_exception_pause(
-            event.rank, event.message
-        )
-        acked, timed_out = await self._ft_send_command_collect(
-            command="pause",
-            target_ranks=targets,
-            timeout_sec=self.server_args.fault_tolerance_timeout,
-            reason="exception",
-            tolerate_timeout=True,
-        )
-        self.fault_tolerance.finish_pause_collection(acked, timed_out)
-        if any(item.state == RankState.DEAD for item in self.fault_tolerance.ranks):
+        targets = self.fault_tolerance.begin_exception_pause()
+        await self._ft_pause_schedulers(targets)
+        if RankState.DEAD in self.fault_tolerance.rank_states:
             await self._ft_apply_current_active_mask()
 
     async def _ft_handle_kill(self, event: FaultToleranceRankFaultOutput):
         if self.fault_tolerance is None:
             return
-        targets = self.fault_tolerance.record_kill(event.rank, event.message)
+        targets = self.fault_tolerance.record_kill(event.rank)
         if targets:
-            acked, timed_out = await self._ft_send_command_collect(
-                command="pause",
-                target_ranks=targets,
-                timeout_sec=self.server_args.fault_tolerance_timeout,
-                reason="kill",
-                tolerate_timeout=True,
-            )
-            self.fault_tolerance.finish_pause_collection(acked, timed_out)
+            await self._ft_pause_schedulers(targets)
             await self._ft_apply_current_active_mask()
         else:
             self.send_to_scheduler.send_pyobj(
-                ActiveRanksOutput(
-                    status=[
-                        item.state != RankState.DEAD
-                        for item in self.fault_tolerance.ranks
-                    ]
-                )
+                ActiveRanksOutput(status=self.fault_tolerance.active_mask())
             )
 
     async def _ft_pause_after_inactive(self, targets: List[int]):
         if self.fault_tolerance is None:
             return
+        await self._ft_pause_schedulers(targets)
+        await self._ft_apply_current_active_mask()
+
+    async def _ft_pause_schedulers(self, targets: List[int]):
         acked, timed_out = await self._ft_send_command_collect(
             command="pause",
             target_ranks=targets,
             timeout_sec=self.server_args.fault_tolerance_timeout,
-            reason="inactive_rank",
             tolerate_timeout=True,
         )
         self.fault_tolerance.finish_pause_collection(acked, timed_out)
-        await self._ft_apply_current_active_mask()
 
     async def _ft_apply_current_active_mask(self):
         if self.fault_tolerance is None:
             return
-        active_mask = [
-            item.state != RankState.DEAD for item in self.fault_tolerance.ranks
-        ]
         await self._ft_apply_active_mask(
-            active_mask, self.server_args.fault_tolerance_timeout
+            self.fault_tolerance.active_mask(),
+            self.server_args.fault_tolerance_timeout,
         )
 
     async def _ft_apply_active_mask(
         self,
         active_mask: List[bool],
         timeout: int,
-        extra_targets: Optional[List[int]] = None,
         update_routing: bool = True,
     ):
         if self.fault_tolerance is None:
             return
         if not any(active_mask):
             raise RuntimeError("fault tolerance active mask has no live rank")
-        targets = {
-            item.rank
-            for item in self.fault_tolerance.ranks
-            if item.state != RankState.DEAD
-        }
-        targets.update(extra_targets or [])
-        logger.info(
-            "Fault tolerance active mask dispatch: mask=%s targets=%s "
-            "update_routing=%s",
-            active_mask,
-            sorted(targets),
-            update_routing,
-        )
         await self._ft_send_command_collect(
             command="apply_active_mask",
-            target_ranks=sorted(targets),
+            target_ranks=self.fault_tolerance.live_ranks(),
             timeout_sec=timeout,
             active_mask=active_mask,
-            reason="apply_active_mask",
         )
         if update_routing:
             self.send_to_scheduler.send_pyobj(
@@ -2902,7 +2820,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         target_ranks: List[int],
         timeout_sec: int,
         active_mask: Optional[List[bool]] = None,
-        reason: str = "",
         tolerate_timeout: bool = False,
     ) -> Tuple[set[int], set[int]]:
         target_set = set(target_ranks)
@@ -2919,18 +2836,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             request_id=request_id,
             command=command,
             target_ranks=sorted(target_set),
-            timeout_sec=timeout_sec,
             active_mask=active_mask,
-            reason=reason,
         )
         logger.info(
-            "Fault tolerance command dispatch: id=%s command=%s targets=%s "
-            "reason=%s timeout=%s",
+            "FT command dispatch: id=%s command=%s targets=%s",
             request_id,
             command,
-            sorted(target_set),
-            reason,
-            timeout_sec,
+            req.target_ranks,
         )
         await self.send_to_scheduler.send_pyobj(req)
         try:
@@ -2956,11 +2868,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         timed_out = target_set - pending.acked
         logger.info(
-            "Fault tolerance command completed: id=%s command=%s acked=%s "
-            "timed_out=%s",
+            "FT command complete: id=%s command=%s timed_out=%s",
             request_id,
             command,
-            sorted(pending.acked),
             sorted(timed_out),
         )
         return pending.acked, timed_out

@@ -191,7 +191,6 @@ class DataParallelController:
             self.control_message_step = 1
 
         self._scheduler_watchdog = None
-        self._ft_suppressed_scheduler_exit_ranks = set()
         if self.scheduler_procs and server_args.node_rank == 0:
             self._scheduler_watchdog = SubprocessWatchdog(
                 processes=self.scheduler_procs,
@@ -238,17 +237,14 @@ class DataParallelController:
                         if rank < len(self.scheduler_procs)
                         else None
                     )
-                    if self.status[rank]:
-                        self._ft_suppressed_scheduler_exit_ranks.add(rank)
                     self.status[rank] = False
                     if proc is not None and proc.is_alive():
                         logger.info(
                             "DPC shutting down scheduler for fault tolerance: "
-                            "id=%s rank=%s pid=%s reason=%s",
+                            "id=%s rank=%s pid=%s",
                             obj.request_id,
                             rank,
                             proc.pid,
-                            obj.reason,
                         )
                         proc.terminate()
                     else:
@@ -272,13 +268,10 @@ class DataParallelController:
         for rank in range(0, len(self.workers), self.control_message_step):
             if self.status[rank]:
                 logger.info(
-                    "DPC forwarding fault tolerance command: id=%s command=%s "
-                    "control_rank=%s targets=%s reason=%s",
+                    "DPC forwarding FT command: id=%s command=%s control_rank=%s",
                     obj.request_id,
                     obj.command,
                     rank,
-                    obj.target_ranks,
-                    obj.reason,
                 )
                 self.workers[rank].send_pyobj(obj)
 
@@ -287,17 +280,6 @@ class DataParallelController:
             return False
         if 0 <= index < len(self.status):
             if not self.status[index]:
-                return True
-            if index in self._ft_suppressed_scheduler_exit_ranks:
-                logger.info(
-                    "DPC suppressed expected scheduler exit after FT shutdown: "
-                    "rank=%s pid=%s name=%s",
-                    index,
-                    getattr(proc, "pid", None),
-                    name,
-                )
-                self._ft_suppressed_scheduler_exit_ranks.discard(index)
-                self.status[index] = False
                 return True
             self.status[index] = False
             if not self.server_args.enable_fault_tolerance:

@@ -1394,9 +1394,7 @@ class FaultToleranceCommandReqInput(BaseReq):
     request_id: str
     command: Literal["pause", "apply_active_mask", "resume", "shutdown", "park_idle"]
     target_ranks: List[int]
-    timeout_sec: int
     active_mask: Optional[List[bool]] = None
-    reason: str = ""
 
 
 @dataclass

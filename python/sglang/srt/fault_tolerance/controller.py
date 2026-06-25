@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 from enum import Enum
 from http import HTTPStatus
 from typing import Any, Dict, List, Optional, Tuple
@@ -12,20 +11,11 @@ class RankState(str, Enum):
     DEAD = "dead"
 
 
-@dataclasses.dataclass
-class RankRuntimeState:
-    rank: int
-    state: RankState = RankState.HEALTHY
-    last_message: str = ""
-
-
 def ft_failure(message: str) -> Dict[str, Any]:
     return {"success": False, "message": message}
 
 
 def ft_error_status(error: str) -> int:
-    if error == "fault_tolerance_disabled":
-        return HTTPStatus.SERVICE_UNAVAILABLE
     if error == "ft_operation_in_progress":
         return HTTPStatus.CONFLICT
     return HTTPStatus.BAD_REQUEST
@@ -57,82 +47,85 @@ class FaultToleranceManager:
     def __init__(
         self,
         *,
-        enabled: bool,
         dp_size: int,
         strategy: str,
-        is_mooncake_backend: bool,
     ):
-        self.enabled = enabled
         self.dp_size = dp_size
         self.strategy = strategy
-        self.is_mooncake_backend = is_mooncake_backend
-        self.ranks = [RankRuntimeState(rank=i) for i in range(dp_size)]
+        self.rank_states = [RankState.HEALTHY] * dp_size
         self.ft_operation_in_progress = False
-        self.last_fault_type: str = ""
-        self.last_fault_message: str = ""
 
     def status_response(self) -> Dict[str, Any]:
         return {
             "ranks": [
-                {"rank": item.rank, "state": item.state.value}
-                for item in self.ranks
+                {"rank": rank, "state": state.value}
+                for rank, state in enumerate(self.rank_states)
             ]
         }
 
     def has_paused_rank(self) -> bool:
-        return any(item.state == RankState.PAUSED for item in self.ranks)
-
-    def has_healthy_rank(self) -> bool:
-        return any(item.state == RankState.HEALTHY for item in self.ranks)
-
-    def fault_handling_ready(self) -> bool:
-        return self.has_paused_rank() and not self.ft_operation_in_progress
+        return RankState.PAUSED in self.rank_states
 
     def should_reject_admission(self) -> bool:
         return (
-            self.enabled
-            and self.strategy == "pause"
+            self.strategy == "pause"
             and (self.ft_operation_in_progress or self.has_paused_rank())
         )
 
     def is_rank_healthy(self, rank: int) -> bool:
-        return 0 <= rank < self.dp_size and self.ranks[rank].state == RankState.HEALTHY
+        return (
+            0 <= rank < self.dp_size
+            and self.rank_states[rank] == RankState.HEALTHY
+        )
 
     def healthy_ranks(self) -> List[int]:
         return [
-            item.rank for item in self.ranks if item.state == RankState.HEALTHY
+            rank
+            for rank, state in enumerate(self.rank_states)
+            if state == RankState.HEALTHY
         ]
 
     def paused_ranks(self) -> List[int]:
-        return [item.rank for item in self.ranks if item.state == RankState.PAUSED]
+        return [
+            rank
+            for rank, state in enumerate(self.rank_states)
+            if state == RankState.PAUSED
+        ]
 
-    def non_dead_ranks(self) -> List[int]:
-        return [item.rank for item in self.ranks if item.state != RankState.DEAD]
+    def live_ranks(self) -> List[int]:
+        return [
+            rank
+            for rank, state in enumerate(self.rank_states)
+            if state != RankState.DEAD
+        ]
 
-    def begin_exception_pause(self, rank: int, message: str) -> List[int]:
+    def active_mask(self, excluded_ranks=()) -> List[bool]:
+        excluded = set(excluded_ranks)
+        return [
+            state != RankState.DEAD and rank not in excluded
+            for rank, state in enumerate(self.rank_states)
+        ]
+
+    def begin_exception_pause(self) -> List[int]:
         self.ft_operation_in_progress = True
-        self.last_fault_type = "exception"
-        self.last_fault_message = message
-        if 0 <= rank < self.dp_size:
-            self.ranks[rank].last_message = message
         return self.healthy_ranks()
 
     def finish_pause_collection(self, acked: set[int], timed_out: set[int]) -> None:
         for rank in acked:
-            if 0 <= rank < self.dp_size and self.ranks[rank].state != RankState.DEAD:
-                self.ranks[rank].state = RankState.PAUSED
+            if (
+                0 <= rank < self.dp_size
+                and self.rank_states[rank] != RankState.DEAD
+            ):
+                self.rank_states[rank] = RankState.PAUSED
         for rank in timed_out:
             if 0 <= rank < self.dp_size:
-                self.ranks[rank].state = RankState.DEAD
+                self.rank_states[rank] = RankState.DEAD
         self.ft_operation_in_progress = False
 
-    def record_kill(self, rank: int, message: str = "") -> List[int]:
+    def record_kill(self, rank: int) -> List[int]:
         self.ft_operation_in_progress = True
-        self.last_fault_type = "kill"
-        self.last_fault_message = message
         if 0 <= rank < self.dp_size:
-            self.ranks[rank].state = RankState.DEAD
-            self.ranks[rank].last_message = message
+            self.rank_states[rank] = RankState.DEAD
 
         if self.strategy == "pause":
             return self.healthy_ranks()
@@ -143,9 +136,8 @@ class FaultToleranceManager:
     def record_inactive_mask(self, new_mask: List[bool]) -> List[int]:
         newly_inactive = []
         for rank, is_active in enumerate(new_mask[: self.dp_size]):
-            if not is_active and self.ranks[rank].state != RankState.DEAD:
-                self.ranks[rank].state = RankState.DEAD
-                self.ranks[rank].last_message = "inactive_rank"
+            if not is_active and self.rank_states[rank] != RankState.DEAD:
+                self.rank_states[rank] = RankState.DEAD
                 newly_inactive.append(rank)
 
         if self.strategy == "pause" and newly_inactive:
@@ -157,8 +149,6 @@ class FaultToleranceManager:
     def validate_apply(
         self, instruction: str, ranks: Optional[List[int]]
     ) -> Optional[str]:
-        if not self.enabled:
-            return "fault_tolerance_disabled"
         if self.ft_operation_in_progress:
             return "ft_operation_in_progress"
         if not self.has_paused_rank():
@@ -177,12 +167,10 @@ class FaultToleranceManager:
         requested = set(ranks)
         if any(rank < 0 or rank >= self.dp_size for rank in requested):
             return "unknown_rank"
-        remaining = [
-            item.rank
-            for item in self.ranks
-            if item.state != RankState.DEAD and item.rank not in requested
-        ]
-        if not remaining:
+        if not any(
+            state != RankState.DEAD and rank not in requested
+            for rank, state in enumerate(self.rank_states)
+        ):
             return "cannot_isolate_all_active_ranks"
         return None
 
@@ -193,13 +181,11 @@ class FaultToleranceManager:
         pending_scale_down_ranks: List[int] = []
         if instruction == "scale_down":
             pending_scale_down_ranks = sorted(set(scale_down_ranks or []))
-        pending = set(pending_scale_down_ranks)
-        active_mask = [
-            item.state != RankState.DEAD and item.rank not in pending
-            for item in self.ranks
-        ]
-        resume_targets = self.paused_ranks()
-        return active_mask, resume_targets, pending_scale_down_ranks
+        return (
+            self.active_mask(pending_scale_down_ranks),
+            self.paused_ranks(),
+            pending_scale_down_ranks,
+        )
 
     def commit_recover(
         self, pending_scale_down_ranks: Optional[List[int]] = None
@@ -207,12 +193,12 @@ class FaultToleranceManager:
         pending = set(pending_scale_down_ranks or [])
         for rank in pending:
             if 0 <= rank < self.dp_size:
-                self.ranks[rank].state = RankState.DEAD
+                self.rank_states[rank] = RankState.DEAD
         resumed_ranks = []
-        for item in self.ranks:
-            if item.state == RankState.PAUSED:
-                item.state = RankState.HEALTHY
-                resumed_ranks.append(item.rank)
+        for rank, state in enumerate(self.rank_states):
+            if state == RankState.PAUSED:
+                self.rank_states[rank] = RankState.HEALTHY
+                resumed_ranks.append(rank)
         self.ft_operation_in_progress = False
         body = self.status_response()
         body.update(
@@ -223,8 +209,3 @@ class FaultToleranceManager:
             }
         )
         return body
-
-    def abort_operation(self, message: str = "") -> None:
-        self.ft_operation_in_progress = False
-        if message:
-            self.last_fault_message = message

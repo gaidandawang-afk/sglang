@@ -1516,17 +1516,7 @@ async def fault_tolerance_apply(request: Request):
             status_code=503,
         )
     obj = await request.json()
-    logger.info(
-        "Fault tolerance apply request received: instruction=%s params=%s",
-        obj.get("fault_tolerance_instruction"),
-        obj.get("fault_tolerance_params"),
-    )
     status_code, body = await _global_state.tokenizer_manager.fault_tolerance_apply(obj)
-    logger.info(
-        "Fault tolerance apply request completed: status=%s success=%s",
-        status_code,
-        body.get("success") if isinstance(body, dict) else None,
-    )
     return ORJSONResponse(content=body, status_code=status_code)
 
 

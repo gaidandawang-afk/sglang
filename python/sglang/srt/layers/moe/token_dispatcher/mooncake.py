@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any, NamedTuple, Optional
+from typing import NamedTuple, Optional
 
 import torch
 import torch.distributed as dist
@@ -22,23 +21,6 @@ from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode, get_moe_runner_backend
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_int_env_var
-
-logger = logging.getLogger(__name__)
-
-
-def _ft_debug_shape(value: Any):
-    if hasattr(value, "shape"):
-        return list(value.shape)
-    if isinstance(value, (tuple, list)):
-        return [_ft_debug_shape(item) for item in value]
-    return type(value).__name__
-
-
-def _ft_debug_active_ranks(active_ranks: Optional[torch.Tensor]):
-    if active_ranks is None:
-        return None
-    return active_ranks.detach().cpu().tolist()
-
 
 class MooncakeDispatchOutput(NamedTuple):
     """Mooncake EP dispatch output."""
@@ -225,16 +207,6 @@ class _MooncakeEPDispatcherImpl:
         elastic_ep_state = ElasticEPStateManager.instance()
         elastic_ep_state.maybe_inject_test_rank_fault()
         active_ranks = elastic_ep_state.active_ranks
-        if envs.SGLANG_FT_DEBUG_FLOW.get():
-            logger.info(
-                "FT debug mooncake dispatch begin: rank=%s first=%s "
-                "hidden_shape=%s topk_shape=%s active=%s",
-                dist.get_rank(),
-                self.first_execution,
-                _ft_debug_shape(hidden_states),
-                _ft_debug_shape(topk_ids),
-                _ft_debug_active_ranks(active_ranks),
-            )
         packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,
@@ -248,14 +220,6 @@ class _MooncakeEPDispatcherImpl:
                 return_recv_hook=self.return_recv_hook,
             )
         )
-        if envs.SGLANG_FT_DEBUG_FLOW.get():
-            logger.info(
-                "FT debug mooncake dispatch done: rank=%s recv_hidden_shape=%s "
-                "recv_count_shape=%s",
-                dist.get_rank(),
-                _ft_debug_shape(packed_recv_hidden),
-                _ft_debug_shape(packed_recv_count),
-            )
         return packed_recv_hidden, packed_recv_count, event, hook
 
     def _should_use_fp8_dispatch(self) -> bool:
@@ -291,17 +255,6 @@ class _MooncakeEPDispatcherImpl:
         elastic_ep_state = ElasticEPStateManager.instance()
         elastic_ep_state.maybe_inject_test_rank_fault()
         active_ranks = elastic_ep_state.active_ranks
-        if envs.SGLANG_FT_DEBUG_FLOW.get():
-            logger.info(
-                "FT debug mooncake combine begin: rank=%s first=%s "
-                "hidden_shape=%s topk_shape=%s active=%s handle_set=%s",
-                dist.get_rank(),
-                self.first_execution,
-                _ft_debug_shape(hidden_states),
-                _ft_debug_shape(topk_ids),
-                _ft_debug_active_ranks(active_ranks),
-                self.handle is not None,
-            )
         combined_hidden_states, event, hook = buffer.combine(
             hidden_states,
             topk_ids,
@@ -312,12 +265,6 @@ class _MooncakeEPDispatcherImpl:
             async_finish=not self.return_recv_hook,
             return_recv_hook=self.return_recv_hook,
         )
-        if envs.SGLANG_FT_DEBUG_FLOW.get():
-            logger.info(
-                "FT debug mooncake combine done: rank=%s combined_shape=%s",
-                dist.get_rank(),
-                _ft_debug_shape(combined_hidden_states),
-            )
         self.first_execution = False
         self.handle = None
         return combined_hidden_states, event, hook

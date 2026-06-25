@@ -1066,7 +1066,6 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
-        self._ft_shutdown_requested = False
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1548,7 +1547,13 @@ class Scheduler(
                 dispatch_event_loop(self)
             except Exception as exc:
                 recovered = self._ft_discard_current_batch(exc)
-                self._ft_notify_fault("exception", str(exc))
+                self.send_to_tokenizer.send_output(
+                    FaultToleranceRankFaultOutput(
+                        rank=self._ft_rank(),
+                        fault_type="exception",
+                        message=str(exc),
+                    )
+                )
                 if (
                     self.server_args.fault_tolerance_on_error_strategy == "continue"
                     and recovered
@@ -1558,15 +1563,6 @@ class Scheduler(
 
     def _ft_rank(self) -> int:
         return self.dp_rank if self.dp_rank is not None else 0
-
-    def _ft_notify_fault(self, fault_type: str, message: str):
-        self.send_to_tokenizer.send_output(
-            FaultToleranceRankFaultOutput(
-                rank=self._ft_rank(),
-                fault_type=fault_type,
-                message=message,
-            )
-        )
 
     def _ft_discard_current_batch(self, exc: Exception) -> bool:
         batch = self.cur_batch
@@ -1946,9 +1942,6 @@ class Scheduler(
         self._check_pending_flush()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
-        if self._ft_shutdown_requested:
-            logger.warning("Fault tolerance shutdown command acknowledged; exiting scheduler.")
-            os._exit(0)
 
     def init_req_max_new_tokens(self, req):
         input_len = len(req.origin_input_ids)
@@ -3098,37 +3091,6 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
-        ft_debug_flow = envs.SGLANG_FT_DEBUG_FLOW.get()
-        if ft_debug_flow:
-            active_ranks = None
-            last_active_ranks = None
-            try:
-                from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
-
-                elastic_ep_state = ElasticEPStateManager.instance()
-                if elastic_ep_state is not None:
-                    if elastic_ep_state.active_ranks is not None:
-                        active_ranks = (
-                            elastic_ep_state.active_ranks.detach().cpu().tolist()
-                        )
-                    if elastic_ep_state.last_active_ranks is not None:
-                        last_active_ranks = (
-                            elastic_ep_state.last_active_ranks.detach().cpu().tolist()
-                        )
-            except Exception:
-                logger.exception("FT debug failed to read elastic EP state")
-            logger.info(
-                "FT debug run_batch begin: rank=%s iter=%s mode=%s batch_size=%s "
-                "active=%s last_active=%s rids=%s",
-                self._ft_rank(),
-                batch.forward_iter,
-                batch.forward_mode,
-                batch.batch_size(),
-                active_ranks,
-                last_active_ranks,
-                [req.rid for req in batch.reqs],
-            )
-
         # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:
@@ -3195,16 +3157,6 @@ class Scheduler(
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
-
-            if ft_debug_flow:
-                logger.info(
-                    "FT debug run_batch forward done: rank=%s iter=%s mode=%s "
-                    "batch_size=%s",
-                    self._ft_rank(),
-                    batch.forward_iter,
-                    batch.forward_mode,
-                    batch.batch_size(),
-                )
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
@@ -3854,12 +3806,10 @@ class Scheduler(
 
         try:
             logger.info(
-                "Scheduler received fault tolerance command: id=%s command=%s "
-                "rank=%s reason=%s",
+                "Scheduler received FT command: id=%s command=%s rank=%s",
                 recv_req.request_id,
                 recv_req.command,
                 rank,
-                recv_req.reason,
             )
             if recv_req.command == "pause":
                 self._engine_paused = True
@@ -3878,9 +3828,6 @@ class Scheduler(
                 self._ft_response_barrier_cleanup()
                 self._engine_paused = True
                 message = "parked idle"
-            elif recv_req.command == "shutdown":
-                message = "shutdown scheduled"
-                self._ft_shutdown_requested = True
             else:
                 raise ValueError(f"unknown fault tolerance command: {recv_req.command}")
             return FaultToleranceCommandReqOutput(

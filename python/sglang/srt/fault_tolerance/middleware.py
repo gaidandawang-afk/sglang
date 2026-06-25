@@ -14,12 +14,8 @@ FT_ADMISSION_BYPASS_PATHS = {
 }
 
 
-def should_bypass_fault_tolerance(path: str) -> bool:
-    return path in FT_ADMISSION_BYPASS_PATHS
-
-
 def should_reject_fault_tolerance_request(tokenizer_manager: Any, path: str) -> bool:
-    if should_bypass_fault_tolerance(path):
+    if path in FT_ADMISSION_BYPASS_PATHS:
         return False
     ft = getattr(tokenizer_manager, "fault_tolerance", None)
     return bool(ft and ft.should_reject_admission())
