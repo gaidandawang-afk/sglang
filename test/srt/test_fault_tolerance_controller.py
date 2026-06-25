@@ -1,6 +1,7 @@
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 
 _CONTROLLER_PATH = (
@@ -18,6 +19,7 @@ _SPEC.loader.exec_module(_MODULE)
 
 FaultToleranceManager = _MODULE.FaultToleranceManager
 RankState = _MODULE.RankState
+is_ft_supported_config = _MODULE.is_ft_supported_config
 
 
 def make_manager(dp_size=4, strategy="pause"):
@@ -85,3 +87,35 @@ def test_continue_kill_marks_dead_without_pause():
     assert manager.record_kill(2) == []
     assert manager.rank_states[2] == RankState.DEAD
     assert not manager.ft_operation_in_progress
+
+
+def test_active_mask_recovers_dead_rank_without_resuming_paused_rank():
+    manager = make_manager()
+    manager.record_kill(3)
+    manager.finish_pause_collection(acked={0, 1, 2}, timed_out=set())
+
+    manager.record_inactive_mask([True, False, True, True])
+
+    assert manager.rank_states == [
+        RankState.PAUSED,
+        RankState.DEAD,
+        RankState.PAUSED,
+        RankState.HEALTHY,
+    ]
+
+
+def test_mooncake_active_rank_backend_allows_logical_multinode_ft():
+    supported, reason = is_ft_supported_config(
+        SimpleNamespace(
+            pp_size=1,
+            nnodes=4,
+            elastic_ep_backend="mooncake",
+            disaggregation_mode="null",
+            device="cuda",
+            tokenizer_worker_num=1,
+            use_ray=False,
+        )
+    )
+
+    assert supported
+    assert reason == ""
