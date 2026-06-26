@@ -70,6 +70,14 @@ class ExpertLocationUpdater:
             nnodes=nnodes,
             rank=rank,
         )
+        if get_bool_env_var("SGLANG_FT_PRECISION_DEBUG"):
+            logger.info(
+                "[FTPrecisionDebug][ExpertLocationUpdater] "
+                "rank=%s update_layer_ids_head=%s missing_logical_experts=%s",
+                rank,
+                sorted(update_layer_ids)[:8],
+                missing_logical_experts_by_layers,
+            )
         old_expert_location_metadata.update(
             new_expert_location_metadata,
             update_layer_ids=update_layer_ids,
@@ -486,7 +494,7 @@ def update_expert_weights_single_layer(
         if len(p2p_ops) == 0:
             return
 
-        if _LOG_P2P_SCHEDULE:
+        if _LOG_P2P_SCHEDULE or get_bool_env_var("SGLANG_FT_PRECISION_DEBUG"):
             schedules = defaultdict(list)
             for logical_expert_id, ops in sorted_infos:
                 for op in ops:

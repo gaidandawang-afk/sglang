@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import random
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional
@@ -26,11 +27,46 @@ import torch
 import torch.distributed
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
+
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def _tensor_debug_digest(tensor: Optional[torch.Tensor]):
+    if tensor is None:
+        return None
+    cpu = tensor.detach().cpu().contiguous()
+    return hashlib.sha256(cpu.numpy().tobytes()).hexdigest()[:16]
+
+
+def _tensor_debug_head(tensor: Optional[torch.Tensor], n: int = 16):
+    if tensor is None or tensor.numel() == 0:
+        return []
+    return tensor.detach().cpu().reshape(-1)[:n].tolist()
+
+
+def expert_location_debug_summary(
+    metadata: Optional["ExpertLocationMetadata"], label: str
+) -> str:
+    if metadata is None:
+        return f"[FTPrecisionDebug][ExpertLocation] label={label} metadata=None"
+    dispatch_map = metadata.logical_to_rank_dispatch_physical_map
+    return (
+        "[FTPrecisionDebug][ExpertLocation] "
+        f"label={label} "
+        f"physical_shape={tuple(metadata.physical_to_logical_map.shape)} "
+        f"logical_shape={tuple(metadata.logical_to_all_physical_map.shape)} "
+        f"physical_hash={_tensor_debug_digest(metadata.physical_to_logical_map_cpu)} "
+        f"logical_hash={_tensor_debug_digest(metadata.logical_to_all_physical_map_cpu)} "
+        f"dispatch_hash={_tensor_debug_digest(dispatch_map)} "
+        f"physical_head={_tensor_debug_head(metadata.physical_to_logical_map_cpu)} "
+        f"logical_head={_tensor_debug_head(metadata.logical_to_all_physical_map_cpu)} "
+        f"valid_head={_tensor_debug_head(metadata.logical_to_all_physical_map_num_valid)}"
+    )
 
 
 @dataclass
@@ -230,7 +266,7 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map != -1, dim=-1
         )
 
-        return ExpertLocationMetadata(
+        metadata = ExpertLocationMetadata(
             physical_to_logical_map=physical_to_logical_map,
             physical_to_logical_map_cpu=physical_to_logical_map.cpu(),
             logical_to_all_physical_map=logical_to_all_physical_map_padded,
@@ -249,6 +285,9 @@ class ExpertLocationMetadata:
                 else None
             ),
         )
+        if envs.SGLANG_FT_PRECISION_DEBUG.get():
+            logger.info(expert_location_debug_summary(metadata, "init_raw"))
+        return metadata
 
     # -------------------------------- mutation ------------------------------------
 
@@ -370,6 +409,8 @@ def broadcast_global_expert_location_metadata(
     metadata.logical_to_all_physical_map_cpu = (
         metadata.logical_to_all_physical_map.cpu()
     )
+    if envs.SGLANG_FT_PRECISION_DEBUG.get():
+        logger.info(expert_location_debug_summary(metadata, "broadcast_device"))
 
 
 def _broadcast_global_expert_location_metadata_via_cpu_group(
@@ -438,6 +479,8 @@ def _broadcast_global_expert_location_metadata_via_cpu_group(
                 non_blocking=True,
             )
         )
+    if envs.SGLANG_FT_PRECISION_DEBUG.get():
+        logger.info(expert_location_debug_summary(metadata, "broadcast_cpu_fallback"))
 
 
 def _compute_logical_to_all_physical_map(

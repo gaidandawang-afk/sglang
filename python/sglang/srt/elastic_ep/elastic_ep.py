@@ -9,6 +9,7 @@ from typing import Iterator, List, Optional
 import torch
 
 from sglang.srt.distributed import parallel_state
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ServerArgs
 from sglang.srt.utils import is_cpu, is_cuda
 
@@ -34,6 +35,7 @@ class ElasticEPState:
 
     def reset(self):
         if self.active_ranks is not None:
+            old_active = self.active_ranks.detach().cpu().tolist()
             self.active_ranks = torch.ones(
                 self.active_ranks.shape,
                 dtype=self.active_ranks.dtype,
@@ -41,6 +43,12 @@ class ElasticEPState:
             )
             self.snapshot_active_to_last()
             self.sync_active_to_cpu()
+            if envs.SGLANG_FT_PRECISION_DEBUG.get():
+                logger.info(
+                    "[FTPrecisionDebug][ElasticEP] reset old_active=%s new_active=%s",
+                    old_active,
+                    self.active_ranks_cpu.tolist(),
+                )
 
     def maybe_inject_test_rank_fault(self) -> bool:
         ranks_raw = os.environ.get("SGLANG_TEST_ELASTIC_EP_FAULT_RANKS", "")
@@ -202,6 +210,8 @@ def apply_active_rank_mask(mask: List[bool]) -> None:
     state = ElasticEPStateManager.instance()
     if state is None or state.active_ranks is None:
         raise RuntimeError("elastic ep state is not initialized")
+    original_mask = list(mask)
+    old_active = state.active_ranks_cpu.tolist()
     if len(mask) != state.active_ranks.numel() and state.active_ranks.numel() == 1:
         # Native DP launches one-rank scheduler worlds. The FT control plane
         # still carries a DP-rank mask, while each live scheduler only needs its
@@ -220,6 +230,15 @@ def apply_active_rank_mask(mask: List[bool]) -> None:
     state.active_ranks.copy_(tensor)
     state.sync_active_to_cpu()
     _refresh_ep_members()
+    if envs.SGLANG_FT_PRECISION_DEBUG.get():
+        logger.info(
+            "[FTPrecisionDebug][ElasticEP] apply_active_rank_mask "
+            "requested=%s effective=%s old_active=%s new_active=%s",
+            original_mask,
+            mask,
+            old_active,
+            state.active_ranks_cpu.tolist(),
+        )
 
 
 def try_recover_ranks(global_ranks: List[int]) -> bool:

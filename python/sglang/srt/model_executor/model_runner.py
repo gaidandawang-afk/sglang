@@ -101,6 +101,7 @@ from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
+    expert_location_debug_summary,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
@@ -288,6 +289,36 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 
 logger = logging.getLogger(__name__)
+
+
+def _debug_tensor_fingerprint(tensor: torch.Tensor) -> str:
+    sample = tensor.detach().reshape(-1)[:1024].float().cpu().contiguous()
+    return hashlib.sha256(sample.numpy().tobytes()).hexdigest()[:16]
+
+
+def _debug_weight_fingerprints(routed_experts_weights_of_layer, update_layer_ids):
+    if not routed_experts_weights_of_layer or not update_layer_ids:
+        return {}
+    summary = {}
+    for layer_id in sorted(update_layer_ids)[:2]:
+        tensors = routed_experts_weights_of_layer.get(layer_id)
+        if not tensors:
+            continue
+        layer_summary = []
+        for tensor_index, tensor in enumerate(tensors[:2]):
+            slots = min(4, tensor.shape[0])
+            layer_summary.append(
+                {
+                    "tensor_index": tensor_index,
+                    "shape": tuple(tensor.shape),
+                    "slot_hashes": [
+                        _debug_tensor_fingerprint(tensor[slot_id])
+                        for slot_id in range(slots)
+                    ],
+                }
+            )
+        summary[layer_id] = layer_summary
+    return summary
 
 
 def resolve_language_model(model: nn.Module) -> nn.Module:
@@ -1649,6 +1680,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
+        if envs.SGLANG_FT_PRECISION_DEBUG.get():
+            logger.info(
+                expert_location_debug_summary(
+                    get_global_expert_location_metadata(), "update_before"
+                )
+            )
+            logger.info(
+                expert_location_debug_summary(
+                    new_expert_location_metadata, "update_target"
+                )
+            )
+            logger.info(
+                "[FTPrecisionDebug][Weights] before_update "
+                "rank=%s update_layer_ids_head=%s fingerprints=%s",
+                self.tp_rank,
+                sorted(update_layer_ids)[:8],
+                _debug_weight_fingerprints(
+                    self.model.routed_experts_weights_of_layer, update_layer_ids
+                ),
+            )
         p2p_missing_logical_experts = self.expert_location_updater.update(
             self.model.routed_experts_weights_of_layer,
             new_expert_location_metadata,
@@ -1656,6 +1707,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             nnodes=self.server_args.nnodes,
             rank=self.tp_rank,
         )
+        if envs.SGLANG_FT_PRECISION_DEBUG.get():
+            logger.info(
+                "[FTPrecisionDebug][Weights] after_p2p "
+                "rank=%s missing_logical_experts=%s fingerprints=%s",
+                self.tp_rank,
+                p2p_missing_logical_experts,
+                _debug_weight_fingerprints(
+                    self.model.routed_experts_weights_of_layer, update_layer_ids
+                ),
+            )
+            logger.info(
+                expert_location_debug_summary(
+                    get_global_expert_location_metadata(), "update_after_metadata"
+                )
+            )
 
         if len(p2p_missing_logical_experts) > 0:
             # Load the missing expert weights from disk
@@ -1684,6 +1750,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_global_server_args().model_path,
                     get_global_server_args().load_format,
                     weight_name_filter=weight_name_filter,
+                )
+            if envs.SGLANG_FT_PRECISION_DEBUG.get():
+                logger.info(
+                    "[FTPrecisionDebug][Weights] after_missing_reload "
+                    "rank=%s missing_logical_experts=%s fingerprints=%s",
+                    self.tp_rank,
+                    p2p_missing_logical_experts,
+                    _debug_weight_fingerprints(
+                        self.model.routed_experts_weights_of_layer, update_layer_ids
+                    ),
                 )
 
     def maybe_recover_ep_ranks(self):
@@ -1717,6 +1793,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     invoked_in_elastic_ep_rejoin_path=False
                 )
             )
+            if envs.SGLANG_FT_PRECISION_DEBUG.get():
+                logger.info(
+                    expert_location_debug_summary(
+                        get_global_expert_location_metadata(), "after_recover_broadcast"
+                    )
+                )
             ElasticEPStateManager.instance().reset()
 
             broadcast_pyobj(
