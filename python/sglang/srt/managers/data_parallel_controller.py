@@ -220,10 +220,13 @@ class DataParallelController:
 
     def send_control_message(self, obj):
         # Send control messages to first worker of tp group
-        for worker in self.workers[:: self.control_message_step]:
-            worker.send_pyobj(obj)
+        self._refresh_worker_liveness()
+        for rank in range(0, len(self.workers), self.control_message_step):
+            if self.status[rank]:
+                self.workers[rank].send_pyobj(obj)
 
     def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
+        self._refresh_worker_liveness()
         if obj.command == "shutdown":
             for rank in obj.target_ranks:
                 success = True
@@ -306,9 +309,29 @@ class DataParallelController:
         self.dp_budget.update_budget(obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        self.status = ranks.status
+        self.status = list(ranks.status)
+        self._refresh_worker_liveness()
+
+    def _refresh_worker_liveness(self):
+        """Keep DPC routing state aligned with scheduler process liveness."""
+        changed = False
+        for rank, proc in enumerate(self.scheduler_procs):
+            if proc is None or rank >= len(self.status):
+                continue
+            if self.status[rank] and not proc.is_alive():
+                self.status[rank] = False
+                changed = True
+                logger.warning(
+                    "Mark DP rank %s inactive because scheduler process %s exited",
+                    rank,
+                    proc.pid,
+                )
+
+        if changed and not self.server_args.enable_fault_tolerance:
+            self._send_active_ranks_to_live_workers()
 
     def dispatching_with_trace(self, req: Req):
+        self._refresh_worker_liveness()
         req.time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
 
         req.time_stats.set_dp_dispatch_time()
