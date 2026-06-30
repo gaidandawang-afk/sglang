@@ -321,43 +321,6 @@ def _debug_weight_fingerprints(routed_experts_weights_of_layer, update_layer_ids
     return summary
 
 
-def _merge_logical_experts_by_layer(*maps):
-    merged = {}
-    for items in maps:
-        for layer_id, logical_ids in (items or {}).items():
-            values = merged.setdefault(layer_id, set())
-            values.update(int(logical_id) for logical_id in logical_ids)
-    return {
-        layer_id: sorted(logical_ids)
-        for layer_id, logical_ids in merged.items()
-        if logical_ids
-    }
-
-
-def _local_changed_logical_experts_by_layer(
-    old_metadata,
-    new_metadata,
-    update_layer_ids,
-    rank: int,
-    world_size: int,
-):
-    if old_metadata is None or new_metadata is None:
-        return {}
-
-    changed_by_layer = {}
-    for layer_id in update_layer_ids:
-        old_map = old_metadata.physical_to_logical_map_cpu[layer_id]
-        new_map = new_metadata.physical_to_logical_map_cpu[layer_id]
-        num_local_slots = new_map.numel() // world_size
-        start = rank * num_local_slots
-        end = start + num_local_slots
-        changed = new_map[start:end][old_map[start:end] != new_map[start:end]]
-        logical_ids = sorted({int(x) for x in changed.tolist() if int(x) >= 0})
-        if logical_ids:
-            changed_by_layer[layer_id] = logical_ids
-    return changed_by_layer
-
-
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
@@ -1717,18 +1680,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
-        old_expert_location_metadata = get_global_expert_location_metadata()
-        local_changed_logical_experts = _local_changed_logical_experts_by_layer(
-            old_expert_location_metadata,
-            new_expert_location_metadata,
-            update_layer_ids,
-            self.tp_rank,
-            self.moe_ep_size,
-        )
         if envs.SGLANG_FT_PRECISION_DEBUG.get():
             logger.info(
                 expert_location_debug_summary(
-                    old_expert_location_metadata, "update_before"
+                    get_global_expert_location_metadata(), "update_before"
                 )
             )
             logger.info(
@@ -1768,18 +1723,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             )
 
-        reload_logical_experts = _merge_logical_experts_by_layer(
-            p2p_missing_logical_experts,
-            local_changed_logical_experts,
-        )
-
-        if len(reload_logical_experts) > 0:
-            # Native Elastic EP may move a logical expert into a different local
-            # physical slot during shrink. Reload touched experts so moved slots
-            # match the checkpoint loader even when P2P leaves stale tensor data.
+        if len(p2p_missing_logical_experts) > 0:
+            # Load the missing expert weights from disk
             if callable(getattr(self.model, "generate_weight_name_filter", None)):
                 weight_name_filter = self.model.generate_weight_name_filter(
-                    reload_logical_experts
+                    p2p_missing_logical_experts
                 )
             else:
                 # Do a full reload from disk/DRAM
@@ -1805,13 +1753,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if envs.SGLANG_FT_PRECISION_DEBUG.get():
                 logger.info(
                     "[FTPrecisionDebug][Weights] after_missing_reload "
-                    "rank=%s missing_logical_experts=%s "
-                    "changed_logical_experts=%s reload_logical_experts=%s "
-                    "fingerprints=%s",
+                    "rank=%s missing_logical_experts=%s fingerprints=%s",
                     self.tp_rank,
                     p2p_missing_logical_experts,
-                    local_changed_logical_experts,
-                    reload_logical_experts,
                     _debug_weight_fingerprints(
                         self.model.routed_experts_weights_of_layer, update_layer_ids
                     ),
