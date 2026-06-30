@@ -1700,6 +1700,14 @@ class AbortReq(BaseReq):
 @dataclass
 class ActiveRanksOutput(BaseReq):
     status: List[bool]
+    request_id: Optional[str] = None
+
+
+@dataclass
+class ActiveRanksUpdateReqOutput(BaseReq):
+    request_id: str
+    success: bool
+    message: str = ""
 
 
 @dataclass

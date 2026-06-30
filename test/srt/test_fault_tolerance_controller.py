@@ -70,6 +70,14 @@ def test_apply_rejected_without_paused_rank():
     assert manager.validate_apply("retry", None) == "no_paused_rank"
 
 
+def test_retry_rejects_ranks_parameter():
+    manager = make_manager()
+    manager.begin_exception_pause()
+    manager.finish_pause_collection(acked={0, 1, 2, 3}, timed_out=set())
+
+    assert manager.validate_apply("retry", []) == "retry_does_not_accept_ranks"
+
+
 def test_scale_down_cannot_isolate_all_remaining_ranks():
     manager = make_manager(dp_size=2)
     manager.record_kill(1)
@@ -104,7 +112,7 @@ def test_active_mask_recovers_dead_rank_without_resuming_paused_rank():
     ]
 
 
-def test_mooncake_active_rank_backend_allows_logical_multinode_ft():
+def test_fault_tolerance_rejects_multinode_even_with_mooncake():
     supported, reason = is_ft_supported_config(
         SimpleNamespace(
             pp_size=1,
@@ -117,5 +125,5 @@ def test_mooncake_active_rank_backend_allows_logical_multinode_ft():
         )
     )
 
-    assert supported
-    assert reason == ""
+    assert not supported
+    assert reason == "ft_requires_single_node"

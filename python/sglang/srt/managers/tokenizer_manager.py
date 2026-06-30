@@ -58,6 +58,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    ActiveRanksUpdateReqOutput,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
@@ -408,6 +409,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_fault_tolerance(self):
         self.fault_tolerance: Optional[FaultToleranceManager] = None
         self._ft_pending_commands: Dict[str, PendingFTCommand] = {}
+        self._ft_pending_active_rank_updates: Dict[str, asyncio.Future] = {}
         self._ft_parked_scheduler_ranks: List[int] = []
         self._ft_scheduler_park_lock = asyncio.Lock()
         self._ft_last_dispatched_active_mask: Optional[List[bool]] = None
@@ -547,6 +549,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (ActiveRanksUpdateReqOutput, self._handle_active_ranks_update_output),
                 (FaultToleranceCommandReqOutput, self._handle_ft_command_output),
                 (FaultToleranceRankFaultOutput, self._handle_ft_rank_fault),
             ]
@@ -1600,6 +1603,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             except (TypeError, ValueError):
                 return 400, ft_failure("unknown_rank")
         elif instruction == "retry":
+            if params:
+                return 400, ft_failure("retry_does_not_accept_params")
             ranks = None
 
         error = self.fault_tolerance.validate_apply(instruction, ranks)
@@ -1658,11 +1663,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 timeout_sec=timeout,
             )
             self._ft_parked_scheduler_ranks.clear()
-            self.send_to_scheduler.send_pyobj(
-                ActiveRanksOutput(status=active_mask)
-            )
-            if instruction == "scale_down":
-                await asyncio.sleep(1)
+            await self._ft_publish_active_ranks(active_mask, timeout)
             if shutdown_live_targets and live_scale_down_targets:
                 await self._ft_send_command_collect(
                     command="shutdown",
@@ -1685,6 +1686,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return (
             self.fault_tolerance is not None
             and self.server_args.dp_size > 1
+            and not envs.SGLANG_FT_DISABLE_PARK_IDLE.get()
         )
 
     async def _ft_resume_parked_schedulers_before_request(self) -> None:
@@ -2705,6 +2707,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             pending.failed[output.rank] = output.message
         pending.finish_if_ready()
 
+    def _handle_active_ranks_update_output(self, output: ActiveRanksUpdateReqOutput):
+        future = self._ft_pending_active_rank_updates.get(output.request_id)
+        if future is None:
+            logger.warning(
+                "Unknown active-ranks update ack: request_id=%s success=%s",
+                output.request_id,
+                output.success,
+            )
+            return
+        if future.done():
+            return
+        if output.success:
+            future.set_result(None)
+        else:
+            future.set_exception(RuntimeError(output.message))
+
     def _handle_ft_rank_fault(self, event: FaultToleranceRankFaultOutput):
         if self.fault_tolerance is None:
             return
@@ -2811,9 +2829,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
         self._ft_last_dispatched_active_mask = list(active_mask)
         if update_routing:
-            self.send_to_scheduler.send_pyobj(
-                ActiveRanksOutput(status=active_mask)
+            await self._ft_publish_active_ranks(active_mask, timeout)
+
+    async def _ft_publish_active_ranks(
+        self, active_mask: List[bool], timeout_sec: int
+    ) -> None:
+        if self.server_args.dp_size <= 1:
+            self.send_to_scheduler.send_pyobj(ActiveRanksOutput(status=active_mask))
+            return
+
+        request_id = uuid.uuid4().hex
+        future = self.event_loop.create_future()
+        self._ft_pending_active_rank_updates[request_id] = future
+        try:
+            await self.send_to_scheduler.send_pyobj(
+                ActiveRanksOutput(status=active_mask, request_id=request_id)
             )
+            await asyncio.wait_for(future, timeout=timeout_sec)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"active-ranks routing update timed out: request_id={request_id}"
+            ) from exc
+        finally:
+            self._ft_pending_active_rank_updates.pop(request_id, None)
 
     async def _ft_send_command_collect(
         self,

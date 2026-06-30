@@ -32,6 +32,7 @@ from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    ActiveRanksUpdateReqOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
@@ -309,8 +310,24 @@ class DataParallelController:
         self.dp_budget.update_budget(obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        self.status = list(ranks.status)
-        self._refresh_worker_liveness()
+        success = True
+        message = "active ranks updated"
+        try:
+            self.status = list(ranks.status)
+            self._refresh_worker_liveness()
+        except Exception as exc:
+            success = False
+            message = str(exc)
+            logger.exception("Failed to update active DP ranks")
+        finally:
+            if ranks.request_id is not None and self.send_to_tokenizer is not None:
+                self.send_to_tokenizer.send_pyobj(
+                    ActiveRanksUpdateReqOutput(
+                        request_id=ranks.request_id,
+                        success=success,
+                        message=message,
+                    )
+                )
 
     def _refresh_worker_liveness(self):
         """Keep DPC routing state aligned with scheduler process liveness."""

@@ -28,9 +28,7 @@ def is_mooncake_active_rank_backend(server_args) -> bool:
 def is_ft_supported_config(server_args) -> Tuple[bool, str]:
     if getattr(server_args, "pp_size", 1) != 1:
         return False, "ft_requires_pp1"
-    if getattr(server_args, "nnodes", 1) != 1 and not is_mooncake_active_rank_backend(
-        server_args
-    ):
+    if getattr(server_args, "nnodes", 1) != 1:
         return False, "ft_requires_single_node"
     if not is_mooncake_active_rank_backend(server_args):
         return False, "ft_requires_mooncake_active_rank_backend"
@@ -160,7 +158,7 @@ class FaultToleranceManager:
         if instruction not in ("retry", "scale_down"):
             return "unknown_instruction"
         if instruction == "retry":
-            if ranks:
+            if ranks is not None:
                 return "retry_does_not_accept_ranks"
             return None
         return self.validate_scale_down_ranks(ranks)
