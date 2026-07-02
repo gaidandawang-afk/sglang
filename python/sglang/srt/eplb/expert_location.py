@@ -36,6 +36,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class NoActiveExpertReplicaError(RuntimeError):
+    """Raised when rank filtering leaves a logical expert without a replica."""
+
+
 def _tensor_debug_digest(tensor: Optional[torch.Tensor]):
     if tensor is None:
         return None
@@ -151,6 +155,7 @@ class ExpertLocationMetadata:
         model_config: ModelConfig,
         physical_to_logical_map,
         moe_ep_rank: int = None,
+        active_ranks: Optional[torch.Tensor] = None,
     ):
         if not isinstance(physical_to_logical_map, torch.Tensor):
             physical_to_logical_map = torch.tensor(physical_to_logical_map)
@@ -168,6 +173,7 @@ class ExpertLocationMetadata:
             num_logical_experts=model_config_for_expert_location.num_logical_experts,
             ep_size=common["ep_size"],
             moe_ep_rank=moe_ep_rank,
+            active_ranks=active_ranks,
         )
 
         return ExpertLocationMetadata._init_raw(
@@ -489,10 +495,24 @@ def _compute_logical_to_all_physical_map(
     num_logical_experts: int,
     ep_size: int,
     moe_ep_rank: int,
+    active_ranks: Optional[torch.Tensor] = None,
 ):
     # This is rarely called, so we use for loops for maximum clarity
 
     num_layers, num_physical_experts = physical_to_logical_map.shape
+    num_local_physical_experts, remainder = divmod(num_physical_experts, ep_size)
+    assert remainder == 0
+
+    active_ranks_cpu = None
+    if active_ranks is not None:
+        active_ranks_cpu = (
+            torch.as_tensor(active_ranks, dtype=torch.bool).cpu().flatten()
+        )
+        if active_ranks_cpu.numel() != ep_size:
+            raise ValueError(
+                f"Expected {ep_size} active-rank entries, got "
+                f"{active_ranks_cpu.numel()}"
+            )
 
     logical_to_all_physical_map = [
         [[] for _ in range(num_logical_experts)] for _ in range(num_layers)
@@ -501,12 +521,27 @@ def _compute_logical_to_all_physical_map(
     # Find out the candidate physical experts for each logical expert on each layer
     for layer_id in range(num_layers):
         for physical_expert_id in range(num_physical_experts):
+            owner_rank = physical_expert_id // num_local_physical_experts
+            if active_ranks_cpu is not None and not active_ranks_cpu[owner_rank]:
+                continue
             logical_expert_id = physical_to_logical_map[
                 layer_id, physical_expert_id
             ].item()
             logical_to_all_physical_map[layer_id][logical_expert_id].append(
                 physical_expert_id
             )
+
+    missing_live_replicas = [
+        (layer_id, logical_expert_id)
+        for layer_id in range(num_layers)
+        for logical_expert_id in range(num_logical_experts)
+        if not logical_to_all_physical_map[layer_id][logical_expert_id]
+    ]
+    if missing_live_replicas:
+        raise NoActiveExpertReplicaError(
+            "No active physical replica for layer/logical expert pairs: "
+            f"{missing_live_replicas[:16]}"
+        )
 
     # Replace by the physical expert on local GPU or node if possible
     if moe_ep_rank is not None:
