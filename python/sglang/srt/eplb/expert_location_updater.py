@@ -70,6 +70,22 @@ class ExpertLocationUpdater:
             nnodes=nnodes,
             rank=rank,
         )
+        elastic_ep_state = ElasticEPStateManager.instance()
+        recovering_from_rank_fault = (
+            elastic_ep_state is not None
+            and elastic_ep_state.active_ranks_cpu is not None
+            and not bool(elastic_ep_state.active_ranks_cpu.all().item())
+        )
+        if recovering_from_rank_fault:
+            torch.get_device_module().synchronize()
+        if get_bool_env_var("SGLANG_FT_PRECISION_DEBUG"):
+            logger.info(
+                "[FTPrecisionDebug][ExpertLocationUpdater] "
+                "rank=%s update_layer_ids_head=%s missing_logical_experts=%s",
+                rank,
+                sorted(update_layer_ids)[:8],
+                missing_logical_experts_by_layers,
+            )
         old_expert_location_metadata.update(
             new_expert_location_metadata,
             update_layer_ids=update_layer_ids,
@@ -221,6 +237,24 @@ def update_expert_weights_single_layer(
     num_tensors = len(routed_experts_weights)
 
     self_node_id = rank // num_gpu_per_node
+    temp_filled_expert_locations = set()
+
+    def _rank_is_active(target_rank: int) -> bool:
+        elastic_ep_state = ElasticEPStateManager.instance()
+        if (
+            elastic_ep_state is None
+            or elastic_ep_state.active_ranks_cpu is None
+            or missing_logical_experts_info is None
+        ):
+            return True
+        return bool(elastic_ep_state.active_ranks_cpu[target_rank].item())
+
+    def _record_missing_logical_expert(logical_expert_id: int):
+        if (
+            missing_logical_experts_info is not None
+            and logical_expert_id not in missing_logical_experts_info
+        ):
+            missing_logical_experts_info.append(logical_expert_id)
 
     local_expert_location_range = (
         rank * num_local_physical_experts,
@@ -277,6 +311,7 @@ def update_expert_weights_single_layer(
                     _get_tensor(temp_buffers, i, dst_expert_location).copy_(
                         _get_tensor(routed_experts_weights, i, src_expert_location)
                     )
+                temp_filled_expert_locations.add(dst_expert_location)
                 buffer2weight_copy_infos.append(
                     (dst_expert_location, dst_expert_location)
                 )
@@ -290,7 +325,10 @@ def update_expert_weights_single_layer(
         for src_expert_location in range(
             rank * num_local_physical_experts, dst_expert_location
         ):
-            if new_physical_to_logical_map[src_expert_location] == logical_expert_id:
+            if (
+                new_physical_to_logical_map[src_expert_location] == logical_expert_id
+                and src_expert_location in temp_filled_expert_locations
+            ):
                 buffer2weight_copy_infos.append(
                     (src_expert_location, dst_expert_location)
                 )
@@ -324,6 +362,13 @@ def update_expert_weights_single_layer(
 
         # case 5: cross-node
         # Future work: can optimize when there are multiple ranks in the same dst node that uses the same logical expert
+        if len(cross_node_mapping.chunk_values) == 0:
+            _record_missing_logical_expert(logical_expert_id)
+            if debug:
+                output_logs.append(
+                    f"handle_recv_of_dst_expert_location {dst_expert_location=} case=missing-active-source"
+                )
+            return
         chosen_src_rank = cross_node_mapping.chunk_value_from_element_value(
             element_value=rank
         )
@@ -348,6 +393,13 @@ def update_expert_weights_single_layer(
         src_rank: int,
         dst_expert_location: int,
     ):
+        if not _rank_is_active(src_rank):
+            _record_missing_logical_expert(logical_expert_id)
+            if debug:
+                output_logs.append(
+                    f"create_p2p_recv skipped inactive {logical_expert_id=} {src_rank=} {dst_expert_location=}"
+                )
+            return
         p2p_op_infos.append(
             (
                 logical_expert_id,
@@ -361,6 +413,7 @@ def update_expert_weights_single_layer(
                 ],
             )
         )
+        temp_filled_expert_locations.add(dst_expert_location)
         buffer2weight_copy_infos.append((dst_expert_location, dst_expert_location))
 
     def _create_isend_ops(p2p_op_infos):
@@ -421,6 +474,7 @@ def update_expert_weights_single_layer(
                 if old_physical_to_logical_map[x] == logical_expert_id
             ]
         )
+        all_src_ranks = [x for x in all_src_ranks if _rank_is_active(x)]
         all_src_nodes = [x // num_gpu_per_node for x in all_src_ranks]
         self_node_src_ranks = [
             x for x in all_src_ranks if x // num_gpu_per_node == self_node_id
@@ -432,6 +486,7 @@ def update_expert_weights_single_layer(
                 for x in range(num_physical_experts)
                 if new_physical_to_logical_map[x] == logical_expert_id
                 and x // num_local_physical_experts not in all_src_ranks
+                and _rank_is_active(x // num_local_physical_experts)
             ]
         )
         need_comm_self_node_dst_ranks = (
@@ -486,7 +541,7 @@ def update_expert_weights_single_layer(
         if len(p2p_ops) == 0:
             return
 
-        if _LOG_P2P_SCHEDULE:
+        if _LOG_P2P_SCHEDULE or get_bool_env_var("SGLANG_FT_PRECISION_DEBUG"):
             schedules = defaultdict(list)
             for logical_expert_id, ops in sorted_infos:
                 for op in ops:

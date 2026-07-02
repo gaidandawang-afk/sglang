@@ -99,8 +99,10 @@ from sglang.srt.eplb.expert_distribution import (
 )
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
+    NoActiveExpertReplicaError,
     broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
+    expert_location_debug_summary,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
@@ -288,6 +290,36 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 
 logger = logging.getLogger(__name__)
+
+
+def _debug_tensor_fingerprint(tensor: torch.Tensor) -> str:
+    sample = tensor.detach().reshape(-1)[:1024].float().cpu().contiguous()
+    return hashlib.sha256(sample.numpy().tobytes()).hexdigest()[:16]
+
+
+def _debug_weight_fingerprints(routed_experts_weights_of_layer, update_layer_ids):
+    if not routed_experts_weights_of_layer or not update_layer_ids:
+        return {}
+    summary = {}
+    for layer_id in sorted(update_layer_ids)[:2]:
+        tensors = routed_experts_weights_of_layer.get(layer_id)
+        if not tensors:
+            continue
+        layer_summary = []
+        for tensor_index, tensor in enumerate(tensors[:2]):
+            slots = min(4, tensor.shape[0])
+            layer_summary.append(
+                {
+                    "tensor_index": tensor_index,
+                    "shape": tuple(tensor.shape),
+                    "slot_hashes": [
+                        _debug_tensor_fingerprint(tensor[slot_id])
+                        for slot_id in range(slots)
+                    ],
+                }
+            )
+        summary[layer_id] = layer_summary
+    return summary
 
 
 def resolve_language_model(model: nn.Module) -> nn.Module:
@@ -1314,8 +1346,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 msg += f"{pre_model_load_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
                 if envs.SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK.get():
                     raise RuntimeError(msg)
-                else:
-                    logger.warning(msg)
+                logger.warning(msg)
 
         logger.info(
             f"Init torch distributed ends. elapsed={time.perf_counter() - tic:.2f} s, "
@@ -1650,6 +1681,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
+        if envs.SGLANG_FT_PRECISION_DEBUG.get():
+            logger.info(
+                expert_location_debug_summary(
+                    get_global_expert_location_metadata(), "update_before"
+                )
+            )
+            logger.info(
+                expert_location_debug_summary(
+                    new_expert_location_metadata, "update_target"
+                )
+            )
+            logger.info(
+                "[FTPrecisionDebug][Weights] before_update "
+                "rank=%s update_layer_ids_head=%s fingerprints=%s",
+                self.tp_rank,
+                sorted(update_layer_ids)[:8],
+                _debug_weight_fingerprints(
+                    self.model.routed_experts_weights_of_layer, update_layer_ids
+                ),
+            )
         p2p_missing_logical_experts = self.expert_location_updater.update(
             self.model.routed_experts_weights_of_layer,
             new_expert_location_metadata,
@@ -1657,11 +1708,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             nnodes=self.server_args.nnodes,
             rank=self.tp_rank,
         )
+        if envs.SGLANG_FT_PRECISION_DEBUG.get():
+            logger.info(
+                "[FTPrecisionDebug][Weights] after_p2p "
+                "rank=%s missing_logical_experts=%s fingerprints=%s",
+                self.tp_rank,
+                p2p_missing_logical_experts,
+                _debug_weight_fingerprints(
+                    self.model.routed_experts_weights_of_layer, update_layer_ids
+                ),
+            )
+            logger.info(
+                expert_location_debug_summary(
+                    get_global_expert_location_metadata(), "update_after_metadata"
+                )
+            )
 
         if len(p2p_missing_logical_experts) > 0:
             # Load the missing expert weights from disk
             if callable(getattr(self.model, "generate_weight_name_filter", None)):
-                # Filter and load only missing expert weights
                 weight_name_filter = self.model.generate_weight_name_filter(
                     p2p_missing_logical_experts
                 )
@@ -1685,6 +1750,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_global_server_args().model_path,
                     get_global_server_args().load_format,
                     weight_name_filter=weight_name_filter,
+                )
+            if envs.SGLANG_FT_PRECISION_DEBUG.get():
+                logger.info(
+                    "[FTPrecisionDebug][Weights] after_missing_reload "
+                    "rank=%s missing_logical_experts=%s fingerprints=%s",
+                    self.tp_rank,
+                    p2p_missing_logical_experts,
+                    _debug_weight_fingerprints(
+                        self.model.routed_experts_weights_of_layer, update_layer_ids
+                    ),
                 )
 
     def maybe_recover_ep_ranks(self):
@@ -1718,6 +1793,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     invoked_in_elastic_ep_rejoin_path=False
                 )
             )
+            if envs.SGLANG_FT_PRECISION_DEBUG.get():
+                logger.info(
+                    expert_location_debug_summary(
+                        get_global_expert_location_metadata(), "after_recover_broadcast"
+                    )
+                )
             ElasticEPStateManager.instance().reset()
 
             broadcast_pyobj(
@@ -3299,6 +3380,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
+        self._maybe_inject_test_forward_recoverable_fault()
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
@@ -3320,6 +3402,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch,
             ) as recorder_outputs,
         ):
+            if self.enable_elastic_ep:
+                self._update_expert_layout_after_rank_fault_if_needed()
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
@@ -3327,9 +3411,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
-            if self.enable_elastic_ep:
-                output = self._maybe_rebalance_after_rank_fault(
-                    output,
+            if (
+                self.enable_elastic_ep
+                and self._update_expert_layout_after_rank_fault_if_needed()
+            ):
+                output = self._forward_raw(
                     forward_batch,
                     skip_attn_backend_init,
                     pp_proxy_tensors,
@@ -3369,6 +3455,62 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.maybe_recover_ep_ranks()
 
         return output
+
+    def _maybe_inject_test_forward_recoverable_fault(self) -> None:
+        """Inject one ModelRunner forward exception for explicit FT tests only."""
+        target_raw = os.environ.get("SGLANG_TEST_FT_RECOVERABLE_FAULT_RANK")
+        if target_raw is None or getattr(
+            self, "_test_forward_recoverable_fault_injected", False
+        ):
+            return
+
+        trigger_file = os.environ.get("SGLANG_TEST_FT_RECOVERABLE_FAULT_FILE", "")
+        try:
+            target_ranks = {
+                int(item.strip())
+                for item in target_raw.split(",")
+                if item.strip()
+            }
+        except ValueError:
+            return
+
+        rank = self.dp_rank if self.dp_rank is not None else self.tp_rank
+        local_trigger = (
+            rank in target_ranks
+            and (not trigger_file or os.path.exists(trigger_file))
+        )
+        fault_flag = torch.tensor([int(local_trigger)], dtype=torch.int32)
+        if self.tp_group.world_size > 1:
+            dist.all_reduce(
+                fault_flag,
+                op=dist.ReduceOp.MAX,
+                group=self.tp_group.cpu_group,
+            )
+        if not fault_flag.item():
+            return
+
+        self._test_forward_recoverable_fault_injected = True
+        if local_trigger:
+            done_file = os.environ.get(
+                "SGLANG_TEST_FT_RECOVERABLE_FAULT_DONE_FILE", ""
+            )
+            if done_file:
+                try:
+                    with open(done_file, "a", encoding="utf-8") as file:
+                        file.write(
+                            f"pid={os.getpid()} rank={rank} forward_pass_id={self.forward_pass_id}\n"
+                        )
+                except OSError:
+                    logger.warning(
+                        "Failed to record injected FT forward exception in %s",
+                        done_file,
+                        exc_info=True,
+                    )
+
+        raise RuntimeError(
+            "Injected coordinated recoverable FT forward fault requested for "
+            f"model runner rank(s) {sorted(target_ranks)}"
+        )
 
     def _forward_raw(
         self,
@@ -3605,34 +3747,53 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     device=self.device,
                 )
 
-    def _maybe_rebalance_after_rank_fault(
-        self,
-        output: ModelRunnerOutput,
-        forward_batch: ForwardBatch,
-        skip_attn_backend_init: bool,
-        pp_proxy_tensors: Optional[PPProxyTensors],
-        reinit_attn_backend: bool,
-        split_forward_count: int,
-    ) -> ModelRunnerOutput:
+    def _update_expert_layout_after_rank_fault_if_needed(self) -> bool:
+        """Update dispatch metadata after a rank fault, relocating only if needed."""
         elastic_ep_state = ElasticEPStateManager.instance()
         if elastic_ep_state is not None and not elastic_ep_state.is_active_equal_last():
             elastic_ep_state.snapshot_active_to_last()
             elastic_ep_state.sync_active_to_cpu()
-            logging.info("EPLB due to rank faults")
+            old_metadata = get_global_expert_location_metadata()
+            assert old_metadata is not None
+            try:
+                filtered_metadata = ExpertLocationMetadata.init_by_mapping(
+                    self.server_args,
+                    self.model_config,
+                    physical_to_logical_map=old_metadata.physical_to_logical_map,
+                    moe_ep_rank=self.moe_ep_rank,
+                    active_ranks=elastic_ep_state.active_ranks_cpu,
+                )
+            except NoActiveExpertReplicaError:
+                logger.info(
+                    "At least one logical expert has no active replica; "
+                    "falling back to rank-fault EPLB"
+                )
+            else:
+                assert filtered_metadata is not None
+                old_metadata.update(
+                    filtered_metadata,
+                    update_layer_ids=list(range(old_metadata.num_layers)),
+                )
+                logger.info(
+                    "Preserved expert weights and physical layout after rank "
+                    "fault; filtered inactive-rank dispatch candidates only"
+                )
+                if envs.SGLANG_FT_PRECISION_DEBUG.get():
+                    logger.info(
+                        expert_location_debug_summary(
+                            old_metadata, "rank_fault_metadata_only"
+                        )
+                    )
+                return True
+            logger.info("EPLB due to rank faults")
             gen = self.eplb_manager.rebalance()
             while True:
                 try:
                     next(gen)
                 except StopIteration:
                     break
-            output = self._forward_raw(
-                forward_batch,
-                skip_attn_backend_init,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
-            )
-        return output
+            return True
+        return False
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

@@ -105,6 +105,9 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
+    FaultToleranceCommandReqInput,
+    FaultToleranceCommandReqOutput,
+    FaultToleranceRankFaultOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     FreezeGCReq,
@@ -1472,6 +1475,8 @@ class Scheduler(
                 (GetLoadsReqInput, self.get_loads),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (ActiveRanksOutput, self.handle_active_ranks_update),
+                (FaultToleranceCommandReqInput, self.handle_fault_tolerance_command),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
                 (
@@ -1531,7 +1536,81 @@ class Scheduler(
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         with self.device_module.StreamContext(self.schedule_stream):
-            dispatch_event_loop(self)
+            if self.server_args.enable_fault_tolerance:
+                self._run_event_loop_fault_tolerance()
+            else:
+                dispatch_event_loop(self)
+
+    def _run_event_loop_fault_tolerance(self):
+        while True:
+            try:
+                dispatch_event_loop(self)
+            except Exception as exc:
+                recovered = self._ft_discard_current_batch(exc)
+                self.send_to_tokenizer.send_output(
+                    FaultToleranceRankFaultOutput(
+                        rank=self._ft_rank(),
+                        fault_type="exception",
+                        message=str(exc),
+                    )
+                )
+                if (
+                    self.server_args.fault_tolerance_on_error_strategy == "continue"
+                    and recovered
+                ):
+                    continue
+                self._engine_paused = True
+
+    def _ft_rank(self) -> int:
+        return self.dp_rank if self.dp_rank is not None else 0
+
+    def _ft_discard_current_batch(self, exc: Exception) -> bool:
+        batch = self.cur_batch
+        if batch is None or batch.is_empty():
+            return True
+        if batch.forward_mode.is_idle():
+            self.cur_batch = None
+            if self.last_batch is batch:
+                self.last_batch = None
+            return True
+        discarded_reqs = [req for req in batch.reqs if not req.finished()]
+        success = True
+        for req in discarded_reqs:
+            try:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+                abort_reason = FINISH_ABORT(
+                    message=f"Request discarded after scheduler exception: {exc}",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    err_type="SchedulerFault",
+                )
+                req.finished_reason = abort_reason
+                self.send_to_tokenizer.send_output(
+                    AbortReq(
+                        finished_reason=abort_reason.to_json(),
+                        rid=req.rid,
+                    ),
+                    req,
+                )
+            except Exception:
+                logger.exception(
+                    "FT failed to discard request state: rid=%s",
+                    req.rid,
+                )
+                success = False
+
+        batch.filter_batch(keep_indices=[])
+        batch.batch_is_full = False
+        if self.chunked_req in discarded_reqs:
+            self.chunked_req = None
+        self.cur_batch = None
+        if self.last_batch is batch:
+            self.last_batch = None
+        logger.warning(
+            "FT discarded %d request(s) after scheduler exception: %s",
+            len(discarded_reqs),
+            exc,
+        )
+        return success
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -3717,6 +3796,77 @@ class Scheduler(
                 f"(freed {before_mb - after_mb:.1f} MB)"
             )
         self._engine_paused = False
+
+    def handle_fault_tolerance_command(
+        self, recv_req: FaultToleranceCommandReqInput
+    ) -> Optional[FaultToleranceCommandReqOutput]:
+        rank = self._ft_rank()
+        if rank not in recv_req.target_ranks:
+            return None
+
+        try:
+            logger.info(
+                "Scheduler received FT command: id=%s command=%s rank=%s",
+                recv_req.request_id,
+                recv_req.command,
+                rank,
+            )
+            if recv_req.command == "pause":
+                self._engine_paused = True
+                message = "paused"
+            elif recv_req.command == "resume":
+                self._engine_paused = False
+                message = "resumed"
+            elif recv_req.command == "apply_active_mask":
+                if recv_req.active_mask is None:
+                    raise ValueError("active_mask is required")
+                from sglang.srt.elastic_ep.elastic_ep import apply_active_rank_mask
+
+                apply_active_rank_mask(recv_req.active_mask)
+                message = "active mask applied"
+            elif recv_req.command == "park_idle":
+                self._ft_response_barrier_cleanup()
+                self._engine_paused = True
+                message = "parked idle"
+            else:
+                raise ValueError(f"unknown fault tolerance command: {recv_req.command}")
+            return FaultToleranceCommandReqOutput(
+                request_id=recv_req.request_id,
+                rank=rank,
+                success=True,
+                message=message,
+            )
+        except Exception as exc:
+            return FaultToleranceCommandReqOutput(
+                request_id=recv_req.request_id,
+                rank=rank,
+                success=False,
+                message=str(exc),
+            )
+
+    def _ft_response_barrier_cleanup(self) -> None:
+        if self.enable_overlap and getattr(self, "result_queue", None):
+            while self.result_queue:
+                tmp_batch, tmp_result = self.result_queue.popleft()
+                self.process_batch_result(tmp_batch, tmp_result)
+
+        seen_batches = set()
+        for batch in (self.running_batch, self.last_batch, self.cur_batch):
+            if batch is None or id(batch) in seen_batches:
+                continue
+            seen_batches.add(id(batch))
+            batch.filter_batch(v1_spec_info_filtered=True)
+            if batch.is_empty():
+                batch.batch_is_full = False
+        if self.last_batch is not None and self.last_batch.is_empty():
+            self.last_batch = None
+        if self.cur_batch is not None and self.cur_batch.is_empty():
+            self.cur_batch = None
+
+    def handle_active_ranks_update(self, recv_req: ActiveRanksOutput) -> None:
+        from sglang.srt.elastic_ep.elastic_ep import apply_active_rank_mask
+
+        apply_active_rank_mask(recv_req.status)
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
