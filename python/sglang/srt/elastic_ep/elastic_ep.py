@@ -9,6 +9,7 @@ from typing import Iterator, List, Optional
 import torch
 
 from sglang.srt.distributed import parallel_state
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ServerArgs
 from sglang.srt.utils import is_cpu, is_cuda
 
@@ -34,9 +35,20 @@ class ElasticEPState:
 
     def reset(self):
         if self.active_ranks is not None:
-            self.active_ranks.fill_(1)
+            old_active = self.active_ranks.detach().cpu().tolist()
+            self.active_ranks = torch.ones(
+                self.active_ranks.shape,
+                dtype=self.active_ranks.dtype,
+                device=self.active_ranks.device,
+            )
             self.snapshot_active_to_last()
             self.sync_active_to_cpu()
+            if envs.SGLANG_FT_PRECISION_DEBUG.get():
+                logger.info(
+                    "[FTPrecisionDebug][ElasticEP] reset old_active=%s new_active=%s",
+                    old_active,
+                    self.active_ranks_cpu.tolist(),
+                )
 
     def maybe_inject_test_rank_fault(self) -> bool:
         ranks_raw = os.environ.get("SGLANG_TEST_ELASTIC_EP_FAULT_RANKS", "")
@@ -177,10 +189,56 @@ def _maybe_create_message_queue(group) -> None:
     )
 
 
-def _refresh_ep_members() -> None:
+def _refresh_ep_members(*, allow_missing_buffer_in_fallback: bool = False) -> None:
     from sglang.srt.layers.moe.token_dispatcher.mooncake import EPBuffer
 
+    if EPBuffer._buffer is None:
+        if (
+            allow_missing_buffer_in_fallback
+            and os.environ.get("MOONCAKE_EP_FORCE_FALLBACK") == "1"
+        ):
+            logger.info(
+                "Skip Mooncake EP member refresh before EPBuffer initialization "
+                "in Mooncake forced fallback rejoin path."
+            )
+            return
+        raise RuntimeError("Mooncake EPBuffer is not initialized")
     EPBuffer._buffer.update_ep_member()
+
+
+def apply_active_rank_mask(mask: List[bool]) -> None:
+    state = ElasticEPStateManager.instance()
+    if state is None or state.active_ranks is None:
+        raise RuntimeError("elastic ep state is not initialized")
+    original_mask = list(mask)
+    old_active = state.active_ranks_cpu.tolist()
+    if len(mask) != state.active_ranks.numel() and state.active_ranks.numel() == 1:
+        # Native DP launches one-rank scheduler worlds. The FT control plane
+        # still carries a DP-rank mask, while each live scheduler only needs its
+        # local one-rank Mooncake mirror to stay active; DPC owns DP routing.
+        mask = [True]
+    if len(mask) != state.active_ranks.numel():
+        raise ValueError(
+            f"active mask size mismatch: got {len(mask)}, "
+            f"expected {state.active_ranks.numel()}"
+        )
+    tensor = torch.tensor(
+        [1 if item else 0 for item in mask],
+        dtype=state.active_ranks.dtype,
+        device=state.active_ranks.device,
+    )
+    state.active_ranks.copy_(tensor)
+    state.sync_active_to_cpu()
+    _refresh_ep_members()
+    if envs.SGLANG_FT_PRECISION_DEBUG.get():
+        logger.info(
+            "[FTPrecisionDebug][ElasticEP] apply_active_rank_mask "
+            "requested=%s effective=%s old_active=%s new_active=%s",
+            original_mask,
+            mask,
+            old_active,
+            state.active_ranks_cpu.tolist(),
+        )
 
 
 def try_recover_ranks(global_ranks: List[int]) -> bool:
@@ -237,4 +295,4 @@ def join_process_groups():
         )
         _maybe_create_message_queue(group)
 
-    _refresh_ep_members()
+    _refresh_ep_members(allow_missing_buffer_in_fallback=True)

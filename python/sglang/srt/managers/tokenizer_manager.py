@@ -24,6 +24,7 @@ import signal
 import socket
 import sys
 import threading
+import uuid
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -44,6 +45,12 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.fault_tolerance.controller import (
+    FaultToleranceManager,
+    RankState,
+    ft_error_status,
+    ft_failure,
+)
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -51,6 +58,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    ActiveRanksUpdateReqOutput,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
@@ -59,6 +67,9 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     EmbeddingReqInput,
+    FaultToleranceCommandReqInput,
+    FaultToleranceCommandReqOutput,
+    FaultToleranceRankFaultOutput,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -196,6 +207,20 @@ class ReqState:
     output_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
 
 
+@dataclasses.dataclass
+class PendingFTCommand:
+    target_ranks: set[int]
+    future: asyncio.Future
+    acked: set[int] = dataclasses.field(default_factory=set)
+    failed: Dict[int, str] = dataclasses.field(default_factory=dict)
+
+    def finish_if_ready(self):
+        if self.future.done():
+            return
+        if self.acked.union(self.failed) >= self.target_ranks:
+            self.future.set_result(None)
+
+
 def _slice_streaming_output_meta_info(
     meta_info: Dict[Any, Any],
     last_output_offset: int,
@@ -239,6 +264,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init running status
         self.init_running_status()
+
+        # Init fault tolerance state. Disabled FT keeps this as None.
+        self.init_fault_tolerance()
 
         # Init logging and dumping
         self.init_request_logging_and_dumping()
@@ -378,6 +406,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
 
+    def init_fault_tolerance(self):
+        self.fault_tolerance: Optional[FaultToleranceManager] = None
+        self._ft_pending_commands: Dict[str, PendingFTCommand] = {}
+        self._ft_pending_active_rank_updates: Dict[str, asyncio.Future] = {}
+        self._ft_parked_scheduler_ranks: List[int] = []
+        self._ft_scheduler_park_lock = asyncio.Lock()
+        self._ft_last_dispatched_active_mask: Optional[List[bool]] = None
+        if not self.server_args.enable_fault_tolerance:
+            return
+        self.fault_tolerance = FaultToleranceManager(
+            dp_size=self.server_args.dp_size,
+            strategy=self.server_args.fault_tolerance_on_error_strategy,
+        )
+        self._ft_last_dispatched_active_mask = [True] * self.server_args.dp_size
+
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
         # Request logging
@@ -506,6 +549,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (ActiveRanksUpdateReqOutput, self._handle_active_ranks_update_output),
+                (FaultToleranceCommandReqOutput, self._handle_ft_command_output),
+                (FaultToleranceRankFaultOutput, self._handle_ft_rank_fault),
             ]
         )
         self.init_communicators(self.server_args)
@@ -534,6 +580,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
+            if (
+                self.fault_tolerance is not None
+                and not self.fault_tolerance.is_rank_healthy(obj.routed_dp_rank)
+            ):
+                raise ValueError(
+                    f"routed_dp_rank={obj.routed_dp_rank} is not healthy"
+                )
+
+        if (
+            self.fault_tolerance is not None
+            and self.fault_tolerance.should_reject_admission()
+        ):
+            raise RuntimeError("fault_tolerance_paused")
+
+        await self._ft_resume_parked_schedulers_before_request()
 
         self._init_req_state(obj, request)
         if self.server_args.language_only:
@@ -1511,6 +1572,173 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             await self.send_to_scheduler.send_pyobj(obj)
             self.is_pause_cond.notify_all()
 
+    def fault_tolerance_status(self):
+        if self.fault_tolerance is None:
+            return 503, ft_failure("fault_tolerance_disabled")
+        return 200, self.fault_tolerance.status_response()
+
+    async def fault_tolerance_apply(self, obj: Dict[str, Any]):
+        if self.fault_tolerance is None:
+            return 503, ft_failure("fault_tolerance_disabled")
+
+        instruction = obj.get("fault_tolerance_instruction")
+        params = obj.get("fault_tolerance_params") or {}
+        timeout = obj.get(
+            "fault_tolerance_timeout", self.server_args.fault_tolerance_timeout
+        )
+        try:
+            timeout = int(timeout)
+        except (TypeError, ValueError):
+            return 400, ft_failure("invalid_fault_tolerance_timeout")
+        if timeout <= 0:
+            return 400, ft_failure("invalid_fault_tolerance_timeout")
+
+        ranks = None
+        if instruction == "scale_down":
+            ranks = params.get("ranks")
+            if not isinstance(ranks, list):
+                return 400, ft_failure("scale_down_requires_non_empty_ranks")
+            try:
+                ranks = [int(rank) for rank in ranks]
+            except (TypeError, ValueError):
+                return 400, ft_failure("unknown_rank")
+        elif instruction == "retry":
+            if params:
+                return 400, ft_failure("retry_does_not_accept_params")
+            ranks = None
+
+        error = self.fault_tolerance.validate_apply(instruction, ranks)
+        if error:
+            return ft_error_status(error), ft_failure(error)
+
+        live_scale_down_targets = []
+        if instruction == "scale_down":
+            live_scale_down_targets = [
+                rank
+                for rank in ranks or []
+                if self.fault_tolerance.rank_states[rank] != RankState.DEAD
+            ]
+        active_mask, resume_targets, pending_scale_down_ranks = (
+            self.fault_tolerance.begin_recover(
+                instruction, ranks
+            )
+        )
+        shutdown_live_targets = (
+            instruction == "scale_down"
+            and envs.SGLANG_FT_SCALE_DOWN_SHUTDOWN_LIVE_RANK.get()
+        )
+        if shutdown_live_targets:
+            resume_targets = sorted(
+                set(resume_targets) - set(live_scale_down_targets)
+            )
+        else:
+            resume_targets = sorted(set(resume_targets + live_scale_down_targets))
+        logger.info(
+            "Fault tolerance apply plan: instruction=%s active_mask=%s "
+            "resume_targets=%s pending_scale_down=%s shutdown_live_targets=%s "
+            "live_scale_down_targets=%s",
+            instruction,
+            active_mask,
+            resume_targets,
+            pending_scale_down_ranks,
+            shutdown_live_targets,
+            live_scale_down_targets,
+        )
+        try:
+            await self._ft_apply_active_mask(
+                active_mask,
+                timeout,
+                update_routing=False,
+            )
+            resume_targets = sorted(
+                set(resume_targets) | set(self._ft_parked_scheduler_ranks)
+            )
+            if shutdown_live_targets:
+                resume_targets = sorted(
+                    set(resume_targets) - set(live_scale_down_targets)
+                )
+            await self._ft_send_command_collect(
+                command="resume",
+                target_ranks=resume_targets,
+                timeout_sec=timeout,
+            )
+            self._ft_parked_scheduler_ranks.clear()
+            await self._ft_publish_active_ranks(active_mask, timeout)
+            if shutdown_live_targets and live_scale_down_targets:
+                await self._ft_send_command_collect(
+                    command="shutdown",
+                    target_ranks=live_scale_down_targets,
+                    timeout_sec=timeout,
+                )
+        except Exception as exc:
+            logger.exception("Fault tolerance apply failed; exiting: %s", exc)
+            os._exit(1)
+
+        response = self.fault_tolerance.commit_recover(pending_scale_down_ranks)
+        logger.info(
+            "Fault tolerance apply committed: instruction=%s pending_scale_down=%s",
+            instruction,
+            pending_scale_down_ranks,
+        )
+        return 200, response
+
+    def _ft_should_park_schedulers(self) -> bool:
+        return (
+            self.fault_tolerance is not None
+            and self.server_args.dp_size > 1
+            and not envs.SGLANG_FT_DISABLE_PARK_IDLE.get()
+        )
+
+    async def _ft_resume_parked_schedulers_before_request(self) -> None:
+        if not self._ft_should_park_schedulers():
+            return
+        async with self._ft_scheduler_park_lock:
+            if not self._ft_parked_scheduler_ranks:
+                return
+            healthy_rank_set = set(self.fault_tolerance.healthy_ranks())
+            target_ranks = [
+                rank
+                for rank in self._ft_parked_scheduler_ranks
+                if rank in healthy_rank_set
+            ]
+            if not target_ranks:
+                self._ft_parked_scheduler_ranks.clear()
+                return
+            await self._ft_send_command_collect(
+                command="resume",
+                target_ranks=target_ranks,
+                timeout_sec=self.server_args.fault_tolerance_timeout,
+            )
+            self._ft_parked_scheduler_ranks.clear()
+
+    async def _ft_park_schedulers_for_topology_change(
+        self,
+        *,
+        target_ranks: List[int],
+        is_stream: bool = False,
+    ) -> None:
+        if not self._ft_should_park_schedulers():
+            return
+        async with self._ft_scheduler_park_lock:
+            if self._ft_parked_scheduler_ranks:
+                return
+            if not target_ranks:
+                return
+            try:
+                await self._ft_send_command_collect(
+                    command="park_idle",
+                    target_ranks=target_ranks,
+                    timeout_sec=self.server_args.fault_tolerance_timeout,
+                )
+                self._ft_parked_scheduler_ranks = target_ranks
+            except Exception as exc:
+                logger.exception("Failed to park FT schedulers")
+                if not is_stream:
+                    raise fastapi.HTTPException(
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                        detail=f"failed to park fault-tolerance schedulers: {exc}",
+                    ) from exc
+
     async def update_weights_from_disk(
         self,
         obj: UpdateWeightFromDiskReqInput,
@@ -2451,7 +2679,241 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state.event.set()
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
+        if self.fault_tolerance is not None:
+            targets = self.fault_tolerance.record_inactive_mask(ranks.status)
+            if targets:
+                self._ft_create_task(self._ft_pause_after_inactive(targets))
         self.send_to_scheduler.send_pyobj(ranks)
+
+    def _ft_create_task(self, coro):
+        self.auto_create_handle_loop()
+        task = self.event_loop.create_task(print_exception_wrapper(coro))
+        self.asyncio_tasks.add(task)
+        task.add_done_callback(self.asyncio_tasks.discard)
+        return task
+
+    def _handle_ft_command_output(self, output: FaultToleranceCommandReqOutput):
+        pending = self._ft_pending_commands.get(output.request_id)
+        if pending is None:
+            logger.warning(
+                "Unknown fault tolerance command ack: request_id=%s rank=%s",
+                output.request_id,
+                output.rank,
+            )
+            return
+        if output.success:
+            pending.acked.add(output.rank)
+        else:
+            pending.failed[output.rank] = output.message
+        pending.finish_if_ready()
+
+    def _handle_active_ranks_update_output(self, output: ActiveRanksUpdateReqOutput):
+        future = self._ft_pending_active_rank_updates.get(output.request_id)
+        if future is None:
+            logger.warning(
+                "Unknown active-ranks update ack: request_id=%s success=%s",
+                output.request_id,
+                output.success,
+            )
+            return
+        if future.done():
+            return
+        if output.success:
+            future.set_result(None)
+        else:
+            future.set_exception(RuntimeError(output.message))
+
+    def _handle_ft_rank_fault(self, event: FaultToleranceRankFaultOutput):
+        if self.fault_tolerance is None:
+            return
+        if event.fault_type == "exception":
+            if self.server_args.fault_tolerance_on_error_strategy == "continue":
+                logger.warning(
+                    "FT continue observed scheduler exception on rank %s: %s",
+                    event.rank,
+                    event.message,
+                )
+                return
+            self._ft_create_task(self._ft_handle_exception_pause(event))
+            return
+        if event.fault_type == "kill":
+            self._ft_create_task(self._ft_handle_kill(event))
+
+    def handle_ft_process_exit(self, rank: int, proc, name: str = "") -> bool:
+        if self.fault_tolerance is None or self.event_loop is None:
+            return False
+
+        event = FaultToleranceRankFaultOutput(
+            rank=rank,
+            fault_type="kill",
+        )
+
+        def schedule():
+            self._ft_create_task(self._ft_handle_kill(event))
+
+        self.event_loop.call_soon_threadsafe(schedule)
+        return True
+
+    async def _ft_handle_exception_pause(self, event: FaultToleranceRankFaultOutput):
+        if self.fault_tolerance is None:
+            return
+        if self.fault_tolerance.ft_operation_in_progress:
+            logger.warning(
+                "Ignoring duplicate FT exception while another operation is active: "
+                "rank=%s message=%s",
+                event.rank,
+                event.message,
+            )
+            return
+
+        targets = self.fault_tolerance.begin_exception_pause()
+        await self._ft_pause_schedulers(targets)
+        if RankState.DEAD in self.fault_tolerance.rank_states:
+            await self._ft_apply_current_active_mask()
+
+    async def _ft_handle_kill(self, event: FaultToleranceRankFaultOutput):
+        if self.fault_tolerance is None:
+            return
+        targets = self.fault_tolerance.record_kill(event.rank)
+        if targets:
+            await self._ft_pause_schedulers(targets)
+            await self._ft_apply_current_active_mask()
+        else:
+            self.send_to_scheduler.send_pyobj(
+                ActiveRanksOutput(status=self.fault_tolerance.active_mask())
+            )
+
+    async def _ft_pause_after_inactive(self, targets: List[int]):
+        if self.fault_tolerance is None:
+            return
+        await self._ft_pause_schedulers(targets)
+        await self._ft_apply_current_active_mask()
+
+    async def _ft_pause_schedulers(self, targets: List[int]):
+        acked, timed_out = await self._ft_send_command_collect(
+            command="pause",
+            target_ranks=targets,
+            timeout_sec=self.server_args.fault_tolerance_timeout,
+            tolerate_timeout=True,
+        )
+        self.fault_tolerance.finish_pause_collection(acked, timed_out)
+
+    async def _ft_apply_current_active_mask(self):
+        if self.fault_tolerance is None:
+            return
+        await self._ft_apply_active_mask(
+            self.fault_tolerance.active_mask(),
+            self.server_args.fault_tolerance_timeout,
+        )
+
+    async def _ft_apply_active_mask(
+        self,
+        active_mask: List[bool],
+        timeout: int,
+        update_routing: bool = True,
+    ):
+        if self.fault_tolerance is None:
+            return
+        if not any(active_mask):
+            raise RuntimeError("fault tolerance active mask has no live rank")
+        previous_mask = self._ft_last_dispatched_active_mask
+        if previous_mask is None or list(active_mask) != previous_mask:
+            await self._ft_park_schedulers_for_topology_change(
+                target_ranks=self.fault_tolerance.live_ranks(),
+            )
+        await self._ft_send_command_collect(
+            command="apply_active_mask",
+            target_ranks=self.fault_tolerance.live_ranks(),
+            timeout_sec=timeout,
+            active_mask=active_mask,
+        )
+        self._ft_last_dispatched_active_mask = list(active_mask)
+        if update_routing:
+            await self._ft_publish_active_ranks(active_mask, timeout)
+
+    async def _ft_publish_active_ranks(
+        self, active_mask: List[bool], timeout_sec: int
+    ) -> None:
+        if self.server_args.dp_size <= 1:
+            self.send_to_scheduler.send_pyobj(ActiveRanksOutput(status=active_mask))
+            return
+
+        request_id = uuid.uuid4().hex
+        future = self.event_loop.create_future()
+        self._ft_pending_active_rank_updates[request_id] = future
+        try:
+            await self.send_to_scheduler.send_pyobj(
+                ActiveRanksOutput(status=active_mask, request_id=request_id)
+            )
+            await asyncio.wait_for(future, timeout=timeout_sec)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"active-ranks routing update timed out: request_id={request_id}"
+            ) from exc
+        finally:
+            self._ft_pending_active_rank_updates.pop(request_id, None)
+
+    async def _ft_send_command_collect(
+        self,
+        *,
+        command: str,
+        target_ranks: List[int],
+        timeout_sec: int,
+        active_mask: Optional[List[bool]] = None,
+        tolerate_timeout: bool = False,
+    ) -> Tuple[set[int], set[int]]:
+        target_set = set(target_ranks)
+        if not target_set:
+            return set(), set()
+
+        request_id = uuid.uuid4().hex
+        pending = PendingFTCommand(
+            target_ranks=target_set,
+            future=self.event_loop.create_future(),
+        )
+        self._ft_pending_commands[request_id] = pending
+        req = FaultToleranceCommandReqInput(
+            request_id=request_id,
+            command=command,
+            target_ranks=sorted(target_set),
+            active_mask=active_mask,
+        )
+        logger.info(
+            "FT command dispatch: id=%s command=%s targets=%s",
+            request_id,
+            command,
+            req.target_ranks,
+        )
+        await self.send_to_scheduler.send_pyobj(req)
+        try:
+            await asyncio.wait_for(pending.future, timeout=timeout_sec)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Fault tolerance command timeout: id=%s command=%s acked=%s "
+                "pending=%s tolerate_timeout=%s",
+                request_id,
+                command,
+                sorted(pending.acked),
+                sorted(target_set - pending.acked),
+                tolerate_timeout,
+            )
+            if not tolerate_timeout:
+                raise
+        finally:
+            self._ft_pending_commands.pop(request_id, None)
+
+        if pending.failed:
+            raise RuntimeError(
+                f"fault tolerance command {command} failed: {pending.failed}"
+            )
+        timed_out = target_set - pending.acked
+        logger.info(
+            "FT command complete: id=%s command=%s timed_out=%s",
+            request_id,
+            command,
+            sorted(timed_out),
+        )
+        return pending.acked, timed_out
 
     def _handle_open_session_req_output(self, recv_obj):
         future = self.session_futures.get(recv_obj.session_id)
@@ -2739,7 +3201,10 @@ async def print_exception_wrapper(func):
     We do another wrapper to handle the exception.
     """
     try:
-        await func()
+        if callable(func):
+            await func()
+        else:
+            await func
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"TokenizerManager hit an exception: {traceback}")

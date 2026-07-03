@@ -107,6 +107,10 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 )
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
+from sglang.srt.fault_tolerance.middleware import (
+    fault_tolerance_unavailable_response,
+    should_reject_fault_tolerance_request,
+)
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -312,6 +316,11 @@ async def lifespan(fast_api_app: FastAPI):
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
 
+    if server_args.enable_fault_tolerance and hasattr(
+        _global_state.tokenizer_manager, "auto_create_handle_loop"
+    ):
+        _global_state.tokenizer_manager.auto_create_handle_loop()
+
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
         _global_state.tokenizer_manager, _global_state.template_manager
@@ -411,6 +420,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def fault_tolerance_admission_gate(request: Request, call_next):
+    if _global_state is not None and should_reject_fault_tolerance_request(
+        _global_state.tokenizer_manager, request.url.path
+    ):
+        return fault_tolerance_unavailable_response()
+    return await call_next(request)
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -1475,6 +1493,31 @@ async def continue_generation(obj: ContinueGenerationReqInput, request: Request)
         content={"message": "Generation continued successfully.", "status": "ok"},
         status_code=200,
     )
+
+
+@app.get("/fault_tolerance/status")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def fault_tolerance_status(request: Request):
+    if not hasattr(_global_state.tokenizer_manager, "fault_tolerance_status"):
+        return ORJSONResponse(
+            content={"success": False, "message": "fault_tolerance_disabled"},
+            status_code=503,
+        )
+    status_code, body = _global_state.tokenizer_manager.fault_tolerance_status()
+    return ORJSONResponse(content=body, status_code=status_code)
+
+
+@app.post("/fault_tolerance/apply")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def fault_tolerance_apply(request: Request):
+    if not hasattr(_global_state.tokenizer_manager, "fault_tolerance_apply"):
+        return ORJSONResponse(
+            content={"success": False, "message": "fault_tolerance_disabled"},
+            status_code=503,
+        )
+    obj = await request.json()
+    status_code, body = await _global_state.tokenizer_manager.fault_tolerance_apply(obj)
+    return ORJSONResponse(content=body, status_code=status_code)
 
 
 ##### OpenAI-compatible API endpoints #####
