@@ -7769,6 +7769,10 @@ class PortArgs:
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
 
+    # Per-global-rank FT control sockets. These let DPC address a live TP/EP
+    # rank directly when its DP-attention leader is dead.
+    ft_control_ipc_names: Optional[List[str]] = None
+
     @staticmethod
     def init_new(
         server_args: ServerArgs,

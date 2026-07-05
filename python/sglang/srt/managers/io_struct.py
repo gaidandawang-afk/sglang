@@ -1413,6 +1413,13 @@ class FaultToleranceRankFaultOutput(BaseReq):
 
 
 @dataclass
+class FaultToleranceRankRejoinOutput(BaseReq):
+    rank: int
+    pid: int
+    message: str = ""
+
+
+@dataclass
 class TokenizerWorkerRegistration:
     """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
 
@@ -1701,6 +1708,9 @@ class AbortReq(BaseReq):
 class ActiveRanksOutput(BaseReq):
     status: List[bool]
     request_id: Optional[str] = None
+    # "dp_route" updates request-routing/status state.  "ep" is the only
+    # rank space that may be applied to Mooncake's active-rank backend.
+    rank_space: str = "dp_route"
 
 
 @dataclass

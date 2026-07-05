@@ -18,6 +18,7 @@ import logging
 import multiprocessing as mp
 import os
 import signal
+import tempfile
 import threading
 import time
 from enum import Enum, auto
@@ -28,6 +29,12 @@ import setproctitle
 import zmq
 
 from sglang.srt.environ import envs
+from sglang.srt.fault_tolerance.process_registry import SchedulerProcessRegistry
+from sglang.srt.fault_tolerance.rank_space import (
+    FT_RANK_SPACE_DP_ROUTE,
+    active_ranks_broadcast_rank_space,
+    is_dp_route_rank_space,
+)
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -39,6 +46,7 @@ from sglang.srt.managers.io_struct import (
     FaultToleranceCommandReqInput,
     FaultToleranceCommandReqOutput,
     FaultToleranceRankFaultOutput,
+    FaultToleranceRankRejoinOutput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -175,8 +183,16 @@ class DataParallelController:
 
         # Launch data parallel workers
         self.scheduler_procs = []
+        self.scheduler_process_registry = SchedulerProcessRegistry(
+            dp_size=server_args.dp_size,
+            tp_size=server_args.tp_size,
+            attn_cp_size=server_args.attn_cp_size,
+            enable_dp_attention=server_args.enable_dp_attention,
+        )
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
+        self.ft_control_workers: List[Optional[zmq.Socket]] = []
         self.status: List[bool] = [True] * server_args.dp_size
+        self._init_ft_control_channels(server_args, port_args)
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
@@ -219,6 +235,26 @@ class DataParallelController:
             if self.status[i]:
                 worker.send_pyobj(obj)
 
+    def _init_ft_control_channels(
+        self, server_args: ServerArgs, port_args: PortArgs
+    ) -> None:
+        if not (server_args.enable_fault_tolerance and server_args.enable_dp_attention):
+            return
+        if port_args.ft_control_ipc_names is None:
+            port_args.ft_control_ipc_names = [
+                f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+                for _ in range(server_args.tp_size)
+            ]
+        self.ft_control_workers = [
+            get_zmq_socket(self.context, zmq.PUSH, endpoint, True)
+            for endpoint in port_args.ft_control_ipc_names
+        ]
+
+    def _dp_rank_for_scheduler_index(self, scheduler_index: int) -> Optional[int]:
+        return self.scheduler_process_registry.dp_rank_for_scheduler_index(
+            scheduler_index
+        )
+
     def send_control_message(self, obj):
         # Send control messages to first worker of tp group
         self._refresh_worker_liveness()
@@ -226,23 +262,102 @@ class DataParallelController:
             if self.status[rank]:
                 self.workers[rank].send_pyobj(obj)
 
+    def _send_ft_command_failure(
+        self, request_id: str, rank: int, message: str
+    ) -> None:
+        if self.send_to_tokenizer is None:
+            return
+        self.send_to_tokenizer.send_pyobj(
+            FaultToleranceCommandReqOutput(
+                request_id=request_id,
+                rank=rank,
+                success=False,
+                message=message,
+            )
+        )
+
+    def _has_dead_scheduler_rank(self) -> bool:
+        return self.scheduler_process_registry.has_dead_scheduler_rank(
+            self.scheduler_procs
+        )
+
+    def _ft_control_rank_for_target(self, target_rank: int) -> Optional[int]:
+        return self.scheduler_process_registry.ft_control_rank_for_target(
+            target_rank,
+            control_message_step=self.control_message_step,
+            worker_count=len(self.workers),
+        )
+
+    def _is_ft_control_rank_reachable(self, control_rank: int) -> bool:
+        return self.scheduler_process_registry.is_ft_control_rank_reachable(
+            control_rank,
+            control_message_step=self.control_message_step,
+            worker_count=len(self.workers),
+            status=self.status,
+            processes=self.scheduler_procs,
+        )
+
+    def _send_ft_command_direct(self, obj: FaultToleranceCommandReqInput) -> bool:
+        if not self.ft_control_workers:
+            return False
+        for rank in obj.target_ranks:
+            if not (
+                0 <= rank < len(self.ft_control_workers)
+                and rank < len(self.scheduler_procs)
+            ):
+                self._send_ft_command_failure(
+                    obj.request_id,
+                    rank,
+                    "unknown rank",
+                )
+                continue
+            proc = self.scheduler_procs[rank]
+            if not self.scheduler_process_registry.is_rank_alive(rank, proc):
+                self._send_ft_command_failure(
+                    obj.request_id,
+                    rank,
+                    "ft_target_rank_unreachable",
+                )
+                continue
+            logger.info(
+                "DPC forwarding direct FT command: id=%s command=%s rank=%s",
+                obj.request_id,
+                obj.command,
+                rank,
+            )
+            self.ft_control_workers[rank].send_pyobj(obj)
+        return True
+
     def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
         self._refresh_worker_liveness()
         if obj.command == "shutdown":
             for rank in obj.target_ranks:
                 success = True
                 message = "shutdown requested"
-                if not (0 <= rank < len(self.workers)):
+                if not (0 <= rank < len(self.scheduler_procs)):
                     success = False
                     message = "unknown rank"
                 else:
-                    proc = (
-                        self.scheduler_procs[rank]
-                        if rank < len(self.scheduler_procs)
-                        else None
+                    proc = self.scheduler_procs[rank]
+                    replacement_pid = self.scheduler_process_registry.replacement_pid(
+                        rank, proc
                     )
-                    self.status[rank] = False
-                    if proc is not None and proc.is_alive():
+                    dp_rank = self._dp_rank_for_scheduler_index(rank)
+                    if dp_rank is not None:
+                        self.status[dp_rank] = False
+                    if replacement_pid is not None:
+                        logger.info(
+                            "DPC shutting down rejoined scheduler for fault tolerance: "
+                            "id=%s rank=%s pid=%s",
+                            obj.request_id,
+                            rank,
+                            replacement_pid,
+                        )
+                        try:
+                            psutil.Process(replacement_pid).terminate()
+                        except psutil.NoSuchProcess:
+                            message = "already stopped"
+                    elif proc is not None and proc.is_alive():
                         logger.info(
                             "DPC shutting down scheduler for fault tolerance: "
                             "id=%s rank=%s pid=%s",
@@ -264,13 +379,43 @@ class DataParallelController:
                     )
             return
 
-        # Fault-tolerance commands must enter the same control-message fanout
-        # path as other scheduler control messages.  In DP-attention without
-        # local control broadcast, only rank 0 receives from the DPC and then
-        # broadcasts control_reqs over the full tp_group.  Sending directly to
-        # a non-root target rank would be ignored by recv_requests().
-        for rank in range(0, len(self.workers), self.control_message_step):
-            if self.status[rank]:
+        if self._send_ft_command_direct(obj):
+            return
+
+        if (
+            self.server_args.enable_dp_attention
+            and self.control_message_step != 1
+            and self._has_dead_scheduler_rank()
+        ):
+            for rank in obj.target_ranks:
+                self._send_ft_command_failure(
+                    obj.request_id,
+                    rank,
+                    "ft_control_broadcast_contains_dead_rank",
+                )
+            return
+
+        control_ranks = set()
+        for target_rank in obj.target_ranks:
+            control_rank = self._ft_control_rank_for_target(target_rank)
+            if control_rank is None or not self._is_ft_control_rank_reachable(
+                control_rank
+            ):
+                self._send_ft_command_failure(
+                    obj.request_id,
+                    target_rank,
+                    "ft_control_rank_unreachable",
+                )
+                continue
+            control_ranks.add(control_rank)
+
+        # Fallback path for configurations without direct FT control sockets.
+        # In DP-attention without local control broadcast, only rank 0 receives
+        # from the DPC and then broadcasts control_reqs over the full tp_group,
+        # so fail above instead of entering this path when a dead member could
+        # make that bootstrap broadcast hang.
+        for rank in sorted(control_ranks):
+            if 0 <= rank < len(self.workers):
                 logger.info(
                     "DPC forwarding FT command: id=%s command=%s control_rank=%s",
                     obj.request_id,
@@ -282,10 +427,20 @@ class DataParallelController:
     def _handle_scheduler_process_exit(self, index, proc, name):
         if self.send_to_tokenizer is None:
             return False
-        if 0 <= index < len(self.status):
-            if not self.status[index]:
+        if self.scheduler_process_registry.should_ignore_process_exit(index, proc):
+            logger.info(
+                "Ignoring old scheduler process exit after FT rejoin: "
+                "rank=%s old_pid=%s replacement_pid=%s",
+                index,
+                getattr(proc, "pid", None),
+                self.scheduler_process_registry.pids[index],
+            )
+            return True
+        dp_rank = self._dp_rank_for_scheduler_index(index)
+        if dp_rank is not None:
+            if not self.status[dp_rank]:
                 return True
-            self.status[index] = False
+            self.status[dp_rank] = False
             if not self.server_args.enable_fault_tolerance:
                 self._send_active_ranks_to_live_workers()
                 return True
@@ -301,7 +456,13 @@ class DataParallelController:
     def _send_active_ranks_to_live_workers(self):
         if self.server_args.elastic_ep_backend is None:
             return
-        active_ranks = ActiveRanksOutput(status=list(self.status))
+        active_ranks = ActiveRanksOutput(
+            status=list(self.status),
+            rank_space=active_ranks_broadcast_rank_space(
+                mask_size=len(self.status),
+                scheduler_rank_count=len(self.scheduler_procs),
+            ),
+        )
         for rank, worker in enumerate(self.workers):
             if rank < len(self.status) and self.status[rank]:
                 worker.send_pyobj(active_ranks)
@@ -313,6 +474,11 @@ class DataParallelController:
         success = True
         message = "active ranks updated"
         try:
+            if not is_dp_route_rank_space(ranks.rank_space):
+                raise ValueError(
+                    f"DPC active-ranks update expects dp_route rank_space, "
+                    f"got {ranks.rank_space}"
+                )
             self.status = list(ranks.status)
             self._refresh_worker_liveness()
         except Exception as exc:
@@ -329,17 +495,44 @@ class DataParallelController:
                     )
                 )
 
+    def handle_ft_rank_rejoin(self, event: FaultToleranceRankRejoinOutput):
+        if not (0 <= event.rank < len(self.scheduler_procs)):
+            logger.warning(
+                "Ignoring FT rejoin registration for unknown rank=%s pid=%s",
+                event.rank,
+                event.pid,
+            )
+            return
+        old_pid = self.scheduler_process_registry.register_rejoin(
+            event.rank, event.pid
+        )
+        logger.info(
+            "Registered FT rejoined scheduler process: rank=%s old_pid=%s "
+            "new_pid=%s message=%s",
+            event.rank,
+            old_pid,
+            event.pid,
+            event.message,
+        )
+
     def _refresh_worker_liveness(self):
         """Keep DPC routing state aligned with scheduler process liveness."""
         changed = False
         for rank, proc in enumerate(self.scheduler_procs):
-            if proc is None or rank >= len(self.status):
+            if proc is None:
                 continue
-            if self.status[rank] and not proc.is_alive():
-                self.status[rank] = False
+            dp_rank = self._dp_rank_for_scheduler_index(rank)
+            if dp_rank is None:
+                continue
+            if self.status[dp_rank] and not (
+                self.scheduler_process_registry.is_rank_alive(rank, proc)
+            ):
+                self.status[dp_rank] = False
                 changed = True
                 logger.warning(
-                    "Mark DP rank %s inactive because scheduler process %s exited",
+                    "Mark DP rank %s inactive because scheduler process rank=%s "
+                    "pid=%s exited",
+                    dp_rank,
                     rank,
                     proc.pid,
                 )
@@ -375,6 +568,7 @@ class DataParallelController:
                 (WatchLoadUpdateReq, self.handle_load_update_req),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (FaultToleranceCommandReqInput, self.send_fault_tolerance_command),
+                (FaultToleranceRankRejoinOutput, self.handle_ft_rank_rejoin),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -639,6 +833,9 @@ class DataParallelController:
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
+                    rank_port_args.ft_control_ipc_names = (
+                        port_args.ft_control_ipc_names
+                    )
 
                 reader, writer = mp.Pipe(duplex=False)
                 gpu_id = (
@@ -693,6 +890,7 @@ class DataParallelController:
                     ):
                         proc.start()
                 self.scheduler_procs.append(proc)
+                self.scheduler_process_registry.append_process(proc)
                 scheduler_pipe_readers.append(reader)
 
         # Wait for model to finish loading

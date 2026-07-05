@@ -67,6 +67,8 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.fault_tolerance.rank_space import is_ep_rank_space
+from sglang.srt.fault_tolerance.topology import scheduler_ft_rank
 from sglang.srt.layers.attention.mamba.ops import (
     initialize_mamba_selective_state_update_backend,
 )
@@ -108,6 +110,7 @@ from sglang.srt.managers.io_struct import (
     FaultToleranceCommandReqInput,
     FaultToleranceCommandReqOutput,
     FaultToleranceRankFaultOutput,
+    FaultToleranceRankRejoinOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     FreezeGCReq,
@@ -419,6 +422,7 @@ class Scheduler(
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
+        self._ft_maybe_register_rejoin_process()
 
         # Init ZBAL, switch allocator should before any torch alloc action
         self.init_zbal_on_npu()
@@ -536,6 +540,7 @@ class Scheduler(
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
         self.idle_sleeper = None
+        self.recv_from_ft_control = None
 
         if self.pp_rank == 0 and self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
@@ -572,13 +577,59 @@ class Scheduler(
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
-            self.send_to_tokenizer = SenderWrapper(None)
+            if self.server_args.enable_fault_tolerance:
+                # Direct FT control can target any global/EP rank; every rank
+                # needs this channel to ACK commands by its physical rank.
+                self.send_to_tokenizer = SenderWrapper(
+                    get_zmq_socket(
+                        context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+                    )
+                )
+            else:
+                self.send_to_tokenizer = SenderWrapper(None)
             self.send_to_detokenizer = SenderWrapper(None)
 
         if self.current_scheduler_metrics_enabled:
             self.send_metrics_from_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
             )
+
+        if (
+            self.server_args.enable_fault_tolerance
+            and port_args.ft_control_ipc_names is not None
+            and 0 <= self.tp_rank < len(port_args.ft_control_ipc_names)
+        ):
+            self.recv_from_ft_control = get_zmq_socket(
+                context,
+                zmq.PULL,
+                port_args.ft_control_ipc_names[self.tp_rank],
+                False,
+            )
+
+    def _ft_maybe_register_rejoin_process(self) -> None:
+        if not (
+            self.server_args.enable_fault_tolerance
+            and self.server_args.elastic_ep_rejoin
+        ):
+            return
+        self.send_to_tokenizer.send_output(
+            FaultToleranceRankRejoinOutput(
+                rank=self._ft_rank(),
+                pid=os.getpid(),
+                message="elastic_ep_rejoin_scheduler_ready",
+            )
+        )
+
+    def _recv_ft_control_reqs(self) -> List[Any]:
+        if self.recv_from_ft_control is None:
+            return []
+        recv_reqs = []
+        while True:
+            try:
+                recv_reqs.append(self.recv_from_ft_control.recv_pyobj(zmq.NOBLOCK))
+            except zmq.ZMQError:
+                break
+        return recv_reqs
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -1562,7 +1613,11 @@ class Scheduler(
                 self._engine_paused = True
 
     def _ft_rank(self) -> int:
-        return self.dp_rank if self.dp_rank is not None else 0
+        return scheduler_ft_rank(
+            enable_dp_attention=self.server_args.enable_dp_attention,
+            tp_rank=self.tp_rank,
+            dp_rank=self.dp_rank,
+        )
 
     def _ft_discard_current_batch(self, exc: Exception) -> bool:
         batch = self.cur_batch
@@ -1737,6 +1792,10 @@ class Scheduler(
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
 
+        ft_control_reqs = self._recv_ft_control_reqs()
+        if ft_control_reqs:
+            return ft_control_reqs
+
         if self.recv_skipper is not None:
             last_forward_mode = (
                 self.last_batch.forward_mode if self.last_batch is not None else None
@@ -1842,6 +1901,10 @@ class Scheduler(
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
             )
+
+        ft_control_reqs = self._recv_ft_control_reqs()
+        if ft_control_reqs:
+            recv_reqs = (recv_reqs or []) + ft_control_reqs
 
         # Process MM requests under EPD-disaggregation mode
         if (
@@ -3864,6 +3927,12 @@ class Scheduler(
             self.cur_batch = None
 
     def handle_active_ranks_update(self, recv_req: ActiveRanksOutput) -> None:
+        if not is_ep_rank_space(recv_req.rank_space):
+            logger.debug(
+                "Ignoring non-EP active-ranks update in scheduler: rank_space=%s",
+                recv_req.rank_space,
+            )
+            return
         from sglang.srt.elastic_ep.elastic_ep import apply_active_rank_mask
 
         apply_active_rank_mask(recv_req.status)

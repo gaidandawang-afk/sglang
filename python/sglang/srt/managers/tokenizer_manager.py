@@ -51,6 +51,9 @@ from sglang.srt.fault_tolerance.controller import (
     ft_error_status,
     ft_failure,
 )
+from sglang.srt.fault_tolerance.commands import PendingFTCommand
+from sglang.srt.fault_tolerance.rank_space import FT_RANK_SPACE_DP_ROUTE
+from sglang.srt.fault_tolerance.topology import resolve_ft_rank_topology
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -70,6 +73,7 @@ from sglang.srt.managers.io_struct import (
     FaultToleranceCommandReqInput,
     FaultToleranceCommandReqOutput,
     FaultToleranceRankFaultOutput,
+    FaultToleranceRankRejoinOutput,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -205,20 +209,6 @@ class ReqState:
     output_top_logprobs: List[Any] = dataclasses.field(default_factory=list)
     input_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
     output_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
-
-
-@dataclasses.dataclass
-class PendingFTCommand:
-    target_ranks: set[int]
-    future: asyncio.Future
-    acked: set[int] = dataclasses.field(default_factory=set)
-    failed: Dict[int, str] = dataclasses.field(default_factory=dict)
-
-    def finish_if_ready(self):
-        if self.future.done():
-            return
-        if self.acked.union(self.failed) >= self.target_ranks:
-            self.future.set_result(None)
 
 
 def _slice_streaming_output_meta_info(
@@ -415,11 +405,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._ft_last_dispatched_active_mask: Optional[List[bool]] = None
         if not self.server_args.enable_fault_tolerance:
             return
+        ft_rank_topology = resolve_ft_rank_topology(
+            dp_size=self.server_args.dp_size,
+            tp_size=self.server_args.tp_size,
+            attn_cp_size=self.server_args.attn_cp_size,
+            enable_dp_attention=self.server_args.enable_dp_attention,
+        )
         self.fault_tolerance = FaultToleranceManager(
             dp_size=self.server_args.dp_size,
             strategy=self.server_args.fault_tolerance_on_error_strategy,
+            global_rank_count=ft_rank_topology.global_rank_count,
+            attention_tp_size=ft_rank_topology.attention_tp_size,
         )
-        self._ft_last_dispatched_active_mask = [True] * self.server_args.dp_size
+        self._ft_last_dispatched_active_mask = [True] * ft_global_rank_count
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
@@ -552,6 +550,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ActiveRanksUpdateReqOutput, self._handle_active_ranks_update_output),
                 (FaultToleranceCommandReqOutput, self._handle_ft_command_output),
                 (FaultToleranceRankFaultOutput, self._handle_ft_rank_fault),
+                (FaultToleranceRankRejoinOutput, self._handle_ft_rank_rejoin),
             ]
         )
         self.init_communicators(self.server_args)
@@ -1602,6 +1601,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ranks = [int(rank) for rank in ranks]
             except (TypeError, ValueError):
                 return 400, ft_failure("unknown_rank")
+            scale_down_shutdown = params.get("shutdown", None)
+            if scale_down_shutdown is not None and not isinstance(
+                scale_down_shutdown, bool
+            ):
+                return 400, ft_failure("invalid_scale_down_shutdown")
         elif instruction == "retry":
             if params:
                 return 400, ft_failure("retry_does_not_accept_params")
@@ -1612,20 +1616,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return ft_error_status(error), ft_failure(error)
 
         live_scale_down_targets = []
-        if instruction == "scale_down":
-            live_scale_down_targets = [
-                rank
-                for rank in ranks or []
-                if self.fault_tolerance.rank_states[rank] != RankState.DEAD
-            ]
-        active_mask, resume_targets, pending_scale_down_ranks = (
-            self.fault_tolerance.begin_recover(
-                instruction, ranks
-            )
-        )
         shutdown_live_targets = (
             instruction == "scale_down"
-            and envs.SGLANG_FT_SCALE_DOWN_SHUTDOWN_LIVE_RANK.get()
+            and (
+                params.get("shutdown")
+                if params.get("shutdown") is not None
+                else envs.SGLANG_FT_SCALE_DOWN_SHUTDOWN_LIVE_RANK.get()
+            )
+        )
+        if instruction == "scale_down":
+            live_scale_down_targets = (
+                self.fault_tolerance.live_global_ranks_for_dp_ranks(ranks or [])
+            )
+        ep_active_mask, dp_route_mask, resume_targets, pending_scale_down_ranks = (
+            self.fault_tolerance.begin_recover(
+                instruction,
+                ranks,
+                shutdown_scale_down_ranks=shutdown_live_targets,
+            )
         )
         if shutdown_live_targets:
             resume_targets = sorted(
@@ -1634,11 +1642,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             resume_targets = sorted(set(resume_targets + live_scale_down_targets))
         logger.info(
-            "Fault tolerance apply plan: instruction=%s active_mask=%s "
+            "Fault tolerance apply plan: instruction=%s ep_active_mask=%s "
+            "dp_route_mask=%s "
             "resume_targets=%s pending_scale_down=%s shutdown_live_targets=%s "
             "live_scale_down_targets=%s",
             instruction,
-            active_mask,
+            ep_active_mask,
+            dp_route_mask,
             resume_targets,
             pending_scale_down_ranks,
             shutdown_live_targets,
@@ -1646,7 +1656,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
         try:
             await self._ft_apply_active_mask(
-                active_mask,
+                ep_active_mask,
                 timeout,
                 update_routing=False,
             )
@@ -1663,7 +1673,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 timeout_sec=timeout,
             )
             self._ft_parked_scheduler_ranks.clear()
-            await self._ft_publish_active_ranks(active_mask, timeout)
+            await self._ft_publish_active_ranks(dp_route_mask, timeout)
             if shutdown_live_targets and live_scale_down_targets:
                 await self._ft_send_command_collect(
                     command="shutdown",
@@ -1674,7 +1684,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             logger.exception("Fault tolerance apply failed; exiting: %s", exc)
             os._exit(1)
 
-        response = self.fault_tolerance.commit_recover(pending_scale_down_ranks)
+        response = self.fault_tolerance.commit_recover(
+            pending_scale_down_ranks,
+            shutdown_scale_down_ranks=shutdown_live_targets,
+        )
+        if instruction == "scale_down":
+            response["scale_down_shutdown"] = shutdown_live_targets
         logger.info(
             "Fault tolerance apply committed: instruction=%s pending_scale_down=%s",
             instruction,
@@ -2739,6 +2754,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if event.fault_type == "kill":
             self._ft_create_task(self._ft_handle_kill(event))
 
+    def _handle_ft_rank_rejoin(self, event: FaultToleranceRankRejoinOutput):
+        if self.fault_tolerance is None:
+            return
+        logger.info(
+            "FT rejoin registration observed: rank=%s pid=%s message=%s",
+            event.rank,
+            event.pid,
+            event.message,
+        )
+        self.send_to_scheduler.send_pyobj(event)
+
     def handle_ft_process_exit(self, rank: int, proc, name: str = "") -> bool:
         if self.fault_tolerance is None or self.event_loop is None:
             return False
@@ -2780,7 +2806,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             await self._ft_apply_current_active_mask()
         else:
             self.send_to_scheduler.send_pyobj(
-                ActiveRanksOutput(status=self.fault_tolerance.active_mask())
+                ActiveRanksOutput(status=self.fault_tolerance.dp_active_mask())
             )
 
     async def _ft_pause_after_inactive(self, targets: List[int]):
@@ -2802,8 +2828,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self.fault_tolerance is None:
             return
         await self._ft_apply_active_mask(
-            self.fault_tolerance.active_mask(),
+            self.fault_tolerance.ep_active_mask(),
             self.server_args.fault_tolerance_timeout,
+            route_active_mask=self.fault_tolerance.dp_active_mask(),
         )
 
     async def _ft_apply_active_mask(
@@ -2811,11 +2838,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         active_mask: List[bool],
         timeout: int,
         update_routing: bool = True,
+        route_active_mask: Optional[List[bool]] = None,
     ):
         if self.fault_tolerance is None:
             return
         if not any(active_mask):
             raise RuntimeError("fault tolerance active mask has no live rank")
+        if route_active_mask is None:
+            route_active_mask = self.fault_tolerance.dp_active_mask()
         previous_mask = self._ft_last_dispatched_active_mask
         if previous_mask is None or list(active_mask) != previous_mask:
             await self._ft_park_schedulers_for_topology_change(
@@ -2829,13 +2859,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
         self._ft_last_dispatched_active_mask = list(active_mask)
         if update_routing:
-            await self._ft_publish_active_ranks(active_mask, timeout)
+            await self._ft_publish_active_ranks(route_active_mask, timeout)
 
     async def _ft_publish_active_ranks(
         self, active_mask: List[bool], timeout_sec: int
     ) -> None:
         if self.server_args.dp_size <= 1:
-            self.send_to_scheduler.send_pyobj(ActiveRanksOutput(status=active_mask))
+            self.send_to_scheduler.send_pyobj(
+                ActiveRanksOutput(status=active_mask, rank_space=FT_RANK_SPACE_DP_ROUTE)
+            )
             return
 
         request_id = uuid.uuid4().hex
@@ -2843,7 +2875,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._ft_pending_active_rank_updates[request_id] = future
         try:
             await self.send_to_scheduler.send_pyobj(
-                ActiveRanksOutput(status=active_mask, request_id=request_id)
+                ActiveRanksOutput(
+                    status=active_mask,
+                    request_id=request_id,
+                    rank_space=FT_RANK_SPACE_DP_ROUTE,
+                )
             )
             await asyncio.wait_for(future, timeout=timeout_sec)
         except asyncio.TimeoutError as exc:

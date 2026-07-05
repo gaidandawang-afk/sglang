@@ -167,6 +167,9 @@ class RayDataParallelController(DataParallelController):
                             port_args.detokenizer_ipc_name
                         )
                         rank_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
+                        rank_port_args.ft_control_ipc_names = (
+                            port_args.ft_control_ipc_names
+                        )
 
                     local_gpu_idx = (pp_rank % pp_per_node) * tp_per_node + (
                         tp_rank % tp_per_node
