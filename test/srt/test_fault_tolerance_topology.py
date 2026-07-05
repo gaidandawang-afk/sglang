@@ -11,6 +11,14 @@ _TOPOLOGY_PATH = (
     / "fault_tolerance"
     / "topology.py"
 )
+_TOKENIZER_MANAGER_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "python"
+    / "sglang"
+    / "srt"
+    / "managers"
+    / "tokenizer_manager.py"
+)
 _SPEC = importlib.util.spec_from_file_location("ft_topology", _TOPOLOGY_PATH)
 _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
@@ -75,3 +83,10 @@ def test_scheduler_ft_rank_falls_back_to_tp_rank_without_dp_rank():
         tp_rank=0,
         dp_rank=None,
     ) == 0
+
+
+def test_tokenizer_manager_ft_mask_uses_resolved_topology_size():
+    source = _TOKENIZER_MANAGER_PATH.read_text(encoding="utf-8")
+
+    assert "ft_global_rank_count" not in source
+    assert "ft_rank_topology.global_rank_count" in source

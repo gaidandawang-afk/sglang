@@ -417,7 +417,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             global_rank_count=ft_rank_topology.global_rank_count,
             attention_tp_size=ft_rank_topology.attention_tp_size,
         )
-        self._ft_last_dispatched_active_mask = [True] * ft_global_rank_count
+        self._ft_last_dispatched_active_mask = [
+            True
+        ] * ft_rank_topology.global_rank_count
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
