@@ -219,6 +219,8 @@ class FaultToleranceManager:
         for rank, is_active in enumerate(new_mask[: self.dp_size]):
             if not is_active and self.rank_states[rank] != RankState.DEAD:
                 self._dp_route_forced_inactive.add(rank)
+                for global_rank in self.dp_members[rank]:
+                    self.physical_rank_states[global_rank] = RankState.DEAD
                 newly_inactive.append(rank)
             elif is_active:
                 self._dp_route_forced_inactive.discard(rank)

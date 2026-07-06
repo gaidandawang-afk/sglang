@@ -119,6 +119,16 @@ def test_active_mask_recovers_dead_rank_without_resuming_paused_rank():
     ]
 
 
+def test_inactive_mask_excludes_newly_inactive_rank_from_pause_targets():
+    manager = make_manager()
+
+    targets = manager.record_inactive_mask([True, True, True, False])
+
+    assert targets == [0, 1, 2]
+    assert manager.physical_rank_states[3] == RankState.DEAD
+    assert manager.rank_states[3] == RankState.DEAD
+
+
 def test_tpgt1_kill_uses_global_rank_and_separate_ep_dp_masks():
     manager = FaultToleranceManager(
         dp_size=2,

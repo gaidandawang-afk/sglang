@@ -241,10 +241,19 @@ class DataParallelController:
         if not (server_args.enable_fault_tolerance and server_args.enable_dp_attention):
             return
         if port_args.ft_control_ipc_names is None:
-            port_args.ft_control_ipc_names = [
-                f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-                for _ in range(server_args.tp_size)
-            ]
+            if port_args.scheduler_input_ipc_name.startswith("tcp://"):
+                na = NetworkAddress.parse(port_args.scheduler_input_ipc_name)
+                port_args.ft_control_ipc_names = [
+                    NetworkAddress(na.host, na.port + 1 + rank).to_tcp()
+                    for rank in range(server_args.tp_size)
+                ]
+            else:
+                port_args.ft_control_ipc_names = [
+                    f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+                    for _ in range(server_args.tp_size)
+                ]
+        if server_args.node_rank != 0:
+            return
         self.ft_control_workers = [
             get_zmq_socket(self.context, zmq.PUSH, endpoint, True)
             for endpoint in port_args.ft_control_ipc_names
@@ -301,22 +310,11 @@ class DataParallelController:
         if not self.ft_control_workers:
             return False
         for rank in obj.target_ranks:
-            if not (
-                0 <= rank < len(self.ft_control_workers)
-                and rank < len(self.scheduler_procs)
-            ):
+            if not (0 <= rank < len(self.ft_control_workers)):
                 self._send_ft_command_failure(
                     obj.request_id,
                     rank,
                     "unknown rank",
-                )
-                continue
-            proc = self.scheduler_procs[rank]
-            if not self.scheduler_process_registry.is_rank_alive(rank, proc):
-                self._send_ft_command_failure(
-                    obj.request_id,
-                    rank,
-                    "ft_target_rank_unreachable",
                 )
                 continue
             logger.info(
