@@ -1664,7 +1664,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 update_routing=False,
             )
             resume_targets = sorted(
-                set(resume_targets) | set(self._ft_parked_scheduler_ranks)
+                (
+                    set(resume_targets) | set(self._ft_parked_scheduler_ranks)
+                ).intersection(self.fault_tolerance.live_ranks())
             )
             if shutdown_live_targets:
                 resume_targets = sorted(
