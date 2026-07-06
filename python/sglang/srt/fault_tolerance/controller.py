@@ -50,7 +50,7 @@ class FaultToleranceManager:
         dp_size: int,
         strategy: str,
         global_rank_count: Optional[int] = None,
-        attention_tp_size: int = 1,
+        ranks_per_dp: int = 1,
     ):
         self.dp_size = dp_size
         self.strategy = strategy
@@ -60,17 +60,19 @@ class FaultToleranceManager:
             global_rank_count = dp_size
         if global_rank_count <= 0:
             raise ValueError("global_rank_count must be positive")
-        if attention_tp_size <= 0:
-            raise ValueError("attention_tp_size must be positive")
+        if ranks_per_dp <= 0:
+            raise ValueError("ranks_per_dp must be positive")
         if global_rank_count < dp_size:
             raise ValueError("global_rank_count must be >= dp_size")
+        if global_rank_count != dp_size * ranks_per_dp:
+            raise ValueError("global_rank_count must equal dp_size * ranks_per_dp")
 
         self.global_rank_count = global_rank_count
-        self.attention_tp_size = attention_tp_size
+        self.ranks_per_dp = ranks_per_dp
         self.dp_members: List[List[int]] = [[] for _ in range(dp_size)]
         self.global_rank_to_dp_rank: List[int] = [0] * global_rank_count
         for global_rank in range(global_rank_count):
-            dp_rank = min(global_rank // attention_tp_size, dp_size - 1)
+            dp_rank = global_rank // ranks_per_dp
             self.global_rank_to_dp_rank[global_rank] = dp_rank
             self.dp_members[dp_rank].append(global_rank)
         if any(not members for members in self.dp_members):
@@ -202,7 +204,10 @@ class FaultToleranceManager:
         self._refresh_dp_rank_states()
 
         if self.strategy == "pause":
-            return self.healthy_ranks()
+            targets = self.healthy_ranks()
+            if not targets:
+                self.ft_operation_in_progress = False
+            return targets
 
         self.ft_operation_in_progress = False
         return []
@@ -215,8 +220,7 @@ class FaultToleranceManager:
                 newly_inactive.append(rank)
             elif is_active:
                 self._dp_route_forced_inactive.discard(rank)
-                if len(self.dp_members[rank]) == 1:
-                    global_rank = self.dp_members[rank][0]
+                for global_rank in self.dp_members[rank]:
                     if self.physical_rank_states[global_rank] == RankState.DEAD:
                         self.physical_rank_states[global_rank] = RankState.HEALTHY
         self._refresh_dp_rank_states()

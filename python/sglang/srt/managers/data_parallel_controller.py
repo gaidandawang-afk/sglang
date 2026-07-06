@@ -438,12 +438,14 @@ class DataParallelController:
             return True
         dp_rank = self._dp_rank_for_scheduler_index(index)
         if dp_rank is not None:
-            if not self.status[dp_rank]:
-                return True
+            route_was_active = self.status[dp_rank]
             self.status[dp_rank] = False
             if not self.server_args.enable_fault_tolerance:
-                self._send_active_ranks_to_live_workers()
+                if route_was_active:
+                    self._send_active_ranks_to_live_workers()
                 return True
+        if not self.scheduler_process_registry.mark_process_exit_reported(index):
+            return True
         self.send_to_tokenizer.send_pyobj(
             FaultToleranceRankFaultOutput(
                 rank=index,
@@ -524,17 +526,35 @@ class DataParallelController:
             dp_rank = self._dp_rank_for_scheduler_index(rank)
             if dp_rank is None:
                 continue
-            if self.status[dp_rank] and not (
-                self.scheduler_process_registry.is_rank_alive(rank, proc)
-            ):
+            if self.scheduler_process_registry.is_rank_alive(rank, proc):
+                continue
+            route_changed = False
+            if self.status[dp_rank]:
                 self.status[dp_rank] = False
                 changed = True
+                route_changed = True
+            new_fault = (
+                self.server_args.enable_fault_tolerance
+                and self.send_to_tokenizer is not None
+                and self.scheduler_process_registry.mark_process_exit_reported(rank)
+            )
+            if route_changed or new_fault:
                 logger.warning(
                     "Mark DP rank %s inactive because scheduler process rank=%s "
                     "pid=%s exited",
                     dp_rank,
                     rank,
                     proc.pid,
+                )
+            if new_fault:
+                self.send_to_tokenizer.send_pyobj(
+                    FaultToleranceRankFaultOutput(
+                        rank=rank,
+                        fault_type="kill",
+                        message=(
+                            f"scheduler rank={rank} pid={proc.pid} is not alive"
+                        ),
+                    )
                 )
 
         if changed and not self.server_args.enable_fault_tolerance:

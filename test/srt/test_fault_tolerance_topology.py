@@ -38,12 +38,12 @@ def test_dp_attention_topology_uses_global_rank_space():
     )
 
     assert topology.global_rank_count == 4
-    assert topology.attention_tp_size == 2
+    assert topology.ranks_per_dp == 2
     assert [
         dp_rank_for_global_rank(
             rank,
             dp_size=2,
-            attention_tp_size=topology.attention_tp_size,
+            ranks_per_dp=topology.ranks_per_dp,
         )
         for rank in range(topology.global_rank_count)
     ] == [0, 0, 1, 1]
@@ -58,7 +58,27 @@ def test_non_dp_attention_topology_keeps_dp_rank_space():
     )
 
     assert topology.global_rank_count == 2
-    assert topology.attention_tp_size == 1
+    assert topology.ranks_per_dp == 1
+
+
+def test_dp_attention_cp_topology_maps_all_cp_members_to_the_same_dp():
+    topology = resolve_ft_rank_topology(
+        dp_size=2,
+        tp_size=8,
+        attn_cp_size=2,
+        enable_dp_attention=True,
+    )
+
+    assert topology.global_rank_count == 8
+    assert topology.ranks_per_dp == 4
+    assert [
+        dp_rank_for_global_rank(
+            rank,
+            dp_size=2,
+            ranks_per_dp=topology.ranks_per_dp,
+        )
+        for rank in range(topology.global_rank_count)
+    ] == [0, 0, 0, 0, 1, 1, 1, 1]
 
 
 def test_scheduler_ft_rank_uses_global_rank_under_dp_attention():

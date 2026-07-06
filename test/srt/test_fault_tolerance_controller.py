@@ -124,7 +124,7 @@ def test_tpgt1_kill_uses_global_rank_and_separate_ep_dp_masks():
         dp_size=2,
         strategy="pause",
         global_rank_count=4,
-        attention_tp_size=2,
+        ranks_per_dp=2,
     )
 
     assert manager.dp_members == [[0, 1], [2, 3]]
@@ -144,7 +144,7 @@ def test_tpgt1_scale_down_non_shutdown_preserves_healthy_sibling_expert():
         dp_size=2,
         strategy="pause",
         global_rank_count=4,
-        attention_tp_size=2,
+        ranks_per_dp=2,
     )
     manager.record_kill(2)
     manager.finish_pause_collection(acked={0, 1, 3}, timed_out=set())
@@ -167,7 +167,7 @@ def test_tpgt1_scale_down_live_targets_expand_dp_to_surviving_global_ranks():
         dp_size=2,
         strategy="pause",
         global_rank_count=4,
-        attention_tp_size=2,
+        ranks_per_dp=2,
     )
     manager.record_kill(2)
 
@@ -180,7 +180,7 @@ def test_tpgt1_scale_down_commit_defaults_to_non_shutdown():
         dp_size=2,
         strategy="pause",
         global_rank_count=4,
-        attention_tp_size=2,
+        ranks_per_dp=2,
     )
     manager.record_kill(2)
     manager.finish_pause_collection(acked={0, 1, 3}, timed_out=set())
@@ -198,7 +198,7 @@ def test_tpgt1_scale_down_shutdown_expands_dp_to_all_global_ranks():
         dp_size=2,
         strategy="pause",
         global_rank_count=4,
-        attention_tp_size=2,
+        ranks_per_dp=2,
     )
     manager.begin_exception_pause()
     manager.finish_pause_collection(acked={0, 1, 2, 3}, timed_out=set())
@@ -215,6 +215,37 @@ def test_tpgt1_scale_down_shutdown_expands_dp_to_all_global_ranks():
     manager.commit_recover(pending, shutdown_scale_down_ranks=True)
     assert manager.physical_rank_states[2] == RankState.DEAD
     assert manager.physical_rank_states[3] == RankState.DEAD
+
+
+def test_tpgt1_active_dp_mask_restores_rejoined_physical_members():
+    manager = FaultToleranceManager(
+        dp_size=2,
+        strategy="continue",
+        global_rank_count=4,
+        ranks_per_dp=2,
+    )
+    manager.record_kill(2)
+
+    manager.record_inactive_mask([True, True])
+
+    assert manager.physical_rank_states == [
+        RankState.HEALTHY,
+        RankState.HEALTHY,
+        RankState.HEALTHY,
+        RankState.HEALTHY,
+    ]
+    assert manager.rank_states == [RankState.HEALTHY, RankState.HEALTHY]
+    assert manager.dp_active_mask() == [True, True]
+
+
+def test_kill_while_other_ranks_are_paused_does_not_leave_operation_stuck():
+    manager = FaultToleranceManager(dp_size=3, strategy="pause")
+    manager.record_kill(2)
+    manager.finish_pause_collection(acked={0, 1}, timed_out=set())
+
+    assert manager.record_kill(1) == []
+    assert not manager.ft_operation_in_progress
+    assert manager.live_ranks() == [0]
 
 
 def test_fault_tolerance_rejects_multinode_even_with_mooncake():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from typing import List, Optional
 
 from sglang.srt.fault_tolerance.topology import (
@@ -36,16 +37,19 @@ class SchedulerProcessRegistry:
             enable_dp_attention=enable_dp_attention,
         )
         self.pids: List[Optional[int]] = []
+        self.reported_exit_ranks: set[int] = set()
+        self._lock = threading.Lock()
 
     def append_process(self, proc) -> None:
-        self.pids.append(getattr(proc, "pid", None))
+        with self._lock:
+            self.pids.append(getattr(proc, "pid", None))
 
     def dp_rank_for_scheduler_index(self, scheduler_index: int) -> Optional[int]:
         if self.enable_dp_attention:
             return dp_rank_for_global_rank(
                 scheduler_index,
                 dp_size=self.dp_size,
-                attention_tp_size=self.rank_topology.attention_tp_size,
+                ranks_per_dp=self.rank_topology.ranks_per_dp,
             )
         if self.tp_size == 1 and 0 <= scheduler_index < self.dp_size:
             return scheduler_index
@@ -55,9 +59,18 @@ class SchedulerProcessRegistry:
         return None
 
     def register_rejoin(self, rank: int, pid: int) -> Optional[int]:
-        old_pid = self.pids[rank]
-        self.pids[rank] = pid
-        return old_pid
+        with self._lock:
+            old_pid = self.pids[rank]
+            self.pids[rank] = pid
+            self.reported_exit_ranks.discard(rank)
+            return old_pid
+
+    def mark_process_exit_reported(self, rank: int) -> bool:
+        with self._lock:
+            if rank in self.reported_exit_ranks:
+                return False
+            self.reported_exit_ranks.add(rank)
+            return True
 
     def _is_pid_alive(self, pid: int) -> bool:
         import psutil
@@ -69,9 +82,10 @@ class SchedulerProcessRegistry:
             return False
 
     def replacement_pid(self, rank: int, proc) -> Optional[int]:
-        if not (0 <= rank < len(self.pids)):
-            return None
-        pid = self.pids[rank]
+        with self._lock:
+            if not (0 <= rank < len(self.pids)):
+                return None
+            pid = self.pids[rank]
         if pid is not None and pid != getattr(proc, "pid", None):
             return pid
         return None
@@ -119,7 +133,7 @@ class SchedulerProcessRegistry:
         if not (0 <= control_rank < worker_count):
             return False
         if self.enable_dp_attention and control_message_step == 1:
-            leader_rank = control_rank * self.rank_topology.attention_tp_size
+            leader_rank = control_rank * self.rank_topology.ranks_per_dp
             if not (0 <= leader_rank < len(processes)):
                 return False
             return self.is_rank_alive(leader_rank, processes[leader_rank])

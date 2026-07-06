@@ -113,6 +113,26 @@ def test_tpgt1_dp_attention_maps_global_rank_to_dp_rank():
     assert registry.dp_rank_for_scheduler_index(3) == 1
 
 
+def test_dp_attention_cp_maps_all_cp_members_to_the_same_dp():
+    registry = SchedulerProcessRegistry(
+        dp_size=2,
+        tp_size=8,
+        attn_cp_size=2,
+        enable_dp_attention=True,
+    )
+
+    assert [registry.dp_rank_for_scheduler_index(rank) for rank in range(8)] == [
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+    ]
+
+
 def test_dead_replacement_pid_marks_rank_inactive(monkeypatch):
     registry = SchedulerProcessRegistry(dp_size=1, tp_size=1)
     original = FakeProcess(pid=100, alive=False)
@@ -122,6 +142,49 @@ def test_dead_replacement_pid_marks_rank_inactive(monkeypatch):
 
     assert not registry.is_rank_alive(0, original)
     assert not registry.should_ignore_process_exit(0, original)
+
+
+def test_exit_reports_are_deduplicated_per_physical_rank_and_reset_on_rejoin():
+    registry = SchedulerProcessRegistry(
+        dp_size=2,
+        tp_size=4,
+        enable_dp_attention=True,
+    )
+    for rank in range(4):
+        registry.append_process(FakeProcess(pid=100 + rank, alive=True))
+
+    assert registry.mark_process_exit_reported(2)
+    assert not registry.mark_process_exit_reported(2)
+    assert registry.mark_process_exit_reported(3)
+
+    registry.register_rejoin(rank=2, pid=202)
+    assert registry.mark_process_exit_reported(2)
+
+
+def test_dp_attention_cp_local_control_uses_dp_group_leader():
+    registry = SchedulerProcessRegistry(
+        dp_size=2,
+        tp_size=8,
+        attn_cp_size=2,
+        enable_dp_attention=True,
+    )
+    processes = [FakeProcess(pid=100 + rank, alive=True) for rank in range(8)]
+
+    assert registry.is_ft_control_rank_reachable(
+        1,
+        control_message_step=1,
+        worker_count=2,
+        status=[True, True],
+        processes=processes,
+    )
+    processes[4]._alive = False
+    assert not registry.is_ft_control_rank_reachable(
+        1,
+        control_message_step=1,
+        worker_count=2,
+        status=[True, True],
+        processes=processes,
+    )
 
 
 def test_dp_attention_local_control_ignores_dp_route_status_if_leader_alive():

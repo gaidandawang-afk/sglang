@@ -6,7 +6,7 @@ import dataclasses
 @dataclasses.dataclass(frozen=True)
 class FTRankTopology:
     global_rank_count: int
-    attention_tp_size: int
+    ranks_per_dp: int
 
 
 def resolve_ft_rank_topology(
@@ -24,19 +24,24 @@ def resolve_ft_rank_topology(
         raise ValueError("attn_cp_size must be positive")
 
     if enable_dp_attention:
+        if tp_size % dp_size != 0:
+            raise ValueError("tp_size must be divisible by dp_size")
+        ranks_per_dp = tp_size // dp_size
+        if ranks_per_dp % attn_cp_size != 0:
+            raise ValueError("ranks_per_dp must be divisible by attn_cp_size")
         return FTRankTopology(
             global_rank_count=tp_size,
-            attention_tp_size=max(1, tp_size // dp_size // attn_cp_size),
+            ranks_per_dp=ranks_per_dp,
         )
-    return FTRankTopology(global_rank_count=dp_size, attention_tp_size=1)
+    return FTRankTopology(global_rank_count=dp_size, ranks_per_dp=1)
 
 
 def dp_rank_for_global_rank(
-    global_rank: int, *, dp_size: int, attention_tp_size: int
+    global_rank: int, *, dp_size: int, ranks_per_dp: int
 ) -> int | None:
-    if global_rank < 0 or attention_tp_size <= 0:
+    if global_rank < 0 or ranks_per_dp <= 0:
         return None
-    dp_rank = global_rank // attention_tp_size
+    dp_rank = global_rank // ranks_per_dp
     if 0 <= dp_rank < dp_size:
         return dp_rank
     return None

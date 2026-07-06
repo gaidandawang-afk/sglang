@@ -402,6 +402,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._ft_pending_active_rank_updates: Dict[str, asyncio.Future] = {}
         self._ft_parked_scheduler_ranks: List[int] = []
         self._ft_scheduler_park_lock = asyncio.Lock()
+        self._ft_kill_lock = asyncio.Lock()
         self._ft_last_dispatched_active_mask: Optional[List[bool]] = None
         if not self.server_args.enable_fault_tolerance:
             return
@@ -415,7 +416,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             dp_size=self.server_args.dp_size,
             strategy=self.server_args.fault_tolerance_on_error_strategy,
             global_rank_count=ft_rank_topology.global_rank_count,
-            attention_tp_size=ft_rank_topology.attention_tp_size,
+            ranks_per_dp=ft_rank_topology.ranks_per_dp,
         )
         self._ft_last_dispatched_active_mask = [
             True
@@ -2802,14 +2803,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _ft_handle_kill(self, event: FaultToleranceRankFaultOutput):
         if self.fault_tolerance is None:
             return
-        targets = self.fault_tolerance.record_kill(event.rank)
-        if targets:
-            await self._ft_pause_schedulers(targets)
-            await self._ft_apply_current_active_mask()
-        else:
-            self.send_to_scheduler.send_pyobj(
-                ActiveRanksOutput(status=self.fault_tolerance.dp_active_mask())
-            )
+        async with self._ft_kill_lock:
+            if not (0 <= event.rank < self.fault_tolerance.global_rank_count):
+                logger.warning(
+                    "Ignoring FT kill for unknown global rank %s", event.rank
+                )
+                return
+            if (
+                self.fault_tolerance.physical_rank_states[event.rank]
+                == RankState.DEAD
+            ):
+                logger.info(
+                    "Ignoring duplicate FT kill for global rank %s", event.rank
+                )
+                return
+            targets = self.fault_tolerance.record_kill(event.rank)
+            if targets:
+                await self._ft_pause_schedulers(targets)
+                await self._ft_apply_current_active_mask()
+            elif self.fault_tolerance.strategy == "pause":
+                await self._ft_apply_current_active_mask()
+            else:
+                self.send_to_scheduler.send_pyobj(
+                    ActiveRanksOutput(status=self.fault_tolerance.dp_active_mask())
+                )
 
     async def _ft_pause_after_inactive(self, targets: List[int]):
         if self.fault_tolerance is None:
