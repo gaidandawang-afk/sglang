@@ -112,7 +112,7 @@ def test_active_mask_recovers_dead_rank_without_resuming_paused_rank():
     ]
 
 
-def test_fault_tolerance_rejects_multinode_even_with_mooncake():
+def test_fault_tolerance_allows_multinode_without_ft_level_node_gate():
     supported, reason = is_ft_supported_config(
         SimpleNamespace(
             pp_size=1,
@@ -125,5 +125,5 @@ def test_fault_tolerance_rejects_multinode_even_with_mooncake():
         )
     )
 
-    assert not supported
-    assert reason == "ft_requires_single_node"
+    assert supported
+    assert reason == ""
