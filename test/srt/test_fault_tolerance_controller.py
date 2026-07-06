@@ -258,7 +258,7 @@ def test_kill_while_other_ranks_are_paused_does_not_leave_operation_stuck():
     assert manager.live_ranks() == [0]
 
 
-def test_fault_tolerance_rejects_multinode_without_dp_attention():
+def test_fault_tolerance_allows_multinode_without_ft_level_node_gate():
     supported, reason = is_ft_supported_config(
         SimpleNamespace(
             pp_size=1,
@@ -272,8 +272,8 @@ def test_fault_tolerance_rejects_multinode_without_dp_attention():
         )
     )
 
-    assert not supported
-    assert reason == "ft_requires_dp_attention_for_multinode"
+    assert supported
+    assert reason == ""
 
 
 def test_fault_tolerance_allows_multinode_dp_attention_with_mooncake():
