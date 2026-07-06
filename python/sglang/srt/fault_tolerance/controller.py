@@ -28,8 +28,10 @@ def is_mooncake_active_rank_backend(server_args) -> bool:
 def is_ft_supported_config(server_args) -> Tuple[bool, str]:
     if getattr(server_args, "pp_size", 1) != 1:
         return False, "ft_requires_pp1"
-    if getattr(server_args, "nnodes", 1) != 1:
-        return False, "ft_requires_single_node"
+    if getattr(server_args, "nnodes", 1) != 1 and not getattr(
+        server_args, "enable_dp_attention", False
+    ):
+        return False, "ft_requires_dp_attention_for_multinode"
     if not is_mooncake_active_rank_backend(server_args):
         return False, "ft_requires_mooncake_active_rank_backend"
     if getattr(server_args, "disaggregation_mode", "null") != "null":

@@ -248,11 +248,12 @@ def test_kill_while_other_ranks_are_paused_does_not_leave_operation_stuck():
     assert manager.live_ranks() == [0]
 
 
-def test_fault_tolerance_rejects_multinode_even_with_mooncake():
+def test_fault_tolerance_rejects_multinode_without_dp_attention():
     supported, reason = is_ft_supported_config(
         SimpleNamespace(
             pp_size=1,
             nnodes=4,
+            enable_dp_attention=False,
             elastic_ep_backend="mooncake",
             disaggregation_mode="null",
             device="cuda",
@@ -262,4 +263,22 @@ def test_fault_tolerance_rejects_multinode_even_with_mooncake():
     )
 
     assert not supported
-    assert reason == "ft_requires_single_node"
+    assert reason == "ft_requires_dp_attention_for_multinode"
+
+
+def test_fault_tolerance_allows_multinode_dp_attention_with_mooncake():
+    supported, reason = is_ft_supported_config(
+        SimpleNamespace(
+            pp_size=1,
+            nnodes=4,
+            enable_dp_attention=True,
+            elastic_ep_backend="mooncake",
+            disaggregation_mode="null",
+            device="cuda",
+            tokenizer_worker_num=1,
+            use_ray=False,
+        )
+    )
+
+    assert supported
+    assert reason == ""
