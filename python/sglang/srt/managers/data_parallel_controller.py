@@ -242,7 +242,10 @@ class DataParallelController:
             return
         if port_args.ft_control_ipc_names is None:
             if port_args.scheduler_input_ipc_name.startswith("tcp://"):
-                na = NetworkAddress.parse(port_args.scheduler_input_ipc_name)
+                scheduler_input_addr = port_args.scheduler_input_ipc_name[
+                    len("tcp://") :
+                ]
+                na = NetworkAddress.parse(scheduler_input_addr)
                 port_args.ft_control_ipc_names = [
                     NetworkAddress(na.host, na.port + 1 + rank).to_tcp()
                     for rank in range(server_args.tp_size)
