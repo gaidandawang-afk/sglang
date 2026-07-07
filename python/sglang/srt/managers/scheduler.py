@@ -3805,12 +3805,6 @@ class Scheduler(
             return None
 
         try:
-            logger.info(
-                "Scheduler received FT command: id=%s command=%s rank=%s",
-                recv_req.request_id,
-                recv_req.command,
-                rank,
-            )
             if recv_req.command == "pause":
                 self._engine_paused = True
                 message = "paused"

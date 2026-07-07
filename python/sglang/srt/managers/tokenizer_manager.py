@@ -584,9 +584,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.fault_tolerance is not None
                 and not self.fault_tolerance.is_rank_healthy(obj.routed_dp_rank)
             ):
-                raise ValueError(
-                    f"routed_dp_rank={obj.routed_dp_rank} is not healthy"
-                )
+                raise ValueError(f"routed_dp_rank={obj.routed_dp_rank} is not healthy")
 
         if (
             self.fault_tolerance is not None
@@ -1619,9 +1617,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if self.fault_tolerance.rank_states[rank] != RankState.DEAD
             ]
         active_mask, resume_targets, pending_scale_down_ranks = (
-            self.fault_tolerance.begin_recover(
-                instruction, ranks
-            )
+            self.fault_tolerance.begin_recover(instruction, ranks)
         )
         shutdown_live_targets = (
             instruction == "scale_down"
@@ -1686,7 +1682,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return (
             self.fault_tolerance is not None
             and self.server_args.dp_size > 1
-            and not envs.SGLANG_FT_DISABLE_PARK_IDLE.get()
         )
 
     async def _ft_resume_parked_schedulers_before_request(self) -> None:

@@ -1,31 +1,16 @@
 import logging
-import hashlib
 import time
 from typing import TYPE_CHECKING, List
 
 import torch.cuda
 
-from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location import (
-    ExpertLocationMetadata,
-    expert_location_debug_summary,
-)
+from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
-
-
-def _logical_count_debug_summary(logical_count: torch.Tensor) -> str:
-    cpu = logical_count.detach().cpu().contiguous()
-    digest = hashlib.sha256(cpu.numpy().tobytes()).hexdigest()[:16]
-    return (
-        f"shape={tuple(cpu.shape)} sum={float(cpu.sum().item()):.4f} "
-        f"max={float(cpu.max().item()):.4f} hash={digest} "
-        f"head={cpu.reshape(-1)[:16].tolist()}"
-    )
 
 
 class EPLBManager:
@@ -98,14 +83,6 @@ class EPLBManager:
         average_utilization_rate_over_window = dump_record_output[
             "average_utilization_rate_over_window"
         ]
-        if envs.SGLANG_FT_PRECISION_DEBUG.get():
-            logger.info(
-                "[FTPrecisionDebug][EPLB] rebalance_input "
-                "recovering_from_rank_fault=%s logical_count_%s avg_util=%s",
-                recovering_from_rank_fault,
-                _logical_count_debug_summary(logical_count),
-                average_utilization_rate_over_window,
-            )
 
         # Check whether rebalancing is needed
         if not self._check_rebalance_needed(average_utilization_rate_over_window):
@@ -114,12 +91,6 @@ class EPLBManager:
         expert_location_metadata = ExpertLocationMetadata.init_by_eplb(
             self._server_args, self._model_runner.model_config, logical_count
         )
-        if envs.SGLANG_FT_PRECISION_DEBUG.get():
-            logger.info(
-                expert_location_debug_summary(
-                    expert_location_metadata, "eplb_rebalance_output"
-                )
-            )
 
         update_layer_ids_chunks = self._compute_update_layer_ids_chunks()
         for chunk_index, update_layer_ids in enumerate(update_layer_ids_chunks):

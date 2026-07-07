@@ -808,16 +808,15 @@ class Engine(EngineScoreMixin, EngineBase):
         # Set up subprocess liveness watchdog to detect crashes
         # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
         processes = list(scheduler_procs or [])
-        names = [f"scheduler_{i}" for i in range(len(processes))]
+        if server_args.dp_size == 1:
+            names = [f"scheduler_{i}" for i in range(len(processes))]
+        else:
+            names = ["data_parallel_controller" for _ in range(len(processes))]
         processes.append(detoken_proc)
         names.append("detokenizer")
 
         def on_subprocess_exit(index, proc, name):
-            if (
-                server_args.enable_fault_tolerance
-                and server_args.dp_size == 1
-                and name.startswith("scheduler_")
-            ):
+            if server_args.enable_fault_tolerance and name.startswith("scheduler_"):
                 return tokenizer_manager.handle_ft_process_exit(index, proc, name)
             return False
 

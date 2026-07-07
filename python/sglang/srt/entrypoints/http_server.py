@@ -1499,10 +1499,7 @@ async def continue_generation(obj: ContinueGenerationReqInput, request: Request)
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def fault_tolerance_status(request: Request):
     if not hasattr(_global_state.tokenizer_manager, "fault_tolerance_status"):
-        return ORJSONResponse(
-            content={"success": False, "message": "fault_tolerance_disabled"},
-            status_code=503,
-        )
+        return fault_tolerance_unavailable_response("fault_tolerance_disabled")
     status_code, body = _global_state.tokenizer_manager.fault_tolerance_status()
     return ORJSONResponse(content=body, status_code=status_code)
 
@@ -1511,10 +1508,7 @@ async def fault_tolerance_status(request: Request):
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def fault_tolerance_apply(request: Request):
     if not hasattr(_global_state.tokenizer_manager, "fault_tolerance_apply"):
-        return ORJSONResponse(
-            content={"success": False, "message": "fault_tolerance_disabled"},
-            status_code=503,
-        )
+        return fault_tolerance_unavailable_response("fault_tolerance_disabled")
     obj = await request.json()
     status_code, body = await _global_state.tokenizer_manager.fault_tolerance_apply(obj)
     return ORJSONResponse(content=body, status_code=status_code)

@@ -243,13 +243,6 @@ class DataParallelController:
                     )
                     self.status[rank] = False
                     if proc is not None and proc.is_alive():
-                        logger.info(
-                            "DPC shutting down scheduler for fault tolerance: "
-                            "id=%s rank=%s pid=%s",
-                            obj.request_id,
-                            rank,
-                            proc.pid,
-                        )
                         proc.terminate()
                     else:
                         message = "already stopped"

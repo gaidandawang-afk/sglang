@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import math
 import time
@@ -43,17 +42,6 @@ logger = logging.getLogger(__name__)
 # --------------------------------------- Entrypoint -----------------------------------------
 
 _OutputMode = Literal["file", "object"]
-
-
-def _debug_tensor_summary(tensor: torch.Tensor) -> str:
-    cpu = tensor.detach().cpu().contiguous()
-    digest = hashlib.sha256(cpu.numpy().tobytes()).hexdigest()[:16]
-    flat = cpu.reshape(-1)
-    return (
-        f"shape={tuple(cpu.shape)} sum={float(cpu.float().sum().item()):.4f} "
-        f"min={float(cpu.min().item()):.4f} max={float(cpu.max().item()):.4f} "
-        f"hash={digest} head={flat[:16].tolist()}"
-    )
 
 
 @dataclass
@@ -241,20 +229,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def _on_hook(self, hook_name: str, **kwargs):
         if self._disable_all:
             return
-        if envs.SGLANG_FT_PRECISION_DEBUG.get():
-            tensor = kwargs.get("topk_ids")
-            if tensor is None:
-                tensor = kwargs.get("local_physical_count_of_layer")
-            if isinstance(tensor, torch.Tensor):
-                logger.info(
-                    "[FTPrecisionDebug][MoE] hook=%s forward_pass_id=%s "
-                    "layer=%s debug_name=%s %s",
-                    hook_name,
-                    self._current_forward_pass_id.value,
-                    self._current_layer_idx.value,
-                    self._current_debug_name.value,
-                    _debug_tensor_summary(tensor),
-                )
         if not (
             self._recording or torch.get_device_module().is_current_stream_capturing()
         ):

@@ -4,6 +4,8 @@ from typing import Any
 
 from fastapi.responses import ORJSONResponse
 
+from sglang.srt.fault_tolerance.controller import ft_failure
+
 
 FT_ADMISSION_BYPASS_PATHS = {
     "/fault_tolerance/status",
@@ -23,6 +25,6 @@ def should_reject_fault_tolerance_request(tokenizer_manager: Any, path: str) -> 
 
 def fault_tolerance_unavailable_response(message: str = "fault_tolerance_paused"):
     return ORJSONResponse(
-        content={"success": False, "message": message},
+        content=ft_failure(message),
         status_code=503,
     )

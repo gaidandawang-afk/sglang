@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -25,16 +24,6 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
-
-
-def _debug_tensor_summary(tensor: torch.Tensor) -> str:
-    cpu = tensor.detach().cpu().contiguous()
-    digest = hashlib.sha256(cpu.numpy().tobytes()).hexdigest()[:16]
-    flat = cpu.reshape(-1)
-    return (
-        f"shape={tuple(cpu.shape)} sum={float(cpu.float().sum().item()):.4f} "
-        f"hash={digest} head={flat[:16].tolist()}"
-    )
 
 
 class MooncakeDispatchOutput(NamedTuple):
@@ -194,13 +183,6 @@ class _MooncakeEPDispatcherImpl:
         hook,
     ):
         hook() if self.return_recv_hook else event.current_stream_wait()
-        if envs.SGLANG_FT_PRECISION_DEBUG.get():
-            logger.info(
-                "[FTPrecisionDebug][MooncakeDispatch] phase=dispatch_done "
-                "expected_m=%s masked_m_%s",
-                expected_m,
-                _debug_tensor_summary(masked_m),
-            )
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
             masked_m
@@ -236,15 +218,6 @@ class _MooncakeEPDispatcherImpl:
         elif active_ranks_signature != self._last_active_ranks_signature:
             self.first_execution = True
             self._last_active_ranks_signature = active_ranks_signature
-        if envs.SGLANG_FT_PRECISION_DEBUG.get():
-            logger.info(
-                "[FTPrecisionDebug][MooncakeDispatch] phase=dispatch "
-                "first_execution=%s active_ranks=%s hidden_shape=%s topk_%s",
-                self.first_execution,
-                active_ranks.detach().cpu().tolist(),
-                tuple(hidden_states.shape),
-                _debug_tensor_summary(topk_ids),
-            )
         packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,
@@ -293,15 +266,6 @@ class _MooncakeEPDispatcherImpl:
         elastic_ep_state = ElasticEPStateManager.instance()
         elastic_ep_state.maybe_inject_test_rank_fault()
         active_ranks = elastic_ep_state.active_ranks
-        if envs.SGLANG_FT_PRECISION_DEBUG.get():
-            logger.info(
-                "[FTPrecisionDebug][MooncakeDispatch] phase=combine "
-                "first_execution=%s active_ranks=%s hidden_shape=%s topk_%s",
-                self.first_execution,
-                active_ranks.detach().cpu().tolist(),
-                tuple(hidden_states.shape),
-                _debug_tensor_summary(topk_ids),
-            )
         combined_hidden_states, event, hook = buffer.combine(
             hidden_states,
             topk_ids,

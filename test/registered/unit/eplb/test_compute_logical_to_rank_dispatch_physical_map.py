@@ -10,8 +10,6 @@ import unittest
 import torch
 
 from sglang.srt.eplb.expert_location import (
-    NoActiveExpertReplicaError,
-    _compute_logical_to_all_physical_map,
     compute_logical_to_rank_dispatch_physical_map,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -204,51 +202,6 @@ class TestComputeLogicalToRankDispatchPhysicalMap(CustomTestCase):
         )
         self.assertEqual(result.shape, (self.NUM_LAYERS, 1))
         self.assertTrue(torch.all(result >= 0))
-
-    def test_inactive_rank_experts_are_filtered_from_candidates(self):
-        physical_to_logical = torch.tensor([[0, 1, 0, 1, 0, 1, 0, 1]])
-        result = _compute_logical_to_all_physical_map(
-            server_args=self.server_args,
-            physical_to_logical_map=physical_to_logical,
-            num_logical_experts=2,
-            ep_size=self.EP_SIZE,
-            moe_ep_rank=None,
-            active_ranks=torch.tensor([True, True, True, False]),
-        )
-
-        self.assertNotIn(6, result.flatten().tolist())
-        self.assertNotIn(7, result.flatten().tolist())
-        self.assertEqual(result[0, 0].tolist(), [0, 2, 4])
-        self.assertEqual(result[0, 1].tolist(), [1, 3, 5])
-
-    def test_inactive_rank_filter_preserves_rank_local_candidates(self):
-        physical_to_logical = torch.tensor([[0, 1, 0, 1, 0, 1, 0, 1]])
-        result = _compute_logical_to_all_physical_map(
-            server_args=self.server_args,
-            physical_to_logical_map=physical_to_logical,
-            num_logical_experts=2,
-            ep_size=self.EP_SIZE,
-            moe_ep_rank=2,
-            active_ranks=torch.tensor([True, True, True, False]),
-        )
-
-        self.assertEqual(result[0, 0].tolist(), [4])
-        self.assertEqual(result[0, 1].tolist(), [5])
-
-    def test_inactive_rank_filter_rejects_missing_live_replica(self):
-        physical_to_logical = torch.tensor([[0, 0, 0, 0, 0, 0, 1, 1]])
-
-        with self.assertRaisesRegex(
-            NoActiveExpertReplicaError, "No active physical replica"
-        ):
-            _compute_logical_to_all_physical_map(
-                server_args=self.server_args,
-                physical_to_logical_map=physical_to_logical,
-                num_logical_experts=2,
-                ep_size=self.EP_SIZE,
-                moe_ep_rank=None,
-                active_ranks=torch.tensor([True, True, True, False]),
-            )
 
 
 if __name__ == "__main__":

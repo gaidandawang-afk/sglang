@@ -18,7 +18,6 @@ import json
 import logging
 import os
 import random
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional
@@ -26,8 +25,6 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import torch.distributed
 import torch.nn.functional as F
-
-from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -38,39 +35,6 @@ logger = logging.getLogger(__name__)
 
 class NoActiveExpertReplicaError(RuntimeError):
     """Raised when rank filtering leaves a logical expert without a replica."""
-
-
-def _tensor_debug_digest(tensor: Optional[torch.Tensor]):
-    if tensor is None:
-        return None
-    cpu = tensor.detach().cpu().contiguous()
-    return hashlib.sha256(cpu.numpy().tobytes()).hexdigest()[:16]
-
-
-def _tensor_debug_head(tensor: Optional[torch.Tensor], n: int = 16):
-    if tensor is None or tensor.numel() == 0:
-        return []
-    return tensor.detach().cpu().reshape(-1)[:n].tolist()
-
-
-def expert_location_debug_summary(
-    metadata: Optional["ExpertLocationMetadata"], label: str
-) -> str:
-    if metadata is None:
-        return f"[FTPrecisionDebug][ExpertLocation] label={label} metadata=None"
-    dispatch_map = metadata.logical_to_rank_dispatch_physical_map
-    return (
-        "[FTPrecisionDebug][ExpertLocation] "
-        f"label={label} "
-        f"physical_shape={tuple(metadata.physical_to_logical_map.shape)} "
-        f"logical_shape={tuple(metadata.logical_to_all_physical_map.shape)} "
-        f"physical_hash={_tensor_debug_digest(metadata.physical_to_logical_map_cpu)} "
-        f"logical_hash={_tensor_debug_digest(metadata.logical_to_all_physical_map_cpu)} "
-        f"dispatch_hash={_tensor_debug_digest(dispatch_map)} "
-        f"physical_head={_tensor_debug_head(metadata.physical_to_logical_map_cpu)} "
-        f"logical_head={_tensor_debug_head(metadata.logical_to_all_physical_map_cpu)} "
-        f"valid_head={_tensor_debug_head(metadata.logical_to_all_physical_map_num_valid)}"
-    )
 
 
 @dataclass
@@ -272,7 +236,7 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map != -1, dim=-1
         )
 
-        metadata = ExpertLocationMetadata(
+        return ExpertLocationMetadata(
             physical_to_logical_map=physical_to_logical_map,
             physical_to_logical_map_cpu=physical_to_logical_map.cpu(),
             logical_to_all_physical_map=logical_to_all_physical_map_padded,
@@ -291,9 +255,6 @@ class ExpertLocationMetadata:
                 else None
             ),
         )
-        if envs.SGLANG_FT_PRECISION_DEBUG.get():
-            logger.info(expert_location_debug_summary(metadata, "init_raw"))
-        return metadata
 
     # -------------------------------- mutation ------------------------------------
 
@@ -415,8 +376,6 @@ def broadcast_global_expert_location_metadata(
     metadata.logical_to_all_physical_map_cpu = (
         metadata.logical_to_all_physical_map.cpu()
     )
-    if envs.SGLANG_FT_PRECISION_DEBUG.get():
-        logger.info(expert_location_debug_summary(metadata, "broadcast_device"))
 
 
 def _broadcast_global_expert_location_metadata_via_cpu_group(
@@ -425,6 +384,7 @@ def _broadcast_global_expert_location_metadata_via_cpu_group(
 ):
     from sglang.srt.distributed.parallel_state import get_world_group
 
+    cpu_group = get_world_group().cpu_group
     logger.info(
         "Broadcast expert location metadata over CPU group in Mooncake forced "
         "fallback path."
@@ -438,12 +398,12 @@ def _broadcast_global_expert_location_metadata_via_cpu_group(
     torch.distributed.broadcast(
         physical_to_logical_map_cpu,
         src=src_rank,
-        group=get_world_group().cpu_group,
+        group=cpu_group,
     )
     torch.distributed.broadcast(
         logical_to_all_physical_map_cpu,
         src=src_rank,
-        group=get_world_group().cpu_group,
+        group=cpu_group,
     )
 
     logical_to_all_physical_map_num_valid_cpu = torch.count_nonzero(
@@ -459,7 +419,7 @@ def _broadcast_global_expert_location_metadata_via_cpu_group(
         torch.distributed.broadcast(
             logical_to_rank_dispatch_physical_map_cpu,
             src=src_rank,
-            group=get_world_group().cpu_group,
+            group=cpu_group,
         )
 
     metadata.physical_to_logical_map_cpu = physical_to_logical_map_cpu
@@ -485,8 +445,6 @@ def _broadcast_global_expert_location_metadata_via_cpu_group(
                 non_blocking=True,
             )
         )
-    if envs.SGLANG_FT_PRECISION_DEBUG.get():
-        logger.info(expert_location_debug_summary(metadata, "broadcast_cpu_fallback"))
 
 
 def _compute_logical_to_all_physical_map(
@@ -505,6 +463,8 @@ def _compute_logical_to_all_physical_map(
 
     active_ranks_cpu = None
     if active_ranks is not None:
+        # TODO(ft): add regression coverage for inactive-rank filtering before
+        # final PR submission.
         active_ranks_cpu = (
             torch.as_tensor(active_ranks, dtype=torch.bool).cpu().flatten()
         )
