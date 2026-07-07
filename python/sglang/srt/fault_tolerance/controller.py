@@ -41,7 +41,7 @@ def is_ft_supported_config(server_args) -> Tuple[bool, str]:
     return True, ""
 
 
-class FaultToleranceManager:
+class FaultToleranceState:
     def __init__(
         self,
         *,
@@ -65,16 +65,12 @@ class FaultToleranceManager:
         return RankState.PAUSED in self.rank_states
 
     def should_reject_admission(self) -> bool:
-        return (
-            self.strategy == "pause"
-            and (self.ft_operation_in_progress or self.has_paused_rank())
+        return self.strategy == "pause" and (
+            self.ft_operation_in_progress or self.has_paused_rank()
         )
 
     def is_rank_healthy(self, rank: int) -> bool:
-        return (
-            0 <= rank < self.dp_size
-            and self.rank_states[rank] == RankState.HEALTHY
-        )
+        return 0 <= rank < self.dp_size and self.rank_states[rank] == RankState.HEALTHY
 
     def healthy_ranks(self) -> List[int]:
         return [
@@ -110,10 +106,7 @@ class FaultToleranceManager:
 
     def finish_pause_collection(self, acked: set[int], timed_out: set[int]) -> None:
         for rank in acked:
-            if (
-                0 <= rank < self.dp_size
-                and self.rank_states[rank] != RankState.DEAD
-            ):
+            if 0 <= rank < self.dp_size and self.rank_states[rank] != RankState.DEAD:
                 self.rank_states[rank] = RankState.PAUSED
         for rank in timed_out:
             if 0 <= rank < self.dp_size:
