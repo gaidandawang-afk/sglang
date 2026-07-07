@@ -66,8 +66,7 @@ from sglang.srt.utils.network import (
     get_zmq_socket_on_host,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils.watchdog import Watchdog
-from sglang.srt.utils.watchdog import SubprocessWatchdog
+from sglang.srt.utils.watchdog import SubprocessWatchdog, Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
