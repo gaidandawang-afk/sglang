@@ -44,6 +44,16 @@ def noop_worker():
     pass
 
 
+class FakeProcess:
+    def __init__(self, pid, alive, exitcode=None):
+        self.pid = pid
+        self.alive = alive
+        self.exitcode = exitcode
+
+    def is_alive(self):
+        return self.alive
+
+
 class TestSubprocessWatchdog(CustomTestCase):
     def setUp(self):
         self.sigquit_triggered = threading.Event()
@@ -132,6 +142,34 @@ class TestSubprocessWatchdog(CustomTestCase):
             self.sigquit_triggered.is_set(),
             "SIGQUIT should not be triggered for normal exit (exitcode=0)",
         )
+
+    def test_normal_exit_does_not_call_callback(self):
+        proc = self._spawn(noop_worker)
+        proc.join(timeout=2)
+        exit_seen = threading.Event()
+        self._monitor = SubprocessWatchdog(
+            processes=[proc],
+            interval=0.05,
+            on_exit=lambda index, process, name: exit_seen.set(),
+        )
+        self._monitor.start()
+
+        self.assertFalse(exit_seen.wait(timeout=0.3))
+        self.assertFalse(self.sigquit_triggered.is_set())
+
+    def test_callback_runs_before_default_sigquit(self):
+        exits = []
+        process = FakeProcess(pid=20, alive=False, exitcode=1)
+        monitor = SubprocessWatchdog(
+            processes=[process],
+            on_exit=lambda index, process, name: exits.append(
+                (index, process.pid, name, self.sigquit_triggered.is_set())
+            ),
+        )
+
+        self.assertTrue(monitor._check_processes())
+        self.assertEqual(exits, [(0, 20, "process_0", False)])
+        self.assertTrue(self.sigquit_triggered.is_set())
 
 
 if __name__ == "__main__":

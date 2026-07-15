@@ -811,8 +811,10 @@ class Engine(EngineScoreMixin, EngineBase):
         names = [f"scheduler_{i}" for i in range(len(processes))]
         processes.append(detoken_proc)
         names.append("detokenizer")
+
         subprocess_watchdog = SubprocessWatchdog(
-            processes=processes, process_names=names
+            processes=processes,
+            process_names=names,
         )
         subprocess_watchdog.start()
 

@@ -105,6 +105,9 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
+    FaultToleranceCommandReqInput,
+    FaultToleranceCommandReqOutput,
+    FaultToleranceRankFaultOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     FreezeGCReq,
@@ -125,6 +128,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
+    RecoveredDPRanksOutput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -1472,6 +1476,7 @@ class Scheduler(
                 (GetLoadsReqInput, self.get_loads),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (FaultToleranceCommandReqInput, self.handle_fault_tolerance_command),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
                 (
@@ -1531,7 +1536,93 @@ class Scheduler(
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         with self.device_module.StreamContext(self.schedule_stream):
-            dispatch_event_loop(self)
+            if self.server_args.enable_fault_tolerance:
+                self._run_event_loop_fault_tolerance()
+            else:
+                dispatch_event_loop(self)
+
+    def _run_event_loop_fault_tolerance(self):
+        while True:
+            try:
+                dispatch_event_loop(self)
+            except Exception as exc:
+                recovered = self._ft_discard_current_batch(exc)
+                self.send_to_tokenizer.send_output(
+                    FaultToleranceRankFaultOutput(
+                        rank=self._ft_rank(),
+                        fault_type="exception",
+                        message=str(exc),
+                    )
+                )
+                if (
+                    self.server_args.fault_tolerance_on_error_strategy == "continue"
+                    and recovered
+                ):
+                    continue
+                self._engine_paused = True
+
+    def _ft_rank(self) -> int:
+        return self.dp_rank if self.dp_rank is not None else 0
+
+    def _report_recovered_dp_ranks(self) -> None:
+        recovered_tp_ranks = self.tp_worker.model_runner.take_recovered_ep_ranks()
+        if not self.server_args.enable_fault_tolerance or not recovered_tp_ranks:
+            return
+        ranks_per_dp = self.tp_size // self.dp_size
+        recovered_dp_ranks = sorted(
+            {rank // ranks_per_dp for rank in recovered_tp_ranks}
+        )
+        self.send_to_tokenizer.send_output(
+            RecoveredDPRanksOutput(ranks=recovered_dp_ranks)
+        )
+
+    def _ft_discard_current_batch(self, exc: Exception) -> bool:
+        batch = self.cur_batch
+        if batch is None or batch.is_empty():
+            return True
+        if batch.forward_mode.is_idle():
+            self.cur_batch = None
+            if self.last_batch is batch:
+                self.last_batch = None
+            return True
+        discarded_reqs = [req for req in batch.reqs if not req.finished()]
+        success = True
+        for req in discarded_reqs:
+            try:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+                abort_reason = FINISH_ABORT(
+                    message=f"Request discarded after scheduler exception: {exc}",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    err_type="SchedulerFault",
+                )
+                req.finished_reason = abort_reason
+                self.send_to_tokenizer.send_output(
+                    AbortReq(
+                        finished_reason=abort_reason.to_json(),
+                        rid=req.rid,
+                    ),
+                    req,
+                )
+            except Exception:
+                logger.exception(
+                    "FT failed to discard request state: rid=%s",
+                    req.rid,
+                )
+                success = False
+
+        batch.filter_batch(keep_indices=[])
+        batch.batch_is_full = False
+        if self.chunked_req in discarded_reqs:
+            self.chunked_req = None
+        self.cur_batch = None
+        if self.last_batch is batch:
+            self.last_batch = None
+        logger.warning(
+            "FT discarded %d request(s) after scheduler exception: %s",
+            len(discarded_reqs),
+            exc,
+        )
+        return success
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1727,12 +1818,13 @@ class Scheduler(
                     src=self.attn_cp_group.ranks[0],
                 )
 
-            # When dp_attention_local_control_broadcast is enabled, each DP
-            # group leader already receives control messages from the DP
-            # controller, so we broadcast within attn_tp_group + attn_cp_group
-            # instead of the full tp_group.  This avoids an expensive
-            # all-ranks gloo sync.
-            _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
+            # FT commands are delivered to each target DP leader and must stay
+            # within that attention block. The original option remains unchanged
+            # when FT is disabled.
+            _local_ctrl = (
+                self.server_args.enable_fault_tolerance
+                or self.server_args.enable_dp_attention_local_control_broadcast
+            )
             if _local_ctrl:
                 if self.attn_tp_size != 1:
                     control_reqs = broadcast_pyobj(
@@ -3128,6 +3220,8 @@ class Scheduler(
             self.server_args.enable_dp_attention
             and self.server_args.elastic_ep_backend is not None
         ):
+            self._report_recovered_dp_ranks()
+
             # Get the tensors indicating rank activeness
             tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
             tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
@@ -3717,6 +3811,83 @@ class Scheduler(
                 f"(freed {before_mb - after_mb:.1f} MB)"
             )
         self._engine_paused = False
+
+    def handle_fault_tolerance_command(
+        self, recv_req: FaultToleranceCommandReqInput
+    ) -> Optional[FaultToleranceCommandReqOutput]:
+        rank = self._ft_rank()
+        if rank not in recv_req.target_ranks:
+            return None
+
+        if recv_req.command == "shutdown":
+            if self.attn_tp_rank != 0 or self.attn_cp_rank != 0:
+                return None
+            logger.warning(
+                "FT scale_down is terminating the DP leader process for rank %s", rank
+            )
+            os.kill(os.getpid(), signal.SIGTERM)
+            return None
+
+        try:
+            if recv_req.command == "pause":
+                self._engine_paused = True
+                message = "paused"
+            elif recv_req.command == "resume":
+                self._engine_paused = False
+                message = "resumed"
+            else:
+                raise ValueError(f"unknown fault tolerance command: {recv_req.command}")
+            success = True
+        except Exception as exc:
+            success = False
+            message = str(exc)
+
+        success, message = self._aggregate_ft_command_result(success, message)
+        if self.attn_tp_rank != 0 or self.attn_cp_rank != 0:
+            return None
+        return FaultToleranceCommandReqOutput(
+            request_id=recv_req.request_id,
+            rank=rank,
+            success=success,
+            message=message,
+        )
+
+    def _aggregate_ft_command_result(
+        self, success: bool, message: str
+    ) -> Tuple[bool, str]:
+        member_result = {
+            "tp_rank": self.tp_rank,
+            "success": success,
+            "message": message,
+        }
+
+        if self.server_args.enable_dp_attention:
+            if self.attn_cp_size != 1:
+                cp_results = self.attn_cp_group.all_gather_object(member_result)
+            else:
+                cp_results = [member_result]
+
+            if self.attn_tp_size != 1:
+                gathered_results = self.attn_tp_group.all_gather_object(cp_results)
+                member_results = [
+                    result
+                    for tp_results in gathered_results
+                    for result in tp_results
+                ]
+            else:
+                member_results = cp_results
+        elif self.tp_size != 1:
+            member_results = self.tp_group.all_gather_object(member_result)
+        else:
+            member_results = [member_result]
+
+        failures = [result for result in member_results if not result["success"]]
+        if not failures:
+            return True, message
+        return False, "; ".join(
+            f"tp_rank={result['tp_rank']}: {result['message']}"
+            for result in failures
+        )
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
