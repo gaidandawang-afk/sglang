@@ -1390,6 +1390,27 @@ class ContinueGenerationReqInput(BaseReq):
 
 
 @dataclass
+class FaultToleranceCommandReqInput(BaseReq):
+    request_id: str
+    command: Literal["pause", "resume"]
+    target_ranks: List[int]
+
+
+@dataclass
+class FaultToleranceCommandReqOutput(BaseReq):
+    request_id: str
+    rank: int
+    success: bool
+    message: str = ""
+
+
+@dataclass
+class FaultToleranceRankFaultOutput(BaseReq):
+    rank: int
+    message: str = ""
+
+
+@dataclass
 class TokenizerWorkerRegistration:
     """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
 
@@ -1677,6 +1698,20 @@ class AbortReq(BaseReq):
 @dataclass
 class ActiveRanksOutput(BaseReq):
     status: List[bool]
+    request_id: Optional[str] = None
+
+
+@dataclass
+class ProcessActiveRanksOutput(BaseReq):
+    ranks: List[int]
+    active: bool
+
+
+@dataclass
+class ActiveRanksUpdateReqOutput(BaseReq):
+    request_id: str
+    success: bool
+    message: str = ""
 
 
 @dataclass

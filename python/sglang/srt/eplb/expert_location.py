@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,10 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+class NoActiveExpertReplicaError(RuntimeError):
+    """Raised when rank filtering leaves a logical expert without a replica."""
 
 
 @dataclass
@@ -114,6 +119,7 @@ class ExpertLocationMetadata:
         model_config: ModelConfig,
         physical_to_logical_map,
         moe_ep_rank: int = None,
+        active_ranks: Optional[torch.Tensor] = None,
     ):
         if not isinstance(physical_to_logical_map, torch.Tensor):
             physical_to_logical_map = torch.tensor(physical_to_logical_map)
@@ -131,6 +137,7 @@ class ExpertLocationMetadata:
             num_logical_experts=model_config_for_expert_location.num_logical_experts,
             ep_size=common["ep_size"],
             moe_ep_rank=moe_ep_rank,
+            active_ranks=active_ranks,
         )
 
         return ExpertLocationMetadata._init_raw(
@@ -333,6 +340,13 @@ def broadcast_global_expert_location_metadata(
     metadata = get_global_expert_location_metadata()
     assert metadata is not None
 
+    if group is None and os.environ.get("MOONCAKE_EP_FORCE_FALLBACK") == "1":
+        _broadcast_global_expert_location_metadata_via_cpu_group(
+            metadata=metadata,
+            src_rank=src_rank,
+        )
+        return
+
     # Ensure device tensors are contiguous before broadcasting in-place
     metadata.physical_to_logical_map = metadata.physical_to_logical_map.contiguous()
     metadata.logical_to_all_physical_map = (
@@ -364,16 +378,98 @@ def broadcast_global_expert_location_metadata(
     )
 
 
+def _broadcast_global_expert_location_metadata_via_cpu_group(
+    metadata: ExpertLocationMetadata,
+    src_rank: int,
+):
+    from sglang.srt.distributed.parallel_state import get_world_group
+
+    logger.info(
+        "Broadcast expert location metadata over CPU group in Mooncake forced "
+        "fallback path."
+    )
+
+    physical_to_logical_map_cpu = metadata.physical_to_logical_map_cpu.contiguous()
+    logical_to_all_physical_map_cpu = (
+        metadata.logical_to_all_physical_map_cpu.contiguous()
+    )
+
+    torch.distributed.broadcast(
+        physical_to_logical_map_cpu,
+        src=src_rank,
+        group=get_world_group().cpu_group,
+    )
+    torch.distributed.broadcast(
+        logical_to_all_physical_map_cpu,
+        src=src_rank,
+        group=get_world_group().cpu_group,
+    )
+
+    logical_to_all_physical_map_num_valid_cpu = torch.count_nonzero(
+        logical_to_all_physical_map_cpu != -1,
+        dim=-1,
+    )
+
+    logical_to_rank_dispatch_physical_map_cpu = None
+    if metadata.logical_to_rank_dispatch_physical_map is not None:
+        logical_to_rank_dispatch_physical_map_cpu = (
+            metadata.logical_to_rank_dispatch_physical_map.detach().cpu().contiguous()
+        )
+        torch.distributed.broadcast(
+            logical_to_rank_dispatch_physical_map_cpu,
+            src=src_rank,
+            group=get_world_group().cpu_group,
+        )
+
+    metadata.physical_to_logical_map_cpu = physical_to_logical_map_cpu
+    metadata.logical_to_all_physical_map_cpu = logical_to_all_physical_map_cpu
+    metadata.physical_to_logical_map = physical_to_logical_map_cpu.to(
+        device=metadata.physical_to_logical_map.device,
+        non_blocking=True,
+    )
+    metadata.logical_to_all_physical_map = logical_to_all_physical_map_cpu.to(
+        device=metadata.logical_to_all_physical_map.device,
+        non_blocking=True,
+    )
+    metadata.logical_to_all_physical_map_num_valid = (
+        logical_to_all_physical_map_num_valid_cpu.to(
+            device=metadata.logical_to_all_physical_map_num_valid.device,
+            non_blocking=True,
+        )
+    )
+    if logical_to_rank_dispatch_physical_map_cpu is not None:
+        metadata.logical_to_rank_dispatch_physical_map = (
+            logical_to_rank_dispatch_physical_map_cpu.to(
+                device=metadata.logical_to_rank_dispatch_physical_map.device,
+                non_blocking=True,
+            )
+        )
+
+
 def _compute_logical_to_all_physical_map(
     server_args: ServerArgs,
     physical_to_logical_map: torch.Tensor,
     num_logical_experts: int,
     ep_size: int,
     moe_ep_rank: int,
+    active_ranks: Optional[torch.Tensor] = None,
 ):
     # This is rarely called, so we use for loops for maximum clarity
 
     num_layers, num_physical_experts = physical_to_logical_map.shape
+    num_local_physical_experts, remainder = divmod(num_physical_experts, ep_size)
+    assert remainder == 0
+
+    active_ranks_cpu = None
+    if active_ranks is not None:
+        active_ranks_cpu = (
+            torch.as_tensor(active_ranks, dtype=torch.bool).cpu().flatten()
+        )
+        if active_ranks_cpu.numel() != ep_size:
+            raise ValueError(
+                f"Expected {ep_size} active-rank entries, got "
+                f"{active_ranks_cpu.numel()}"
+            )
 
     logical_to_all_physical_map = [
         [[] for _ in range(num_logical_experts)] for _ in range(num_layers)
@@ -382,12 +478,27 @@ def _compute_logical_to_all_physical_map(
     # Find out the candidate physical experts for each logical expert on each layer
     for layer_id in range(num_layers):
         for physical_expert_id in range(num_physical_experts):
+            owner_rank = physical_expert_id // num_local_physical_experts
+            if active_ranks_cpu is not None and not active_ranks_cpu[owner_rank]:
+                continue
             logical_expert_id = physical_to_logical_map[
                 layer_id, physical_expert_id
             ].item()
             logical_to_all_physical_map[layer_id][logical_expert_id].append(
                 physical_expert_id
             )
+
+    missing_live_replicas = [
+        (layer_id, logical_expert_id)
+        for layer_id in range(num_layers)
+        for logical_expert_id in range(num_logical_experts)
+        if not logical_to_all_physical_map[layer_id][logical_expert_id]
+    ]
+    if missing_live_replicas:
+        raise NoActiveExpertReplicaError(
+            "No active physical replica for layer/logical expert pairs: "
+            f"{missing_live_replicas[:16]}"
+        )
 
     # Replace by the physical expert on local GPU or node if possible
     if moe_ep_rank is not None:

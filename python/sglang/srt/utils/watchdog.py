@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from multiprocessing import Process
+from multiprocessing import Pipe, Process, connection
 from typing import Callable, List, Optional
 
 import psutil
@@ -26,9 +26,9 @@ class Watchdog:
         test_stuck_time: float = 0,
     ) -> Watchdog:
         if watchdog_timeout is None:
-            assert (
-                test_stuck_time == 0
-            ), f"stuck tester can be enabled only if soft watchdog is enabled."
+            assert test_stuck_time == 0, (
+                f"stuck tester can be enabled only if soft watchdog is enabled."
+            )
             return _WatchdogNoop()
         return _WatchdogReal(
             debug_name=debug_name,
@@ -164,26 +164,35 @@ class WatchdogRaw:
 
 
 class SubprocessWatchdog:
-    """Monitors subprocess liveness and triggers SIGQUIT when a crash is detected.
+    """Monitors subprocess sentinels and triggers SIGQUIT when a crash is detected.
 
     When a subprocess crashes (e.g., NCCL timeout causing C++ std::terminate()),
     Python exception handlers never run, leaving the main process as a zombie
-    service. This watchdog polls subprocess liveness in a daemon thread and
-    sends SIGQUIT to trigger proper cleanup.
+    service. This watchdog waits for multiprocessing exit signals in a daemon
+    thread and sends SIGQUIT to trigger proper cleanup.
 
     See: https://github.com/sgl-project/sglang/issues/18421
+
+    An optional ``on_exit`` callback is invoked before the default SIGQUIT path.
+    Callers that can isolate one failed subprocess may disable that fail-stop
+    while retaining sentinel-based monitoring for the remaining subprocesses.
     """
 
     def __init__(
         self,
         processes: List[Process],
         process_names: Optional[List[str]] = None,
-        interval: float = 1.0,
+        stop_join_timeout: float = 2.0,
+        on_exit: Optional[Callable[[int, Process, str], None]] = None,
+        fail_stop_on_exit: bool = True,
     ):
         self._processes = processes
         self._names = process_names or [f"process_{i}" for i in range(len(processes))]
-        self._interval = interval
+        self._stop_join_timeout = stop_join_timeout
+        self._on_exit = on_exit
+        self._fail_stop_on_exit = fail_stop_on_exit
         self._stop_event = threading.Event()
+        self._stop_reader, self._stop_writer = Pipe(duplex=False)
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
@@ -197,27 +206,61 @@ class SubprocessWatchdog:
     def stop(self) -> None:
         self._stop_event.set()
         if self._thread is not None:
-            self._thread.join(timeout=self._interval * 2)
+            try:
+                self._stop_writer.send_bytes(b"\0")
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+            self._thread.join(timeout=self._stop_join_timeout)
             self._thread = None
+
+    def wait(self) -> None:
+        if self._thread is not None:
+            self._thread.join()
 
     def _monitor_loop(self) -> None:
         try:
-            while not self._stop_event.wait(self._interval):
-                if self._check_processes():
+            sentinel_to_process = {
+                proc.sentinel: (index, proc, name)
+                for index, (proc, name) in enumerate(zip(self._processes, self._names))
+            }
+            remaining = set(sentinel_to_process)
+            while remaining and not self._stop_event.is_set():
+                ready = connection.wait([self._stop_reader, *remaining])
+                if self._stop_reader in ready:
                     return
+                for sentinel in ready:
+                    remaining.discard(sentinel)
+                    index, proc, name = sentinel_to_process[sentinel]
+                    proc.join(timeout=0)
+                    if self._handle_process_exit(index, proc, name):
+                        return
         except Exception as e:
             logger.error(f"SubprocessWatchdog thread crashed: {e}", exc_info=True)
 
-    def _check_processes(self) -> bool:
-        for proc, name in zip(self._processes, self._names):
-            if proc.is_alive() or proc.exitcode == 0:
-                continue
+    def _handle_process_exit(self, index: int, proc: Process, name: str) -> bool:
+        if proc.exitcode == 0:
+            return False
 
+        if self._on_exit is not None:
+            try:
+                self._on_exit(index, proc, name)
+            except Exception:
+                logger.exception(
+                    "Subprocess watchdog on-exit callback failed for %s", name
+                )
+
+        if not self._fail_stop_on_exit:
             logger.error(
                 f"Subprocess {name} (pid={proc.pid}) crashed "
                 f"with exit code {proc.exitcode}. "
-                f"Triggering SIGQUIT for cleanup..."
+                f"Continuing to monitor remaining subprocesses."
             )
-            os.kill(os.getpid(), signal.SIGQUIT)
-            return True
-        return False
+            return False
+
+        logger.error(
+            f"Subprocess {name} (pid={proc.pid}) crashed "
+            f"with exit code {proc.exitcode}. "
+            f"Triggering SIGQUIT for cleanup..."
+        )
+        os.kill(os.getpid(), signal.SIGQUIT)
+        return True
