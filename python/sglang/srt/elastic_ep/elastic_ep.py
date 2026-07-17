@@ -180,8 +180,15 @@ def _maybe_create_message_queue(group) -> None:
 def _refresh_ep_members() -> None:
     from sglang.srt.layers.moe.token_dispatcher.mooncake import EPBuffer
 
-    if EPBuffer._buffer is not None:
-        EPBuffer._buffer.update_ep_member()
+    if EPBuffer._buffer is None:
+        if os.environ.get("MOONCAKE_EP_FORCE_FALLBACK") == "1":
+            logger.info(
+                "Skip Mooncake EP member refresh before EPBuffer initialization "
+                "in Mooncake forced fallback rejoin path."
+            )
+            return
+        raise RuntimeError("Mooncake EPBuffer is not initialized")
+    EPBuffer._buffer.update_ep_member()
 
 
 def try_recover_ranks(global_ranks: List[int]) -> bool:
