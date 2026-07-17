@@ -140,6 +140,7 @@ class _MooncakeEPDispatcherImpl:
         assert self.num_max_dispatch_tokens_per_rank <= 1024
 
         self.first_execution = True
+        self._last_active_ranks_signature = None
         self.timeout_us = 10000000
 
         self.handle = None
@@ -211,6 +212,12 @@ class _MooncakeEPDispatcherImpl:
         elastic_ep_state = ElasticEPStateManager.instance()
         elastic_ep_state.maybe_inject_test_rank_fault()
         active_ranks = elastic_ep_state.active_ranks
+        active_ranks_signature = tuple(active_ranks.detach().cpu().tolist())
+        if self._last_active_ranks_signature is None:
+            self._last_active_ranks_signature = active_ranks_signature
+        elif active_ranks_signature != self._last_active_ranks_signature:
+            self.first_execution = True
+            self._last_active_ranks_signature = active_ranks_signature
         packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,

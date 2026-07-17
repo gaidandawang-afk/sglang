@@ -99,6 +99,7 @@ from sglang.srt.eplb.expert_distribution import (
 )
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
+    NoActiveExpertReplicaError,
     broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
     get_global_expert_location_metadata,
@@ -3329,6 +3330,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch,
             ) as recorder_outputs,
         ):
+            if self.enable_elastic_ep:
+                self._update_expert_layout_after_rank_fault_if_needed()
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
@@ -3336,9 +3339,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
-            if self.enable_elastic_ep:
-                output = self._maybe_rebalance_after_rank_fault(
-                    output,
+            if (
+                self.enable_elastic_ep
+                and self._update_expert_layout_after_rank_fault_if_needed()
+            ):
+                output = self._forward_raw(
                     forward_batch,
                     skip_attn_backend_init,
                     pp_proxy_tensors,
@@ -3614,34 +3619,47 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     device=self.device,
                 )
 
-    def _maybe_rebalance_after_rank_fault(
-        self,
-        output: ModelRunnerOutput,
-        forward_batch: ForwardBatch,
-        skip_attn_backend_init: bool,
-        pp_proxy_tensors: Optional[PPProxyTensors],
-        reinit_attn_backend: bool,
-        split_forward_count: int,
-    ) -> ModelRunnerOutput:
+    def _update_expert_layout_after_rank_fault_if_needed(self) -> bool:
+        """Update dispatch metadata after a rank fault, relocating only if needed."""
         elastic_ep_state = ElasticEPStateManager.instance()
         if elastic_ep_state is not None and not elastic_ep_state.is_active_equal_last():
             elastic_ep_state.snapshot_active_to_last()
             elastic_ep_state.sync_active_to_cpu()
-            logging.info("EPLB due to rank faults")
+            old_metadata = get_global_expert_location_metadata()
+            assert old_metadata is not None
+            try:
+                filtered_metadata = ExpertLocationMetadata.init_by_mapping(
+                    self.server_args,
+                    self.model_config,
+                    physical_to_logical_map=old_metadata.physical_to_logical_map,
+                    moe_ep_rank=self.moe_ep_rank,
+                    active_ranks=elastic_ep_state.active_ranks_cpu,
+                )
+            except NoActiveExpertReplicaError:
+                logger.info(
+                    "At least one logical expert has no active replica; "
+                    "falling back to rank-fault EPLB"
+                )
+            else:
+                assert filtered_metadata is not None
+                old_metadata.update(
+                    filtered_metadata,
+                    update_layer_ids=list(range(old_metadata.num_layers)),
+                )
+                logger.info(
+                    "Preserved expert weights and physical layout after rank "
+                    "fault; filtered inactive-rank dispatch candidates only"
+                )
+                return True
+            logger.info("EPLB due to rank faults")
             gen = self.eplb_manager.rebalance()
             while True:
                 try:
                     next(gen)
                 except StopIteration:
                     break
-            output = self._forward_raw(
-                forward_batch,
-                skip_attn_backend_init,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
-            )
-        return output
+            return True
+        return False
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
