@@ -865,13 +865,14 @@ def run_data_parallel_controller_process(
         )
         if server_args.node_rank == 0:
             controller.event_loop()
-        if controller._scheduler_watchdog is not None:
+        if server_args.node_rank != 0 and controller._scheduler_watchdog is not None:
             controller._scheduler_watchdog.wait()
-        for proc in controller.scheduler_procs:
-            proc.join()
-            logger.error(
-                f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
-            )
+        else:
+            for proc in controller.scheduler_procs:
+                proc.join()
+                logger.error(
+                    f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
+                )
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"DataParallelController hit an exception: {traceback}")
