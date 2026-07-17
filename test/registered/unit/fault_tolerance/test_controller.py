@@ -47,6 +47,43 @@ class TestFaultToleranceState(unittest.TestCase):
             (False, "ft_requires_tp_divisible_by_dp_and_attn_cp"),
         )
 
+    def test_attn_tp_gt1_is_allowed_without_rejoin(self):
+        args = SimpleNamespace(
+            pp_size=1,
+            elastic_ep_backend="mooncake",
+            elastic_ep_rejoin=False,
+            disaggregation_mode="null",
+            device="cuda",
+            tokenizer_worker_num=1,
+            use_ray=False,
+            enable_dp_attention=True,
+            tp_size=4,
+            dp_size=2,
+            attn_cp_size=1,
+        )
+
+        self.assertEqual(is_ft_supported_config(args), (True, ""))
+
+    def test_rejoin_requires_singleton_attention_tp(self):
+        args = SimpleNamespace(
+            pp_size=1,
+            elastic_ep_backend="mooncake",
+            elastic_ep_rejoin=True,
+            disaggregation_mode="null",
+            device="cuda",
+            tokenizer_worker_num=1,
+            use_ray=False,
+            enable_dp_attention=True,
+            tp_size=4,
+            dp_size=2,
+            attn_cp_size=1,
+        )
+
+        self.assertEqual(
+            is_ft_supported_config(args),
+            (False, "ft_rejoin_requires_attn_tp1"),
+        )
+
     def test_effective_mask_is_intersection_of_three_sources(self):
         state = FaultToleranceState(dp_size=3, strategy="pause")
         state.process_active_ranks = [True, False, True]
@@ -119,7 +156,7 @@ class TestFaultToleranceState(unittest.TestCase):
         self.assertEqual(response["resumed_ranks"], [0, 1])
         self.assertEqual(
             state.rank_states,
-            [RankState.HEALTHY, RankState.DEAD],
+            [RankState.HEALTHY, RankState.PAUSED],
         )
 
     def test_scale_down_cannot_remove_last_effective_route(self):

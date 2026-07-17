@@ -217,6 +217,7 @@ class DataParallelController:
                     for info in self.scheduler_process_infos
                 ],
                 on_exit=self._handle_scheduler_process_exit,
+                fail_stop_on_exit=False,
             )
             self._scheduler_watchdog.start()
             if server_args.elastic_ep_rejoin:
@@ -246,8 +247,8 @@ class DataParallelController:
 
     def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
         # FT commands are DP-scoped. Each target socket belongs to that DP's
-        # attention leader. Do not gate command delivery on route status:
-        # scale_down closes the route before asking the leader to exit.
+        # attention leader. Do not gate command delivery on route status because
+        # recovery may need to resume a DP while its route is still inactive.
         for rank in sorted(set(obj.target_ranks)):
             if not 0 <= rank < len(self.workers):
                 logger.warning(
@@ -277,7 +278,7 @@ class DataParallelController:
         info = self.scheduler_process_infos[index]
         logger.warning(
             "Global scheduler rank %s for DP rank %s exited (pid=%s); "
-            "marking all local DP ranks inactive before local fail-stop",
+            "marking that DP rank inactive",
             info.global_rank,
             info.dp_rank,
             proc.pid,
@@ -291,13 +292,13 @@ class DataParallelController:
             )
             sender.send_pyobj(
                 ProcessActiveRanksOutput(
-                    ranks=self.local_dp_ranks,
+                    ranks=[info.dp_rank],
                     active=False,
                 )
             )
         except Exception:
             logger.exception(
-                "Failed to report inactive local DP ranks %s", self.local_dp_ranks
+                "Failed to report inactive DP rank %s", info.dp_rank
             )
         finally:
             time.sleep(FT_PROCESS_EXIT_GRACE_PERIOD)

@@ -171,6 +171,21 @@ class TestSubprocessWatchdog(CustomTestCase):
         self.assertEqual(exits, [(0, 20, "process_0", False)])
         self.assertTrue(self.sigquit_triggered.is_set())
 
+    def test_callback_can_isolate_crash_without_default_sigquit(self):
+        exits = []
+        process = FakeProcess(pid=21, alive=False, exitcode=1)
+        monitor = SubprocessWatchdog(
+            processes=[process],
+            on_exit=lambda index, process, name: exits.append(
+                (index, process.pid, name)
+            ),
+            fail_stop_on_exit=False,
+        )
+
+        self.assertFalse(monitor._check_processes())
+        self.assertEqual(exits, [(0, 21, "process_0")])
+        self.assertFalse(self.sigquit_triggered.is_set())
+
 
 if __name__ == "__main__":
     import unittest

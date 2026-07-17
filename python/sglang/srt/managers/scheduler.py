@@ -3819,15 +3819,6 @@ class Scheduler(
         if rank not in recv_req.target_ranks:
             return None
 
-        if recv_req.command == "shutdown":
-            if self.attn_tp_rank != 0 or self.attn_cp_rank != 0:
-                return None
-            logger.warning(
-                "FT scale_down is terminating the DP leader process for rank %s", rank
-            )
-            os.kill(os.getpid(), signal.SIGTERM)
-            return None
-
         try:
             if recv_req.command == "pause":
                 self._engine_paused = True

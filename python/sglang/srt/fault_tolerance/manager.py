@@ -141,18 +141,6 @@ class FaultToleranceManager:
                 f"{sorted(resume_targets)}: {exc}"
             )
 
-        if instruction == "scale_down" and ranks:
-            try:
-                await self._send_command_no_wait(
-                    command="shutdown",
-                    target_ranks=ranks,
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to dispatch fire-and-forget shutdown for DP ranks %s",
-                    ranks,
-                )
-
         response = self.state.commit_recover(
             resumed_ranks=acked,
             isolated_ranks=(ranks if instruction == "scale_down" else None),
@@ -364,30 +352,6 @@ class FaultToleranceManager:
             sorted(timed_out),
         )
         return pending.acked, timed_out
-
-    async def _send_command_no_wait(
-        self,
-        *,
-        command: str,
-        target_ranks: List[int],
-    ) -> None:
-        target_set = set(target_ranks)
-        if not target_set:
-            return
-        request_id = uuid.uuid4().hex
-        logger.info(
-            "FT command dispatch without ack: id=%s command=%s targets=%s",
-            request_id,
-            command,
-            sorted(target_set),
-        )
-        await self.send_to_scheduler.send_pyobj(
-            FaultToleranceCommandReqInput(
-                request_id=request_id,
-                command=command,
-                target_ranks=sorted(target_set),
-            )
-        )
 
     @staticmethod
     def _failstop(message: str) -> None:

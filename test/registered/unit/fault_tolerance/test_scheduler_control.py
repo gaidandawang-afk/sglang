@@ -1,12 +1,9 @@
 import ast
 import logging
-import os
-import signal
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional, Tuple
-from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -115,8 +112,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 "RecoveredDPRanksOutput": RecoveredDPRanksOutput,
                 "Tuple": Tuple,
                 "logger": logging.getLogger(__name__),
-                "os": os,
-                "signal": signal,
             },
         )
         cls.handle_command = staticmethod(
@@ -233,37 +228,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertFalse(output.success)
         self.assertIn("tp_rank=1: boom", output.message)
 
-    def test_shutdown_terminates_only_the_target_leader_without_collective(self):
-        scheduler, events = self.make_scheduler()
-        scheduler._aggregate_ft_command_result = lambda *_: self.fail(
-            "shutdown must not enter a collective"
-        )
-        request = FaultToleranceCommandReqInput(
-            request_id="request",
-            command="shutdown",
-            target_ranks=[1],
-        )
-
-        with patch("os.kill") as kill:
-            self.assertIsNone(self.handle_command(scheduler, request))
-
-        kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
-        self.assertEqual(events, [])
-
-    def test_shutdown_is_ignored_by_nonleader_dp_members(self):
-        scheduler, events = self.make_scheduler(attn_tp_rank=1)
-        request = FaultToleranceCommandReqInput(
-            request_id="request",
-            command="shutdown",
-            target_ranks=[1],
-        )
-
-        with patch("os.kill") as kill:
-            self.assertIsNone(self.handle_command(scheduler, request))
-
-        kill.assert_not_called()
-        self.assertEqual(events, [])
-
     def test_successful_tp_recovery_is_reported_as_explicit_dp_ranks(self):
         sender = Sender()
         scheduler = SimpleNamespace(
@@ -283,12 +247,12 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertEqual(len(sender.sent), 1)
         self.assertEqual(sender.sent[0].ranks, [1, 2])
 
-    def test_dpc_forwards_shutdown_to_dp_leader(self):
+    def test_dpc_forwards_command_to_target_dp_leader(self):
         workers = [Sender(), Sender()]
         dpc = SimpleNamespace(workers=workers)
         request = FaultToleranceCommandReqInput(
             request_id="request",
-            command="shutdown",
+            command="resume",
             target_ranks=[1],
         )
 
@@ -297,7 +261,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertEqual(workers[0].sent, [])
         self.assertEqual(workers[1].sent, [request])
 
-    def test_local_process_exit_reports_all_local_dp_ranks_then_waits(self):
+    def test_local_process_exit_reports_only_affected_dp_rank_then_waits(self):
         dpc = SimpleNamespace(
             scheduler_process_infos=[
                 SimpleNamespace(global_rank=8, dp_rank=2),
@@ -312,7 +276,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         self.assertEqual(len(DPC_RUNTIME.sender.sent), 1)
         output = DPC_RUNTIME.sender.sent[0]
-        self.assertEqual(output.ranks, [2, 3])
+        self.assertEqual(output.ranks, [2])
         self.assertFalse(output.active)
         self.assertEqual(DPC_RUNTIME.sleeps, [2])
         self.assertTrue(DPC_RUNTIME.sender.closed)

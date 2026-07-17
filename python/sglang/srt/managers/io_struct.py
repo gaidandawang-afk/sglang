@@ -1392,7 +1392,7 @@ class ContinueGenerationReqInput(BaseReq):
 @dataclass
 class FaultToleranceCommandReqInput(BaseReq):
     request_id: str
-    command: Literal["pause", "resume", "shutdown"]
+    command: Literal["pause", "resume"]
     target_ranks: List[int]
 
 

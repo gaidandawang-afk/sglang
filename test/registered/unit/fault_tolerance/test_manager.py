@@ -134,13 +134,12 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
             [0],
         )
 
-    async def test_scale_down_is_fire_and_forget(self):
+    async def test_scale_down_is_logical_isolation(self):
         manager = make_manager()
         manager.state.begin_exception_pause()
         manager.state.finish_pause({0, 1})
         manager._publish_active_ranks = AsyncMock()
         manager._send_command_collect = AsyncMock(return_value=({0}, set()))
-        manager._send_command_no_wait = AsyncMock()
 
         status, response = await manager.apply(
             {
@@ -157,9 +156,11 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
             target_ranks=[0],
             timeout_sec=1,
         )
-        manager._send_command_no_wait.assert_awaited_once_with(
-            command="shutdown",
-            target_ranks=[1],
+        self.assertEqual(manager.state.disabled_dp_ranks, {1})
+        self.assertEqual(manager.state.process_active_ranks, [True, True])
+        self.assertEqual(
+            manager.state.rank_states,
+            [RankState.HEALTHY, RankState.PAUSED],
         )
 
     async def test_resume_timeout_enters_failstop_without_partial_commit(self):
@@ -178,49 +179,6 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager._failstop.assert_called_once()
         self.assertTrue(manager.state.ft_operation_in_progress)
         self.assertEqual(manager.state.paused_dp_ranks, {0, 1})
-
-    async def test_scale_down_dispatch_failure_does_not_fail_apply(self):
-        manager = make_manager()
-        manager.state.begin_exception_pause()
-        manager.state.finish_pause({0, 1})
-        manager._publish_active_ranks = AsyncMock()
-        manager._send_command_collect = AsyncMock(return_value=({0}, set()))
-        manager._send_command_no_wait = AsyncMock(
-            side_effect=RuntimeError("DPC unavailable")
-        )
-
-        status, response = await manager.apply(
-            {
-                "fault_tolerance_instruction": "scale_down",
-                "fault_tolerance_params": {"ranks": [1]},
-            }
-        )
-
-        self.assertEqual(status, 200)
-        self.assertTrue(response["success"])
-        self.assertEqual(manager.state.paused_dp_ranks, set())
-
-    async def test_shutdown_is_sent_for_process_inactive_dp(self):
-        manager = make_manager()
-        manager.state.begin_exception_pause()
-        manager.state.finish_pause({0, 1})
-        manager.state.process_active_ranks[1] = False
-        manager._publish_active_ranks = AsyncMock()
-        manager._send_command_collect = AsyncMock(return_value=({0}, set()))
-        manager._send_command_no_wait = AsyncMock()
-
-        status, _ = await manager.apply(
-            {
-                "fault_tolerance_instruction": "scale_down",
-                "fault_tolerance_params": {"ranks": [1]},
-            }
-        )
-
-        self.assertEqual(status, 200)
-        manager._send_command_no_wait.assert_awaited_once_with(
-            command="shutdown",
-            target_ranks=[1],
-        )
 
     async def test_scale_down_rejects_removed_shutdown_parameter(self):
         manager = make_manager()

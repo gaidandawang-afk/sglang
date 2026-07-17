@@ -40,12 +40,16 @@ def is_ft_supported_config(server_args) -> Tuple[bool, str]:
         return False, "ft_unsupported_with_multi_tokenizer"
     if getattr(server_args, "use_ray", False):
         return False, "ft_unsupported_with_ray_engine"
+    attn_tp_size = getattr(server_args, "tp_size", 1)
     if getattr(server_args, "enable_dp_attention", False):
         attention_block_count = getattr(server_args, "dp_size", 1) * getattr(
             server_args, "attn_cp_size", 1
         )
         if getattr(server_args, "tp_size", 1) % attention_block_count != 0:
             return False, "ft_requires_tp_divisible_by_dp_and_attn_cp"
+        attn_tp_size //= attention_block_count
+    if getattr(server_args, "elastic_ep_rejoin", False) and attn_tp_size != 1:
+        return False, "ft_rejoin_requires_attn_tp1"
     return True, ""
 
 
@@ -109,14 +113,15 @@ class FaultToleranceState:
         return sorted(rank for rank in self.paused_dp_ranks if runtime_active[rank])
 
     def refresh_rank_states(self) -> None:
-        effective_active = self.effective_active_mask()
+        runtime_active = self.runtime_active_mask()
         self.rank_states = [
             (
                 RankState.DEAD
-                if not effective_active[rank]
+                if not runtime_active[rank]
                 else (
                     RankState.PAUSED
                     if rank in self.paused_dp_ranks
+                    or rank in self.disabled_dp_ranks
                     else RankState.HEALTHY
                 )
             )

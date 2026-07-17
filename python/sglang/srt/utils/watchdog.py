@@ -174,6 +174,8 @@ class SubprocessWatchdog:
     See: https://github.com/sgl-project/sglang/issues/18421
 
     An optional ``on_exit`` callback is invoked before the default SIGQUIT path.
+    Callers that can isolate one failed subprocess may disable that fail-stop
+    while retaining sentinel-based monitoring for the remaining subprocesses.
     """
 
     def __init__(
@@ -182,11 +184,13 @@ class SubprocessWatchdog:
         process_names: Optional[List[str]] = None,
         interval: float = 1.0,
         on_exit: Optional[Callable[[int, Process, str], None]] = None,
+        fail_stop_on_exit: bool = True,
     ):
         self._processes = processes
         self._names = process_names or [f"process_{i}" for i in range(len(processes))]
         self._interval = interval
         self._on_exit = on_exit
+        self._fail_stop_on_exit = fail_stop_on_exit
         self._stop_event = threading.Event()
         self._stop_reader, self._stop_writer = Pipe(duplex=False)
         self._reported = set()
@@ -252,6 +256,14 @@ class SubprocessWatchdog:
                 )
 
         self._reported.add(index)
+        if not self._fail_stop_on_exit:
+            logger.error(
+                f"Subprocess {name} (pid={proc.pid}) crashed "
+                f"with exit code {proc.exitcode}. "
+                f"Continuing to monitor remaining subprocesses."
+            )
+            return False
+
         logger.error(
             f"Subprocess {name} (pid={proc.pid}) crashed "
             f"with exit code {proc.exitcode}. "
