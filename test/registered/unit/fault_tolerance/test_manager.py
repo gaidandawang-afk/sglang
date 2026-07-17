@@ -160,7 +160,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.state.process_active_ranks, [True, True])
         self.assertEqual(
             manager.state.rank_states,
-            [RankState.HEALTHY, RankState.PAUSED],
+            [RankState.HEALTHY, RankState.DEAD],
         )
 
     async def test_resume_timeout_enters_failstop_without_partial_commit(self):
