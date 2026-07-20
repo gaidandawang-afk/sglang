@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class PendingFTCommand:
+    command: str
     target_ranks: set[int]
     future: asyncio.Future
     acked: set[int] = dataclasses.field(default_factory=set)
@@ -176,6 +177,8 @@ class FaultToleranceManager:
         targets = self.state.observe_process_active_ranks(
             ranks.ranks, active=ranks.active
         )
+        if not ranks.active:
+            self._drop_process_inactive_pause_targets(set(ranks.ranks))
         if targets:
             self._create_task(self._pause_schedulers(targets))
         active_mask = self.state.take_effective_active_update()
@@ -208,6 +211,26 @@ class FaultToleranceManager:
         else:
             pending.failed[output.rank] = output.message
         pending.finish_if_ready()
+
+    def _drop_process_inactive_pause_targets(self, inactive_ranks: set[int]) -> None:
+        if not inactive_ranks:
+            return
+
+        for request_id, pending in self._pending_commands.items():
+            if pending.command != "pause":
+                continue
+            dropped_ranks = pending.target_ranks & inactive_ranks
+            if not dropped_ranks:
+                continue
+            pending.target_ranks.difference_update(dropped_ranks)
+            logger.info(
+                "FT pause targets became runtime-inactive: id=%s "
+                "dropped=%s remaining=%s",
+                request_id,
+                sorted(dropped_ranks),
+                sorted(pending.target_ranks),
+            )
+            pending.finish_if_ready()
 
     def handle_active_ranks_update_output(
         self, output: ActiveRanksUpdateReqOutput
@@ -310,6 +333,7 @@ class FaultToleranceManager:
 
         request_id = uuid.uuid4().hex
         pending = PendingFTCommand(
+            command=command,
             target_ranks=target_set,
             future=self.event_loop.create_future(),
         )
@@ -334,7 +358,7 @@ class FaultToleranceManager:
                 request_id,
                 command,
                 sorted(pending.acked),
-                sorted(target_set - pending.acked),
+                sorted(pending.target_ranks - pending.acked),
             )
             raise
         finally:
@@ -344,7 +368,7 @@ class FaultToleranceManager:
             raise RuntimeError(
                 f"fault tolerance command {command} failed: {pending.failed}"
             )
-        timed_out = target_set - pending.acked
+        timed_out = pending.target_ranks - pending.acked
         logger.info(
             "FT command complete: id=%s command=%s timed_out=%s",
             request_id,

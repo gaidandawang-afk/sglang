@@ -7,6 +7,7 @@ from sglang.srt.fault_tolerance.controller import RankState
 from sglang.srt.fault_tolerance.manager import FaultToleranceManager
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
+    FaultToleranceCommandReqOutput,
     FaultToleranceRankFaultOutput,
     ProcessActiveRanksOutput,
     RecoveredDPRanksOutput,
@@ -58,6 +59,41 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
 
         manager._pause_schedulers.assert_awaited_once_with([0])
+
+    async def test_process_down_shrinks_inflight_pause_targets(self):
+        manager = make_manager(dp_size=4)
+
+        manager.observe_process_active_ranks(
+            ProcessActiveRanksOutput(ranks=[1], active=False)
+        )
+        await asyncio.sleep(0)
+
+        self.assertEqual(len(manager._pending_commands), 1)
+        request_id, pending = next(iter(manager._pending_commands.items()))
+        self.assertEqual(pending.command, "pause")
+        self.assertEqual(pending.target_ranks, {0, 2, 3})
+
+        for rank in (0, 3):
+            manager.handle_command_output(
+                FaultToleranceCommandReqOutput(
+                    request_id=request_id,
+                    rank=rank,
+                    success=True,
+                    message="paused",
+                )
+            )
+
+        manager.observe_process_active_ranks(
+            ProcessActiveRanksOutput(ranks=[2], active=False)
+        )
+        await asyncio.gather(*list(manager.asyncio_tasks))
+
+        self.assertEqual(manager.state.paused_dp_ranks, {0, 3})
+        self.assertEqual(
+            manager.state.rank_states,
+            [RankState.PAUSED, RankState.DEAD, RankState.DEAD, RankState.PAUSED],
+        )
+        self.assertEqual(manager._pending_commands, {})
 
     async def test_rejoin_requires_process_native_and_recovery_sources(self):
         manager = make_manager(strategy="continue")
