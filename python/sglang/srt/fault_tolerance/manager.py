@@ -128,8 +128,6 @@ class FaultToleranceManager:
             return 503, response
 
         resume_targets = set(resume_targets)
-        if instruction == "scale_down":
-            resume_targets.difference_update(ranks or [])
         try:
             acked, _ = await self._send_command_collect(
                 command="resume",

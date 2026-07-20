@@ -175,7 +175,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager.state.begin_exception_pause()
         manager.state.finish_pause({0, 1})
         manager._publish_active_ranks = AsyncMock()
-        manager._send_command_collect = AsyncMock(return_value=({0}, set()))
+        manager._send_command_collect = AsyncMock(return_value=({0, 1}, set()))
 
         status, response = await manager.apply(
             {
@@ -185,11 +185,11 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(status, 200)
-        self.assertEqual(response["resumed_ranks"], [0])
+        self.assertEqual(response["resumed_ranks"], [0, 1])
         self.assertEqual(manager.state.paused_dp_ranks, set())
         manager._send_command_collect.assert_awaited_once_with(
             command="resume",
-            target_ranks=[0],
+            target_ranks=[0, 1],
             timeout_sec=1,
         )
         self.assertEqual(manager.state.disabled_dp_ranks, {1})
