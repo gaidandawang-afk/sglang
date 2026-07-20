@@ -1546,7 +1546,7 @@ class Scheduler(
             try:
                 dispatch_event_loop(self)
             except Exception as exc:
-                recovered = self._ft_discard_current_batch(exc)
+                recovered = self._ft_discard_inflight_window(exc)
                 self.send_to_tokenizer.send_output(
                     FaultToleranceRankFaultOutput(
                         rank=self._ft_rank(),
@@ -1576,20 +1576,40 @@ class Scheduler(
             RecoveredDPRanksOutput(ranks=recovered_dp_ranks)
         )
 
-    def _ft_discard_current_batch(self, exc: Exception) -> bool:
-        batch = self.cur_batch
-        if batch is None or batch.is_empty():
-            return True
-        if batch.forward_mode.is_idle():
-            self.cur_batch = None
-            if self.last_batch is batch:
-                self.last_batch = None
-            return True
-        discarded_reqs = [req for req in batch.reqs if not req.finished()]
+    def _ft_discard_inflight_window(self, exc: Exception) -> bool:
+        window_batches = [self.cur_batch, self.last_batch, self.running_batch]
+        result_queue = getattr(self, "result_queue", None)
+        if result_queue is not None:
+            window_batches.extend(batch for batch, _ in result_queue)
+
+        discarded_by_rid = {}
+        for batch in window_batches:
+            if batch is None:
+                continue
+            for req in batch.reqs:
+                if not req.finished():
+                    discarded_by_rid.setdefault(req.rid, req)
+        if self.chunked_req is not None and not self.chunked_req.finished():
+            discarded_by_rid.setdefault(self.chunked_req.rid, self.chunked_req)
+        discarded_reqs = list(discarded_by_rid.values())
+
         success = True
         for req in discarded_reqs:
             try:
-                release_kv_cache(req, self.tree_cache, is_insert=False)
+                # prepare_for_decode commits the newly allocated KV slot before
+                # ModelRunner.forward runs.  If that forward raises, no output
+                # token exists for the slot, so make release_kv_cache reclaim it
+                # through its overallocated-tail path instead of leaking it.
+                req.kv_committed_len = min(
+                    req.kv_committed_len,
+                    len(req.origin_input_ids) + len(req.output_ids),
+                )
+                release_kv_cache(
+                    req,
+                    self.tree_cache,
+                    is_insert=False,
+                    allow_non_spec_overallocated=True,
+                )
                 abort_reason = FINISH_ABORT(
                     message=f"Request discarded after scheduler exception: {exc}",
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE,
@@ -1610,19 +1630,25 @@ class Scheduler(
                 )
                 success = False
 
-        batch.filter_batch(keep_indices=[])
-        batch.batch_is_full = False
-        if self.chunked_req in discarded_reqs:
+        self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+        if self.chunked_req is not None and self.chunked_req.rid in discarded_by_rid:
             self.chunked_req = None
+            self._chunked_req_scheduled_last_iter = False
+        if result_queue is not None:
+            result_queue.clear()
         self.cur_batch = None
-        if self.last_batch is batch:
-            self.last_batch = None
+        self.last_batch = None
         logger.warning(
-            "FT discarded %d request(s) after scheduler exception: %s",
+            "FT discarded %d in-flight request(s) after scheduler exception: %s",
             len(discarded_reqs),
             exc,
         )
         return success
+
+    def _process_next_overlap_result(self):
+        batch, result = self.result_queue[0]
+        self.process_batch_result(batch, result)
+        self.result_queue.popleft()
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1658,11 +1684,6 @@ class Scheduler(
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
-        def pop_and_process():
-            # Process the results of the last batch
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
-
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
@@ -1678,7 +1699,7 @@ class Scheduler(
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
-                pop_and_process()
+                self._process_next_overlap_result()
 
             # Launch the current batch
             if batch:
@@ -1690,7 +1711,7 @@ class Scheduler(
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
-                    pop_and_process()
+                    self._process_next_overlap_result()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
@@ -3766,8 +3787,7 @@ class Scheduler(
 
         if self.enable_overlap and self.last_batch:
             # Process the results of the last batch
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
+            self._process_next_overlap_result()
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             chunked_req_to_exclude = set()

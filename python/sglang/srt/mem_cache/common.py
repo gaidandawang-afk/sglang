@@ -563,7 +563,12 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     return out_cache_loc
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+def release_kv_cache(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    is_insert: bool = True,
+    allow_non_spec_overallocated: bool = False,
+):
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
         assert (
@@ -595,7 +600,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
-    if spec_algo is None and not global_server_args.strip_thinking_cache:
+    if (
+        spec_algo is None
+        and not global_server_args.strip_thinking_cache
+        and not allow_non_spec_overallocated
+    ):
         assert (
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"

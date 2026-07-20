@@ -1,4 +1,6 @@
 import ast
+from collections import deque
+from http import HTTPStatus
 import logging
 import unittest
 from pathlib import Path
@@ -28,6 +30,45 @@ class ProcessActiveRanksOutput(Struct):
 
 class RecoveredDPRanksOutput(Struct):
     pass
+
+
+class AbortReq(Struct):
+    pass
+
+
+class FinishAbort:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+    def to_json(self):
+        return self.__dict__
+
+
+class FakeReq:
+    def __init__(
+        self,
+        rid,
+        *,
+        origin_input_ids=None,
+        output_ids=None,
+        kv_committed_len=0,
+        kv_allocated_len=0,
+    ):
+        self.rid = rid
+        self.finished_reason = None
+        self.origin_input_ids = origin_input_ids or []
+        self.output_ids = output_ids or []
+        self.kv_committed_len = kv_committed_len
+        self.kv_allocated_len = kv_allocated_len
+
+    def finished(self):
+        return self.finished_reason is not None
+
+
+class FakeBatch:
+    def __init__(self, reqs, batch_is_full=True):
+        self.reqs = list(reqs)
+        self.batch_is_full = batch_is_full
 
 
 def load_class_methods(path: Path, class_name: str, method_names, namespace):
@@ -67,8 +108,8 @@ class Sender:
     def send_pyobj(self, value):
         self.sent.append(value)
 
-    def send_output(self, value):
-        self.sent.append(value)
+    def send_output(self, value, *args):
+        self.sent.append((value, *args))
 
     def close(self, linger=None):
         self.closed = True
@@ -104,14 +145,21 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 "handle_fault_tolerance_command",
                 "_aggregate_ft_command_result",
                 "_report_recovered_dp_ranks",
+                "_ft_discard_inflight_window",
+                "_process_next_overlap_result",
             },
             {
+                "AbortReq": AbortReq,
+                "FINISH_ABORT": FinishAbort,
                 "FaultToleranceCommandReqInput": FaultToleranceCommandReqInput,
                 "FaultToleranceCommandReqOutput": FaultToleranceCommandReqOutput,
+                "HTTPStatus": HTTPStatus,
                 "Optional": Optional,
                 "RecoveredDPRanksOutput": RecoveredDPRanksOutput,
+                "ScheduleBatch": FakeBatch,
                 "Tuple": Tuple,
                 "logger": logging.getLogger(__name__),
+                "release_kv_cache": lambda *args, **kwargs: None,
             },
         )
         cls.handle_command = staticmethod(
@@ -122,6 +170,12 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         )
         cls.report_recovered = staticmethod(
             scheduler_methods["_report_recovered_dp_ranks"]
+        )
+        cls.discard_inflight = staticmethod(
+            scheduler_methods["_ft_discard_inflight_window"]
+        )
+        cls.process_next_overlap = staticmethod(
+            scheduler_methods["_process_next_overlap_result"]
         )
 
         dpc_methods = load_class_methods(
@@ -144,9 +198,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 ),
             },
         )
-        cls.send_dpc_command = staticmethod(
-            dpc_methods["send_fault_tolerance_command"]
-        )
+        cls.send_dpc_command = staticmethod(dpc_methods["send_fault_tolerance_command"])
         cls.handle_process_exit = staticmethod(
             dpc_methods["_handle_scheduler_process_exit"]
         )
@@ -245,7 +297,87 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.report_recovered(scheduler)
 
         self.assertEqual(len(sender.sent), 1)
-        self.assertEqual(sender.sent[0].ranks, [1, 2])
+        self.assertEqual(sender.sent[0][0].ranks, [1, 2])
+
+    def test_exception_discards_the_overlap_window_once_per_request(self):
+        shared = FakeReq("shared")
+        previous_only = FakeReq("previous")
+        current_only = FakeReq(
+            "current",
+            origin_input_ids=list(range(10)),
+            output_ids=[10],
+            kv_committed_len=12,
+            kv_allocated_len=12,
+        )
+        waiting = FakeReq("waiting")
+        previous = FakeBatch([shared, previous_only])
+        current = FakeBatch([shared, current_only])
+        running = FakeBatch([shared, previous_only, current_only])
+        sender = Sender()
+        released = []
+        release_options = {}
+        scheduler = SimpleNamespace(
+            cur_batch=current,
+            last_batch=previous,
+            result_queue=deque([(previous, object())]),
+            running_batch=running,
+            chunked_req=current_only,
+            waiting_queue=[waiting],
+            tree_cache=object(),
+            send_to_tokenizer=sender,
+        )
+
+        def record_release(req, *args, **kwargs):
+            released.append(req.rid)
+            release_options[req.rid] = kwargs
+
+        self.discard_inflight.__globals__["release_kv_cache"] = record_release
+
+        self.assertTrue(self.discard_inflight(scheduler, RuntimeError("boom")))
+
+        self.assertCountEqual(released, ["shared", "previous", "current"])
+        self.assertTrue(
+            all(
+                options["allow_non_spec_overallocated"]
+                for options in release_options.values()
+            )
+        )
+        self.assertEqual(current_only.kv_committed_len, 11)
+        self.assertEqual(len(sender.sent), 3)
+        self.assertEqual(
+            {entry[0].rid for entry in sender.sent},
+            {"shared", "previous", "current"},
+        )
+        for abort, req in sender.sent:
+            self.assertEqual(
+                abort.finished_reason["status_code"], HTTPStatus.SERVICE_UNAVAILABLE
+            )
+            self.assertEqual(abort.finished_reason["err_type"], "SchedulerFault")
+            self.assertIs(
+                req.finished_reason.status_code, HTTPStatus.SERVICE_UNAVAILABLE
+            )
+        self.assertEqual(scheduler.running_batch.reqs, [])
+        self.assertEqual(scheduler.waiting_queue, [waiting])
+        self.assertEqual(scheduler.result_queue, deque())
+        self.assertIsNone(scheduler.cur_batch)
+        self.assertIsNone(scheduler.last_batch)
+        self.assertIsNone(scheduler.chunked_req)
+
+    def test_overlap_result_is_only_popped_after_successful_processing(self):
+        batch = FakeBatch([])
+        result = object()
+        scheduler = SimpleNamespace(
+            result_queue=deque([(batch, result)]),
+            process_batch_result=lambda *_: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            self.process_next_overlap(scheduler)
+        self.assertEqual(list(scheduler.result_queue), [(batch, result)])
+
+        scheduler.process_batch_result = lambda *_: None
+        self.process_next_overlap(scheduler)
+        self.assertEqual(scheduler.result_queue, deque())
 
     def test_dpc_forwards_command_to_target_dp_leader(self):
         workers = [Sender(), Sender()]
