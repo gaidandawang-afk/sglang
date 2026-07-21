@@ -3820,6 +3820,14 @@ class Scheduler(
         self, recv_req: FaultToleranceCommandReqInput
     ) -> Optional[FaultToleranceCommandReqOutput]:
         rank = self._ft_rank()
+        if os.getenv("SGLANG_FT_DEBUG_STACK_SIGNAL") == "1":
+            logger.info(
+                "FT scheduler command received: id=%s command=%s rank=%s targets=%s",
+                recv_req.request_id,
+                recv_req.command,
+                rank,
+                recv_req.target_ranks,
+            )
         if rank not in recv_req.target_ranks:
             return None
 
@@ -3838,6 +3846,15 @@ class Scheduler(
             message = str(exc)
 
         success, message = self._aggregate_ft_command_result(success, message)
+        if os.getenv("SGLANG_FT_DEBUG_STACK_SIGNAL") == "1":
+            logger.info(
+                "FT scheduler command handled: id=%s command=%s rank=%s success=%s message=%s",
+                recv_req.request_id,
+                recv_req.command,
+                rank,
+                success,
+                message,
+            )
         if self.attn_tp_rank != 0 or self.attn_cp_rank != 0:
             return None
         return FaultToleranceCommandReqOutput(
@@ -4135,6 +4152,16 @@ def configure_scheduler_process(
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
+    debug_stack_signal = getattr(signal, "SIGUSR2", None)
+    if (
+        os.getenv("SGLANG_FT_DEBUG_STACK_SIGNAL") == "1"
+        and debug_stack_signal is not None
+    ):
+        faulthandler.register(debug_stack_signal, all_threads=True)
+        logger.info(
+            "FT debug stack signal enabled: signal=%s",
+            debug_stack_signal,
+        )
 
     # Set cpu affinity to this gpu process
     if envs.SGLANG_SET_CPU_AFFINITY.get():
