@@ -20,6 +20,9 @@ if TYPE_CHECKING:
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
+FT_ACTION_NONE = 0
+FT_ACTION_PAUSE_READY = 1
+
 
 @dataclass
 class MLPSyncBatchInfo:
@@ -33,6 +36,7 @@ class MLPSyncBatchInfo:
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
+    ft_action: int
 
     # some gathered elements
     tp0_info: torch.Tensor = None
@@ -40,6 +44,7 @@ class MLPSyncBatchInfo:
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
+    global_ft_actions: list[int] = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
@@ -51,6 +56,7 @@ class MLPSyncBatchInfo:
                 int(self.is_extend_in_batch),
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
+                self.ft_action,
             ],
             device=device,
             dtype=dtype,
@@ -65,6 +71,8 @@ class MLPSyncBatchInfo:
                 0,  # is_extend_in_batch
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
+                # An inactive DP no longer participates in the pending pause.
+                FT_ACTION_PAUSE_READY,
             ],
             device=device,
             dtype=dtype,
@@ -73,7 +81,7 @@ class MLPSyncBatchInfo:
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 6),
+            (self.dp_size, self.tp_size * self.cp_size, 7),
             dtype=torch.int64,
             device=device,
         )
@@ -89,15 +97,16 @@ class MLPSyncBatchInfo:
             tp_active_ranks = get_tp_group().active_ranks
 
         # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 6)
+        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 7)
         tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
 
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
         # Perform only one Device-to-Host (D2H) memory copy
-        cpu_data = tp0_info[:, :2].cpu()
+        cpu_data = tp0_info[:, [0, 1, 6]].cpu()
         self.global_num_tokens = cpu_data[:, 0].tolist()
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
+        self.global_ft_actions = cpu_data[:, 2].tolist()
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
         if _ENABLE_METRICS_DP_ATTENTION:
@@ -139,6 +148,7 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    ft_action: int = FT_ACTION_NONE,
 ):
     # Check if other DP workers have running batches
     if local_batch is None or local_batch.forward_mode.is_prebuilt():
@@ -196,6 +206,7 @@ def prepare_mlp_sync_batch_raw(
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
+        ft_action=ft_action,
     )
 
     if not skip_all_gather:
@@ -222,12 +233,12 @@ def prepare_mlp_sync_batch_raw(
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
         local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info
 
-    return local_batch
+    return local_batch, mlp_sync_info
 
 
 class SchedulerDPAttnMixin:
     def prepare_mlp_sync_batch(self: Scheduler, local_batch: ScheduleBatch):
-        return prepare_mlp_sync_batch_raw(
+        local_batch, mlp_sync_info = prepare_mlp_sync_batch_raw(
             local_batch,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.attn_tp_size,
@@ -238,7 +249,14 @@ class SchedulerDPAttnMixin:
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
+            ft_action=(
+                FT_ACTION_PAUSE_READY
+                if self._ft_pending_pause is not None
+                else FT_ACTION_NONE
+            ),
         )
+        self._update_ft_pause_from_mlp_sync(mlp_sync_info.global_ft_actions)
+        return local_batch
 
     def maybe_prepare_mlp_sync_batch(
         self: Scheduler,

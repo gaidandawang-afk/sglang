@@ -172,7 +172,10 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
-from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
+from sglang.srt.managers.scheduler_dp_attn_mixin import (
+    FT_ACTION_PAUSE_READY,
+    SchedulerDPAttnMixin,
+)
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
@@ -1066,6 +1069,7 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+        self._ft_pending_pause: Optional[FaultToleranceCommandReqInput] = None
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1640,6 +1644,7 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
+            self._complete_ft_pause()
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1671,6 +1676,7 @@ class Scheduler(
         ] = deque()
 
         while True:
+            self._complete_ft_pause()
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -2673,6 +2679,8 @@ class Scheduler(
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
             new_batch = self.maybe_prepare_mlp_sync_batch(new_batch)
+            if self._engine_paused:
+                return new_batch
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
@@ -3833,8 +3841,15 @@ class Scheduler(
 
         try:
             if recv_req.command == "pause":
-                self._engine_paused = True
-                message = "paused"
+                self._ft_pending_pause = recv_req
+                if os.getenv("SGLANG_FT_DEBUG_STACK_SIGNAL") == "1":
+                    logger.info(
+                        "FT scheduler pause ready: id=%s rank=%s targets=%s",
+                        recv_req.request_id,
+                        rank,
+                        recv_req.target_ranks,
+                    )
+                return None
             elif recv_req.command == "resume":
                 self._engine_paused = False
                 message = "resumed"
@@ -3864,6 +3879,40 @@ class Scheduler(
             message=message,
         )
 
+    def _update_ft_pause_from_mlp_sync(self, global_ft_actions) -> None:
+        pending = self._ft_pending_pause
+        if pending is None or self._engine_paused or global_ft_actions is None:
+            return
+        if all(
+            global_ft_actions[rank] == FT_ACTION_PAUSE_READY
+            for rank in pending.target_ranks
+        ):
+            self._engine_paused = True
+
+    def _complete_ft_pause(self) -> None:
+        pending = self._ft_pending_pause
+        if pending is None or not self._engine_paused:
+            return
+
+        self._ft_pending_pause = None
+        rank = self._ft_rank()
+        if os.getenv("SGLANG_FT_DEBUG_STACK_SIGNAL") == "1":
+            logger.info(
+                "FT scheduler pause committed: id=%s rank=%s targets=%s",
+                pending.request_id,
+                rank,
+                pending.target_ranks,
+            )
+        if self.attn_tp_rank != 0 or self.attn_cp_rank != 0:
+            return
+        output = FaultToleranceCommandReqOutput(
+            request_id=pending.request_id,
+            rank=rank,
+            success=True,
+            message="paused",
+        )
+        self.send_to_tokenizer.send_output(output, pending)
+
     def _aggregate_ft_command_result(
         self, success: bool, message: str
     ) -> Tuple[bool, str]:
@@ -3882,9 +3931,7 @@ class Scheduler(
             if self.attn_tp_size != 1:
                 gathered_results = self.attn_tp_group.all_gather_object(cp_results)
                 member_results = [
-                    result
-                    for tp_results in gathered_results
-                    for result in tp_results
+                    result for tp_results in gathered_results for result in tp_results
                 ]
             else:
                 member_results = cp_results
@@ -3897,8 +3944,7 @@ class Scheduler(
         if not failures:
             return True, message
         return False, "; ".join(
-            f"tp_rank={result['tp_rank']}: {result['message']}"
-            for result in failures
+            f"tp_rank={result['tp_rank']}: {result['message']}" for result in failures
         )
 
     def load_lora_adapter(

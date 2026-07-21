@@ -2,6 +2,7 @@ import ast
 from collections import deque
 from http import HTTPStatus
 import logging
+import os
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -138,6 +139,8 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             "Scheduler",
             {
                 "handle_fault_tolerance_command",
+                "_update_ft_pause_from_mlp_sync",
+                "_complete_ft_pause",
                 "_aggregate_ft_command_result",
                 "_ft_discard_inflight_window",
                 "_process_next_overlap_result",
@@ -147,11 +150,13 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 "FINISH_ABORT": FinishAbort,
                 "FaultToleranceCommandReqInput": FaultToleranceCommandReqInput,
                 "FaultToleranceCommandReqOutput": FaultToleranceCommandReqOutput,
+                "FT_ACTION_PAUSE_READY": 1,
                 "HTTPStatus": HTTPStatus,
                 "Optional": Optional,
                 "ScheduleBatch": FakeBatch,
                 "Tuple": Tuple,
                 "logger": logging.getLogger(__name__),
+                "os": os,
                 "release_kv_cache": lambda *args, **kwargs: None,
             },
         )
@@ -161,6 +166,10 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         cls.aggregate_result = staticmethod(
             scheduler_methods["_aggregate_ft_command_result"]
         )
+        cls.update_pause_from_mlp_sync = staticmethod(
+            scheduler_methods["_update_ft_pause_from_mlp_sync"]
+        )
+        cls.complete_pause = staticmethod(scheduler_methods["_complete_ft_pause"])
         cls.discard_inflight = staticmethod(
             scheduler_methods["_ft_discard_inflight_window"]
         )
@@ -212,7 +221,9 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             attn_cp_size=2,
             server_args=SimpleNamespace(enable_dp_attention=True),
             _engine_paused=False,
+            _ft_pending_pause=None,
             _ft_rank=lambda: 1,
+            send_to_tokenizer=Sender(),
         )
         cp_remote = {"tp_rank": 2, "success": True, "message": "paused"}
         tp_remote = [
@@ -231,20 +242,38 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         )
         return scheduler, events
 
-    def test_pause_is_aggregated_before_leader_ack(self):
+    def test_pause_waits_for_all_target_dp_ranks_before_ack(self):
         scheduler, events = self.make_scheduler()
         request = FaultToleranceCommandReqInput(
             request_id="request",
             command="pause",
-            target_ranks=[1],
+            target_ranks=[0, 1, 2],
         )
 
         output = self.handle_command(scheduler, request)
 
-        self.assertEqual(events, ["attn_cp", "attn_tp"])
+        self.assertIsNone(output)
+        self.assertEqual(events, [])
+        self.assertIs(scheduler._ft_pending_pause, request)
+        self.assertFalse(scheduler._engine_paused)
+        self.assertEqual(scheduler.send_to_tokenizer.sent, [])
+
+        self.update_pause_from_mlp_sync(scheduler, [1, 1, 0])
+        self.assertFalse(scheduler._engine_paused)
+
+        self.update_pause_from_mlp_sync(scheduler, [1, 1, 1])
         self.assertTrue(scheduler._engine_paused)
-        self.assertTrue(output.success)
-        self.assertEqual(output.rank, 1)
+        self.assertIs(scheduler._ft_pending_pause, request)
+        self.assertEqual(scheduler.send_to_tokenizer.sent, [])
+
+        self.complete_pause(scheduler)
+        self.assertIsNone(scheduler._ft_pending_pause)
+        self.assertEqual(len(scheduler.send_to_tokenizer.sent), 1)
+        ack, original_request = scheduler.send_to_tokenizer.sent[0]
+        self.assertEqual(ack.request_id, "request")
+        self.assertEqual(ack.rank, 1)
+        self.assertTrue(ack.success)
+        self.assertIs(original_request, request)
 
     def test_nonleader_executes_without_ack(self):
         scheduler, _ = self.make_scheduler(attn_tp_rank=1)
@@ -257,11 +286,11 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertIsNone(self.handle_command(scheduler, request))
         self.assertFalse(scheduler._engine_paused)
 
-    def test_remote_command_failure_is_returned_by_leader(self):
+    def test_remote_resume_failure_is_returned_by_leader(self):
         scheduler, _ = self.make_scheduler(remote_failure=True)
         request = FaultToleranceCommandReqInput(
             request_id="request",
-            command="pause",
+            command="resume",
             target_ranks=[1],
         )
 
