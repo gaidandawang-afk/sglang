@@ -128,7 +128,6 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
-    RecoveredDPRanksOutput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -1562,18 +1561,6 @@ class Scheduler(
 
     def _ft_rank(self) -> int:
         return self.dp_rank if self.dp_rank is not None else 0
-
-    def _report_recovered_dp_ranks(self) -> None:
-        recovered_tp_ranks = self.tp_worker.model_runner.take_recovered_ep_ranks()
-        if not self.server_args.enable_fault_tolerance or not recovered_tp_ranks:
-            return
-        ranks_per_dp = self.tp_size // self.dp_size
-        recovered_dp_ranks = sorted(
-            {rank // ranks_per_dp for rank in recovered_tp_ranks}
-        )
-        self.send_to_tokenizer.send_output(
-            RecoveredDPRanksOutput(ranks=recovered_dp_ranks)
-        )
 
     def _ft_discard_inflight_window(self, exc: Exception) -> bool:
         window_batches = [self.cur_batch, self.last_batch, self.running_batch]
@@ -3240,8 +3227,6 @@ class Scheduler(
             self.server_args.enable_dp_attention
             and self.server_args.elastic_ep_backend is not None
         ):
-            self._report_recovered_dp_ranks()
-
             # Get the tensors indicating rank activeness
             tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
             tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()

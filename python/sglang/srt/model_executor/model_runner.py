@@ -398,7 +398,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             rope_scaling is not None and "mrope_section" in rope_scaling
         )
         self.enable_elastic_ep = server_args.elastic_ep_backend is not None
-        self._recovered_ep_ranks: List[int] = []
         self.forward_pass_id = 0
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
@@ -1729,13 +1728,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 src=get_world_group().ranks[0],
             )
             logger.info(f"recover ranks {ranks_to_recover} done")
-            self._recovered_ep_ranks.extend(ranks_to_recover)
-
-    def take_recovered_ep_ranks(self) -> List[int]:
-        recovered_ranks = self._recovered_ep_ranks
-        self._recovered_ep_ranks = []
-        return recovered_ranks
-
     def _get_healthy_expert_location_src_rank(
         self, invoked_in_elastic_ep_rejoin_path: bool
     ) -> int:

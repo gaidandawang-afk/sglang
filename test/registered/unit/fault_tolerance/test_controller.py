@@ -94,8 +94,48 @@ class TestFaultToleranceState(unittest.TestCase):
         state.observe_mooncake_active_ranks([True, True])
         self.assertEqual(state.disabled_dp_ranks, {1})
 
-        state.observe_recovered_dp_ranks([1])
+        self.assertIsNone(state.validate_apply("recover", [1]))
+        self.assertEqual(state.begin_recover("recover", [1]), [])
+        state.commit_recover(set())
         self.assertEqual(state.disabled_dp_ranks, set())
+
+    def test_status_prioritizes_dead_then_paused_then_disabled(self):
+        state = FaultToleranceState(dp_size=3, strategy="pause")
+        state.disabled_dp_ranks = {0, 1, 2}
+        state.paused_dp_ranks = {0, 1}
+        state.process_active_ranks[0] = False
+
+        self.assertEqual(
+            state.status_response()["ranks"],
+            [
+                {"rank": 0, "state": "dead"},
+                {"rank": 1, "state": "paused"},
+                {"rank": 2, "state": "disabled"},
+            ],
+        )
+
+    def test_recover_does_not_require_runtime_to_be_active(self):
+        state = FaultToleranceState(dp_size=2, strategy="continue")
+        state.disabled_dp_ranks.add(1)
+        state.process_active_ranks[1] = False
+
+        self.assertIsNone(state.validate_apply("recover", [1]))
+        state.begin_recover("recover", [1])
+        response = state.commit_recover(set())
+
+        self.assertEqual(response["ranks"][1]["state"], "dead")
+        state.observe_process_active_ranks([1], active=True)
+        self.assertEqual(state.status_response()["ranks"][1]["state"], "healthy")
+
+    def test_recover_is_rejected_while_ft_operation_is_in_progress(self):
+        state = FaultToleranceState(dp_size=2, strategy="pause")
+        state.disabled_dp_ranks.add(1)
+        state.ft_operation_in_progress = True
+
+        self.assertEqual(
+            state.validate_apply("recover", [1]),
+            "ft_operation_in_progress",
+        )
 
     def test_process_rejoin_updates_only_reported_ranks(self):
         state = FaultToleranceState(dp_size=3, strategy="continue")
@@ -124,7 +164,7 @@ class TestFaultToleranceState(unittest.TestCase):
             response["ranks"],
             [
                 {"rank": 0, "state": "healthy"},
-                {"rank": 1, "state": "dead"},
+                {"rank": 1, "state": "disabled"},
             ],
         )
 

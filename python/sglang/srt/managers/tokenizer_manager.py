@@ -71,7 +71,6 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     ProcessActiveRanksOutput,
-    RecoveredDPRanksOutput,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -541,7 +540,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         self.fault_tolerance.handle_rank_fault,
                     ),
                     (ProcessActiveRanksOutput, self.update_process_active_ranks),
-                    (RecoveredDPRanksOutput, self.update_recovered_dp_ranks),
                 ]
             )
         self._result_dispatcher = TypeBasedDispatcher(handlers)
@@ -2516,11 +2514,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def update_process_active_ranks(self, ranks: ProcessActiveRanksOutput):
         active_ranks = self.fault_tolerance.observe_process_active_ranks(ranks)
-        if active_ranks is not None:
-            self.send_to_scheduler.send_pyobj(active_ranks)
-
-    def update_recovered_dp_ranks(self, ranks: RecoveredDPRanksOutput):
-        active_ranks = self.fault_tolerance.observe_recovered_dp_ranks(ranks)
         if active_ranks is not None:
             self.send_to_scheduler.send_pyobj(active_ranks)
 

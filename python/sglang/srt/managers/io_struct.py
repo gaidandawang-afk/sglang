@@ -1708,11 +1708,6 @@ class ProcessActiveRanksOutput(BaseReq):
 
 
 @dataclass
-class RecoveredDPRanksOutput(BaseReq):
-    ranks: List[int]
-
-
-@dataclass
 class ActiveRanksUpdateReqOutput(BaseReq):
     request_id: str
     success: bool

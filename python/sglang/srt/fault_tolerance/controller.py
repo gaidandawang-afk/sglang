@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 class RankState(str, Enum):
     HEALTHY = "healthy"
     PAUSED = "paused"
+    DISABLED = "disabled"
     DEAD = "dead"
 
 
@@ -62,18 +63,22 @@ class FaultToleranceState:
         self._last_effective_active_ranks = [True] * dp_size
 
     def status_response(self) -> Dict[str, Any]:
-        effective_active = self.effective_active_mask()
+        runtime_active = self.runtime_active_mask()
         return {
             "ranks": [
                 {
                     "rank": rank,
                     "state": (
                         RankState.DEAD
-                        if not effective_active[rank]
+                        if not runtime_active[rank]
                         else (
                             RankState.PAUSED
                             if rank in self.paused_dp_ranks
-                            else RankState.HEALTHY
+                            else (
+                                RankState.DISABLED
+                                if rank in self.disabled_dp_ranks
+                                else RankState.HEALTHY
+                            )
                         )
                     ).value,
                 }
@@ -153,11 +158,6 @@ class FaultToleranceState:
         self.mooncake_active_ranks = self._normalize_mask(new_mask)
         return self._begin_availability_pause(old_effective)
 
-    def observe_recovered_dp_ranks(self, ranks: Iterable[int]) -> None:
-        for rank in ranks:
-            if 0 <= rank < self.dp_size:
-                self.disabled_dp_ranks.discard(rank)
-
     def pending_effective_active_update(self) -> Optional[List[bool]]:
         effective_active = self.effective_active_mask()
         if effective_active == self._last_effective_active_ranks:
@@ -194,6 +194,8 @@ class FaultToleranceState:
     ) -> Optional[str]:
         if self.ft_operation_in_progress:
             return "ft_operation_in_progress"
+        if instruction == "recover":
+            return self.validate_recover_ranks(ranks)
         if not self.has_paused_rank():
             return "no_paused_rank"
         if instruction not in ("retry", "scale_down"):
@@ -219,12 +221,25 @@ class FaultToleranceState:
             return "cannot_isolate_all_active_ranks"
         return None
 
+    def validate_recover_ranks(self, ranks: Optional[List[int]]) -> Optional[str]:
+        if not ranks:
+            return "recover_requires_non_empty_ranks"
+        requested = set(ranks)
+        if any(rank < 0 or rank >= self.dp_size for rank in requested):
+            return "unknown_rank"
+        if not requested.issubset(self.disabled_dp_ranks):
+            return "recover_requires_disabled_ranks"
+        return None
+
     def begin_recover(
-        self, instruction: str, scale_down_ranks: Optional[List[int]] = None
+        self, instruction: str, ranks: Optional[List[int]] = None
     ) -> List[int]:
         self.ft_operation_in_progress = True
         if instruction == "scale_down":
-            self.disabled_dp_ranks.update(scale_down_ranks or [])
+            self.disabled_dp_ranks.update(ranks or [])
+        elif instruction == "recover":
+            self.disabled_dp_ranks.difference_update(ranks or [])
+            return []
         return self.resume_targets()
 
     def commit_recover(

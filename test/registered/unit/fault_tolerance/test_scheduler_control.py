@@ -7,7 +7,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional, Tuple
 
-
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
@@ -25,10 +24,6 @@ class FaultToleranceCommandReqOutput(Struct):
 
 
 class ProcessActiveRanksOutput(Struct):
-    pass
-
-
-class RecoveredDPRanksOutput(Struct):
     pass
 
 
@@ -144,7 +139,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             {
                 "handle_fault_tolerance_command",
                 "_aggregate_ft_command_result",
-                "_report_recovered_dp_ranks",
                 "_ft_discard_inflight_window",
                 "_process_next_overlap_result",
             },
@@ -155,7 +149,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 "FaultToleranceCommandReqOutput": FaultToleranceCommandReqOutput,
                 "HTTPStatus": HTTPStatus,
                 "Optional": Optional,
-                "RecoveredDPRanksOutput": RecoveredDPRanksOutput,
                 "ScheduleBatch": FakeBatch,
                 "Tuple": Tuple,
                 "logger": logging.getLogger(__name__),
@@ -167,9 +160,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         )
         cls.aggregate_result = staticmethod(
             scheduler_methods["_aggregate_ft_command_result"]
-        )
-        cls.report_recovered = staticmethod(
-            scheduler_methods["_report_recovered_dp_ranks"]
         )
         cls.discard_inflight = staticmethod(
             scheduler_methods["_ft_discard_inflight_window"]
@@ -279,25 +269,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         self.assertFalse(output.success)
         self.assertIn("tp_rank=1: boom", output.message)
-
-    def test_successful_tp_recovery_is_reported_as_explicit_dp_ranks(self):
-        sender = Sender()
-        scheduler = SimpleNamespace(
-            tp_size=16,
-            dp_size=4,
-            server_args=SimpleNamespace(enable_fault_tolerance=True),
-            tp_worker=SimpleNamespace(
-                model_runner=SimpleNamespace(
-                    take_recovered_ep_ranks=lambda: [4, 5, 7, 8]
-                )
-            ),
-            send_to_tokenizer=sender,
-        )
-
-        self.report_recovered(scheduler)
-
-        self.assertEqual(len(sender.sent), 1)
-        self.assertEqual(sender.sent[0][0].ranks, [1, 2])
 
     def test_exception_discards_the_overlap_window_once_per_request(self):
         shared = FakeReq("shared")

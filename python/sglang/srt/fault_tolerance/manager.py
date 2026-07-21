@@ -20,7 +20,6 @@ from sglang.srt.managers.io_struct import (
     FaultToleranceCommandReqOutput,
     FaultToleranceRankFaultOutput,
     ProcessActiveRanksOutput,
-    RecoveredDPRanksOutput,
 )
 from sglang.srt.utils import kill_process_tree
 from sglang.utils import get_exception_traceback
@@ -83,15 +82,15 @@ class FaultToleranceManager:
             return 400, ft_failure("invalid_fault_tolerance_timeout")
 
         ranks = None
-        if instruction == "scale_down":
+        if instruction in ("scale_down", "recover"):
             ranks = params.get("ranks")
             if not isinstance(ranks, list):
-                return 400, ft_failure("scale_down_requires_non_empty_ranks")
+                return 400, ft_failure(f"{instruction}_requires_non_empty_ranks")
             try:
                 ranks = [int(rank) for rank in ranks]
             except (TypeError, ValueError):
                 return 400, ft_failure("unknown_rank")
-            if "shutdown" in params:
+            if instruction == "scale_down" and "shutdown" in params:
                 return 400, ft_failure("scale_down_does_not_accept_shutdown")
         elif instruction == "retry":
             if params:
@@ -105,7 +104,7 @@ class FaultToleranceManager:
         resume_targets = self.state.begin_recover(instruction, ranks)
         logger.info(
             "Fault tolerance apply plan: instruction=%s active_mask=%s "
-            "resume_targets=%s scale_down_ranks=%s",
+            "resume_targets=%s ranks=%s",
             instruction,
             self.state.effective_active_mask(),
             resume_targets,
@@ -127,25 +126,27 @@ class FaultToleranceManager:
             )
             return 503, response
 
-        resume_targets = set(resume_targets)
-        try:
-            acked = await self._send_command_collect(
-                command="resume",
-                target_ranks=sorted(resume_targets),
-                timeout_sec=timeout,
-            )
-        except Exception as exc:
-            self._failstop(
-                f"fault tolerance resume failed for ranks "
-                f"{sorted(resume_targets)}: {exc}"
-            )
+        acked = set()
+        if instruction != "recover":
+            resume_targets = set(resume_targets)
+            try:
+                acked = await self._send_command_collect(
+                    command="resume",
+                    target_ranks=sorted(resume_targets),
+                    timeout_sec=timeout,
+                )
+            except Exception as exc:
+                self._failstop(
+                    f"fault tolerance resume failed for ranks "
+                    f"{sorted(resume_targets)}: {exc}"
+                )
 
         response = self.state.commit_recover(
             resumed_ranks=acked,
             isolated_ranks=(ranks if instruction == "scale_down" else None),
         )
         logger.info(
-            "Fault tolerance apply committed: instruction=%s scale_down_ranks=%s",
+            "Fault tolerance apply committed: instruction=%s ranks=%s",
             instruction,
             ranks,
         )
@@ -179,15 +180,6 @@ class FaultToleranceManager:
             self._drop_process_inactive_pause_targets(set(ranks.ranks))
         if targets:
             self._create_task(self._pause_schedulers(targets))
-        active_mask = self.state.take_effective_active_update()
-        if active_mask is None:
-            return None
-        return ActiveRanksOutput(status=active_mask)
-
-    def observe_recovered_dp_ranks(
-        self, ranks: RecoveredDPRanksOutput
-    ) -> Optional[ActiveRanksOutput]:
-        self.state.observe_recovered_dp_ranks(ranks.ranks)
         active_mask = self.state.take_effective_active_update()
         if active_mask is None:
             return None
