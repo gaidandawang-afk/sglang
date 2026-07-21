@@ -79,7 +79,6 @@ FT_PROCESS_EXIT_GRACE_PERIOD = 2
 class SchedulerProcessInfo:
     global_rank: int
     dp_rank: int
-    process: mp.Process
 
 
 class LoadBalanceMethod(Enum):
@@ -319,8 +318,8 @@ class DataParallelController:
         self.dp_budget.update_budget(obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        self.status = ranks.status
         if not self.server_args.enable_fault_tolerance:
+            self.status = ranks.status
             return
         success = True
         message = "active ranks updated"
@@ -698,7 +697,6 @@ class DataParallelController:
                         SchedulerProcessInfo(
                             global_rank=global_rank,
                             dp_rank=dp_rank,
-                            process=proc,
                         )
                     )
                 scheduler_pipe_readers.append(reader)

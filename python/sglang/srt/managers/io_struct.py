@@ -1407,7 +1407,6 @@ class FaultToleranceCommandReqOutput(BaseReq):
 @dataclass
 class FaultToleranceRankFaultOutput(BaseReq):
     rank: int
-    fault_type: Literal["exception"]
     message: str = ""
 
 

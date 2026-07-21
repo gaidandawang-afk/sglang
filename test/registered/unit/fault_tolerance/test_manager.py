@@ -3,7 +3,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-from sglang.srt.fault_tolerance.controller import RankState
 from sglang.srt.fault_tolerance.manager import FaultToleranceManager
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
@@ -90,8 +89,13 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(manager.state.paused_dp_ranks, {0, 3})
         self.assertEqual(
-            manager.state.rank_states,
-            [RankState.PAUSED, RankState.DEAD, RankState.DEAD, RankState.PAUSED],
+            manager.state.status_response()["ranks"],
+            [
+                {"rank": 0, "state": "paused"},
+                {"rank": 1, "state": "dead"},
+                {"rank": 2, "state": "dead"},
+                {"rank": 3, "state": "paused"},
+            ],
         )
         self.assertEqual(manager._pending_commands, {})
 
@@ -115,9 +119,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(manager.state.disabled_dp_ranks, {1})
 
-        rejoined = manager.observe_recovered_dp_ranks(
-            RecoveredDPRanksOutput(ranks=[1])
-        )
+        rejoined = manager.observe_recovered_dp_ranks(RecoveredDPRanksOutput(ranks=[1]))
         self.assertEqual(rejoined.status, [True, True])
         self.assertEqual(manager.state.disabled_dp_ranks, set())
 
@@ -132,7 +134,6 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
 
         event = FaultToleranceRankFaultOutput(
             rank=1,
-            fault_type="exception",
             message="boom",
         )
         manager.handle_rank_fault(event)
@@ -153,17 +154,19 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager.state.begin_exception_pause()
         manager.state.finish_pause({0, 1})
         manager.state.process_active_ranks[1] = False
-        manager.state.refresh_rank_states()
         manager._publish_active_ranks = AsyncMock()
-        manager._send_command_collect = AsyncMock(return_value=({0}, set()))
+        manager._send_command_collect = AsyncMock(return_value={0})
 
         status, response = await manager.apply({"fault_tolerance_instruction": "retry"})
 
         self.assertEqual(status, 200)
         self.assertEqual(response["resumed_ranks"], [0])
         self.assertEqual(
-            manager.state.rank_states,
-            [RankState.HEALTHY, RankState.DEAD],
+            response["ranks"],
+            [
+                {"rank": 0, "state": "healthy"},
+                {"rank": 1, "state": "dead"},
+            ],
         )
         self.assertEqual(
             manager._send_command_collect.await_args.kwargs["target_ranks"],
@@ -175,7 +178,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager.state.begin_exception_pause()
         manager.state.finish_pause({0, 1})
         manager._publish_active_ranks = AsyncMock()
-        manager._send_command_collect = AsyncMock(return_value=({0, 1}, set()))
+        manager._send_command_collect = AsyncMock(return_value={0, 1})
 
         status, response = await manager.apply(
             {
@@ -195,8 +198,11 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.state.disabled_dp_ranks, {1})
         self.assertEqual(manager.state.process_active_ranks, [True, True])
         self.assertEqual(
-            manager.state.rank_states,
-            [RankState.HEALTHY, RankState.DEAD],
+            response["ranks"],
+            [
+                {"rank": 0, "state": "healthy"},
+                {"rank": 1, "state": "dead"},
+            ],
         )
 
     async def test_resume_timeout_enters_failstop_without_partial_commit(self):

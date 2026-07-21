@@ -21,16 +21,12 @@ def ft_error_status(error: str) -> int:
     return HTTPStatus.BAD_REQUEST
 
 
-def is_mooncake_active_rank_backend(server_args) -> bool:
-    return getattr(server_args, "elastic_ep_backend", None) == "mooncake"
-
-
 def is_ft_supported_config(server_args) -> Tuple[bool, str]:
     if getattr(server_args, "dp_size", 1) <= 1:
         return False, "ft_requires_dp_gt1"
     if getattr(server_args, "pp_size", 1) != 1:
         return False, "ft_requires_pp1"
-    if not is_mooncake_active_rank_backend(server_args):
+    if getattr(server_args, "elastic_ep_backend", None) != "mooncake":
         return False, "ft_requires_mooncake_active_rank_backend"
     if getattr(server_args, "disaggregation_mode", "null") != "null":
         return False, "ft_unsupported_with_pd"
@@ -62,16 +58,26 @@ class FaultToleranceState:
         self.mooncake_active_ranks = [True] * dp_size
         self.disabled_dp_ranks: set[int] = set()
         self.paused_dp_ranks: set[int] = set()
-        self.rank_states = [RankState.HEALTHY] * dp_size
         self.ft_operation_in_progress = False
         self._last_effective_active_ranks = [True] * dp_size
 
     def status_response(self) -> Dict[str, Any]:
-        self.refresh_rank_states()
+        effective_active = self.effective_active_mask()
         return {
             "ranks": [
-                {"rank": rank, "state": state.value}
-                for rank, state in enumerate(self.rank_states)
+                {
+                    "rank": rank,
+                    "state": (
+                        RankState.DEAD
+                        if not effective_active[rank]
+                        else (
+                            RankState.PAUSED
+                            if rank in self.paused_dp_ranks
+                            else RankState.HEALTHY
+                        )
+                    ).value,
+                }
+                for rank in range(self.dp_size)
             ]
         }
 
@@ -107,21 +113,6 @@ class FaultToleranceState:
     def resume_targets(self) -> List[int]:
         runtime_active = self.runtime_active_mask()
         return sorted(rank for rank in self.paused_dp_ranks if runtime_active[rank])
-
-    def refresh_rank_states(self) -> None:
-        effective_active = self.effective_active_mask()
-        self.rank_states = [
-            (
-                RankState.DEAD
-                if not effective_active[rank]
-                else (
-                    RankState.PAUSED
-                    if rank in self.paused_dp_ranks
-                    else RankState.HEALTHY
-                )
-            )
-            for rank in range(self.dp_size)
-        ]
 
     def is_rank_routable(self, rank: int) -> bool:
         return 0 <= rank < self.dp_size and self.effective_active_mask()[rank]
@@ -162,12 +153,10 @@ class FaultToleranceState:
         self.mooncake_active_ranks = self._normalize_mask(new_mask)
         return self._begin_availability_pause(old_effective)
 
-    def observe_recovered_dp_ranks(self, ranks: Iterable[int]) -> List[int]:
-        old_effective = self.effective_active_mask()
+    def observe_recovered_dp_ranks(self, ranks: Iterable[int]) -> None:
         for rank in ranks:
             if 0 <= rank < self.dp_size:
                 self.disabled_dp_ranks.discard(rank)
-        return self._begin_availability_pause(old_effective)
 
     def pending_effective_active_update(self) -> Optional[List[bool]]:
         effective_active = self.effective_active_mask()
@@ -199,7 +188,6 @@ class FaultToleranceState:
             rank for rank in paused_ranks if 0 <= rank < self.dp_size
         )
         self.ft_operation_in_progress = False
-        self.refresh_rank_states()
 
     def validate_apply(
         self, instruction: str, ranks: Optional[List[int]]
@@ -233,25 +221,21 @@ class FaultToleranceState:
 
     def begin_recover(
         self, instruction: str, scale_down_ranks: Optional[List[int]] = None
-    ) -> Tuple[List[bool], List[int]]:
+    ) -> List[int]:
         self.ft_operation_in_progress = True
         if instruction == "scale_down":
             self.disabled_dp_ranks.update(scale_down_ranks or [])
-        return self.effective_active_mask(), self.resume_targets()
+        return self.resume_targets()
 
     def commit_recover(
         self,
-        resumed_ranks: Optional[Iterable[int]] = None,
+        resumed_ranks: Iterable[int],
         isolated_ranks: Optional[Iterable[int]] = None,
     ) -> Dict[str, Any]:
-        resumable = (
-            self.paused_dp_ranks if resumed_ranks is None else set(resumed_ranks)
-        )
-        committed_resumed_ranks = sorted(self.paused_dp_ranks & set(resumable))
+        committed_resumed_ranks = sorted(self.paused_dp_ranks & set(resumed_ranks))
         self.paused_dp_ranks.difference_update(committed_resumed_ranks)
         self.paused_dp_ranks.difference_update(isolated_ranks or [])
         self.ft_operation_in_progress = False
-        self.refresh_rank_states()
         body = self.status_response()
         body.update(
             {

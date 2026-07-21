@@ -1696,7 +1696,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # synchronization overhead does not propagate to other configs.
         # Leave for future optimization of the elastic EP path.
         if self.tp_group.active_ranks.all() and self.tp_group.active_ranks_cpu.all():
-            return []
+            return
 
         tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
         tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
@@ -1730,8 +1730,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             logger.info(f"recover ranks {ranks_to_recover} done")
             self._recovered_ep_ranks.extend(ranks_to_recover)
-            return ranks_to_recover
-        return []
 
     def take_recovered_ep_ranks(self) -> List[int]:
         recovered_ranks = self._recovered_ep_ranks

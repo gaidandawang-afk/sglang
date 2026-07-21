@@ -2510,7 +2510,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         if self.fault_tolerance is not None:
             ranks = self.fault_tolerance.observe_active_ranks(ranks)
-            if ranks is None or self.server_args.dp_size <= 1:
+            if ranks is None:
                 return
         self.send_to_scheduler.send_pyobj(ranks)
 

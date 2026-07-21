@@ -6,7 +6,7 @@ import logging
 import os
 import sys
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from sglang.srt.fault_tolerance.controller import (
     FaultToleranceState,
@@ -102,12 +102,12 @@ class FaultToleranceManager:
         if error:
             return ft_error_status(error), ft_failure(error)
 
-        active_mask, resume_targets = self.state.begin_recover(instruction, ranks)
+        resume_targets = self.state.begin_recover(instruction, ranks)
         logger.info(
             "Fault tolerance apply plan: instruction=%s active_mask=%s "
             "resume_targets=%s scale_down_ranks=%s",
             instruction,
-            active_mask,
+            self.state.effective_active_mask(),
             resume_targets,
             ranks,
         )
@@ -129,7 +129,7 @@ class FaultToleranceManager:
 
         resume_targets = set(resume_targets)
         try:
-            acked, _ = await self._send_command_collect(
+            acked = await self._send_command_collect(
                 command="resume",
                 target_ranks=sorted(resume_targets),
                 timeout_sec=timeout,
@@ -187,9 +187,7 @@ class FaultToleranceManager:
     def observe_recovered_dp_ranks(
         self, ranks: RecoveredDPRanksOutput
     ) -> Optional[ActiveRanksOutput]:
-        targets = self.state.observe_recovered_dp_ranks(ranks.ranks)
-        if targets:
-            self._create_task(self._pause_schedulers(targets))
+        self.state.observe_recovered_dp_ranks(ranks.ranks)
         active_mask = self.state.take_effective_active_update()
         if active_mask is None:
             return None
@@ -290,7 +288,7 @@ class FaultToleranceManager:
         await self._pause_schedulers(targets)
 
     async def _pause_schedulers(self, targets: List[int]):
-        acked, _ = await self._send_command_collect(
+        acked = await self._send_command_collect(
             command="pause",
             target_ranks=targets,
             timeout_sec=self.server_args.fault_tolerance_timeout,
@@ -300,9 +298,6 @@ class FaultToleranceManager:
     async def _publish_active_ranks(
         self, active_mask: List[bool], timeout_sec: int
     ) -> None:
-        if self.server_args.dp_size <= 1:
-            return
-
         request_id = uuid.uuid4().hex
         future = self.event_loop.create_future()
         self._pending_active_rank_updates[request_id] = future
@@ -324,10 +319,10 @@ class FaultToleranceManager:
         command: str,
         target_ranks: List[int],
         timeout_sec: int,
-    ) -> Tuple[set[int], set[int]]:
+    ) -> set[int]:
         target_set = set(target_ranks)
         if not target_set:
-            return set(), set()
+            return set()
 
         request_id = uuid.uuid4().hex
         pending = PendingFTCommand(
@@ -366,14 +361,13 @@ class FaultToleranceManager:
             raise RuntimeError(
                 f"fault tolerance command {command} failed: {pending.failed}"
             )
-        timed_out = pending.target_ranks - pending.acked
         logger.info(
-            "FT command complete: id=%s command=%s timed_out=%s",
+            "FT command complete: id=%s command=%s acked=%s",
             request_id,
             command,
-            sorted(timed_out),
+            sorted(pending.acked),
         )
-        return pending.acked, timed_out
+        return pending.acked
 
     @staticmethod
     def _failstop(message: str) -> None:

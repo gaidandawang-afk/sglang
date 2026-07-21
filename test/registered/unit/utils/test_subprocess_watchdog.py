@@ -44,16 +44,6 @@ def noop_worker():
     pass
 
 
-class FakeProcess:
-    def __init__(self, pid, alive, exitcode=None):
-        self.pid = pid
-        self.alive = alive
-        self.exitcode = exitcode
-
-    def is_alive(self):
-        return self.alive
-
-
 class TestSubprocessWatchdog(CustomTestCase):
     def setUp(self):
         self.sigquit_triggered = threading.Event()
@@ -86,13 +76,12 @@ class TestSubprocessWatchdog(CustomTestCase):
         self._procs.append(proc)
         return proc
 
-    def _watch(self, procs, names=None, interval=0.1):
+    def _watch(self, procs, names=None):
         if not isinstance(procs, list):
             procs = [procs]
         self._monitor = SubprocessWatchdog(
             processes=procs,
             process_names=names,
-            interval=interval,
         )
         self._monitor.start()
         return self._monitor
@@ -113,7 +102,7 @@ class TestSubprocessWatchdog(CustomTestCase):
 
     def test_immediate_crash_detection(self):
         proc = self._spawn(crashing_worker)
-        self._watch(proc, interval=0.05)
+        self._watch(proc)
         self.assertTrue(
             self.sigquit_triggered.wait(timeout=5.0),
             "Immediate crash was not detected",
@@ -129,7 +118,7 @@ class TestSubprocessWatchdog(CustomTestCase):
         )
 
     def test_empty_processes_list(self):
-        self._watch([], interval=0.1)
+        self._watch([])
         time.sleep(0.3)
         self.assertFalse(self.sigquit_triggered.is_set())
 
@@ -149,7 +138,6 @@ class TestSubprocessWatchdog(CustomTestCase):
         exit_seen = threading.Event()
         self._monitor = SubprocessWatchdog(
             processes=[proc],
-            interval=0.05,
             on_exit=lambda index, process, name: exit_seen.set(),
         )
         self._monitor.start()
@@ -159,31 +147,41 @@ class TestSubprocessWatchdog(CustomTestCase):
 
     def test_callback_runs_before_default_sigquit(self):
         exits = []
-        process = FakeProcess(pid=20, alive=False, exitcode=1)
-        monitor = SubprocessWatchdog(
-            processes=[process],
-            on_exit=lambda index, process, name: exits.append(
-                (index, process.pid, name, self.sigquit_triggered.is_set())
-            ),
-        )
+        exit_seen = threading.Event()
+        process = self._spawn(slow_crash_worker, args=(0.1,))
 
-        self.assertTrue(monitor._check_processes())
-        self.assertEqual(exits, [(0, 20, "process_0", False)])
-        self.assertTrue(self.sigquit_triggered.is_set())
+        def record_exit(index, process, name):
+            exits.append((index, process.pid, name, self.sigquit_triggered.is_set()))
+            exit_seen.set()
+
+        self._monitor = SubprocessWatchdog(
+            processes=[process],
+            on_exit=record_exit,
+        )
+        self._monitor.start()
+
+        self.assertTrue(exit_seen.wait(timeout=5.0))
+        self.assertEqual(exits, [(0, process.pid, "process_0", False)])
+        self.assertTrue(self.sigquit_triggered.wait(timeout=5.0))
 
     def test_callback_can_isolate_crash_without_default_sigquit(self):
         exits = []
-        process = FakeProcess(pid=21, alive=False, exitcode=1)
-        monitor = SubprocessWatchdog(
+        exit_seen = threading.Event()
+        process = self._spawn(slow_crash_worker, args=(0.1,))
+
+        def record_exit(index, process, name):
+            exits.append((index, process.pid, name))
+            exit_seen.set()
+
+        self._monitor = SubprocessWatchdog(
             processes=[process],
-            on_exit=lambda index, process, name: exits.append(
-                (index, process.pid, name)
-            ),
+            on_exit=record_exit,
             fail_stop_on_exit=False,
         )
+        self._monitor.start()
 
-        self.assertFalse(monitor._check_processes())
-        self.assertEqual(exits, [(0, 21, "process_0")])
+        self.assertTrue(exit_seen.wait(timeout=5.0))
+        self.assertEqual(exits, [(0, process.pid, "process_0")])
         self.assertFalse(self.sigquit_triggered.is_set())
 
 

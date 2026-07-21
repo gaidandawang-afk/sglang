@@ -26,9 +26,9 @@ class Watchdog:
         test_stuck_time: float = 0,
     ) -> Watchdog:
         if watchdog_timeout is None:
-            assert (
-                test_stuck_time == 0
-            ), f"stuck tester can be enabled only if soft watchdog is enabled."
+            assert test_stuck_time == 0, (
+                f"stuck tester can be enabled only if soft watchdog is enabled."
+            )
             return _WatchdogNoop()
         return _WatchdogReal(
             debug_name=debug_name,
@@ -182,18 +182,17 @@ class SubprocessWatchdog:
         self,
         processes: List[Process],
         process_names: Optional[List[str]] = None,
-        interval: float = 1.0,
+        stop_join_timeout: float = 2.0,
         on_exit: Optional[Callable[[int, Process, str], None]] = None,
         fail_stop_on_exit: bool = True,
     ):
         self._processes = processes
         self._names = process_names or [f"process_{i}" for i in range(len(processes))]
-        self._interval = interval
+        self._stop_join_timeout = stop_join_timeout
         self._on_exit = on_exit
         self._fail_stop_on_exit = fail_stop_on_exit
         self._stop_event = threading.Event()
         self._stop_reader, self._stop_writer = Pipe(duplex=False)
-        self._reported = set()
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
@@ -211,7 +210,7 @@ class SubprocessWatchdog:
                 self._stop_writer.send_bytes(b"\0")
             except (BrokenPipeError, EOFError, OSError):
                 pass
-            self._thread.join(timeout=self._interval * 2)
+            self._thread.join(timeout=self._stop_join_timeout)
             self._thread = None
 
     def wait(self) -> None:
@@ -222,9 +221,7 @@ class SubprocessWatchdog:
         try:
             sentinel_to_process = {
                 proc.sentinel: (index, proc, name)
-                for index, (proc, name) in enumerate(
-                    zip(self._processes, self._names)
-                )
+                for index, (proc, name) in enumerate(zip(self._processes, self._names))
             }
             remaining = set(sentinel_to_process)
             while remaining and not self._stop_event.is_set():
@@ -241,10 +238,7 @@ class SubprocessWatchdog:
             logger.error(f"SubprocessWatchdog thread crashed: {e}", exc_info=True)
 
     def _handle_process_exit(self, index: int, proc: Process, name: str) -> bool:
-        if index in self._reported:
-            return False
         if proc.exitcode == 0:
-            self._reported.add(index)
             return False
 
         if self._on_exit is not None:
@@ -255,7 +249,6 @@ class SubprocessWatchdog:
                     "Subprocess watchdog on-exit callback failed for %s", name
                 )
 
-        self._reported.add(index)
         if not self._fail_stop_on_exit:
             logger.error(
                 f"Subprocess {name} (pid={proc.pid}) crashed "
@@ -271,11 +264,3 @@ class SubprocessWatchdog:
         )
         os.kill(os.getpid(), signal.SIGQUIT)
         return True
-
-    def _check_processes(self) -> bool:
-        for index, (proc, name) in enumerate(zip(self._processes, self._names)):
-            if index in self._reported or proc.is_alive() or proc.exitcode == 0:
-                continue
-            if self._handle_process_exit(index, proc, name):
-                return True
-        return False

@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 from sglang.srt.fault_tolerance.controller import (
     FaultToleranceState,
-    RankState,
     is_ft_supported_config,
 )
 
@@ -72,8 +71,12 @@ class TestFaultToleranceState(unittest.TestCase):
 
         self.assertEqual(state.paused_dp_ranks, {0, 2})
         self.assertEqual(
-            state.rank_states,
-            [RankState.PAUSED, RankState.DEAD, RankState.PAUSED],
+            state.status_response()["ranks"],
+            [
+                {"rank": 0, "state": "paused"},
+                {"rank": 1, "state": "dead"},
+                {"rank": 2, "state": "paused"},
+            ],
         )
 
     def test_no_effective_route_rejects_admission_for_continue_strategy(self):
@@ -107,9 +110,9 @@ class TestFaultToleranceState(unittest.TestCase):
         state.begin_exception_pause()
         state.finish_pause({0, 1})
 
-        active_mask, resume_targets = state.begin_recover("scale_down", [1])
+        resume_targets = state.begin_recover("scale_down", [1])
 
-        self.assertEqual(active_mask, [True, False])
+        self.assertEqual(state.effective_active_mask(), [True, False])
         self.assertEqual(resume_targets, [0, 1])
         self.assertEqual(state.disabled_dp_ranks, {1})
         self.assertEqual(state.process_active_ranks, [True, True])
@@ -118,8 +121,11 @@ class TestFaultToleranceState(unittest.TestCase):
         response = state.commit_recover({0, 1})
         self.assertEqual(response["resumed_ranks"], [0, 1])
         self.assertEqual(
-            state.rank_states,
-            [RankState.HEALTHY, RankState.DEAD],
+            response["ranks"],
+            [
+                {"rank": 0, "state": "healthy"},
+                {"rank": 1, "state": "dead"},
+            ],
         )
 
     def test_scale_down_cannot_remove_last_effective_route(self):
@@ -131,12 +137,11 @@ class TestFaultToleranceState(unittest.TestCase):
             "cannot_isolate_all_active_ranks",
         )
 
-    def test_resume_targets_ignore_rank_states_and_use_paused_runtime(self):
+    def test_resume_targets_use_paused_runtime_sources(self):
         state = FaultToleranceState(dp_size=3, strategy="pause")
         state.paused_dp_ranks = {0, 1, 2}
         state.process_active_ranks = [True, False, True]
         state.mooncake_active_ranks = [True, True, False]
-        state.rank_states = [RankState.DEAD] * 3
 
         self.assertEqual(state.resume_targets(), [0])
 

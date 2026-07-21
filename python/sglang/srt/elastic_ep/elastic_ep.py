@@ -138,10 +138,6 @@ class ElasticEPStateManager:
 _PEER_STATE_POLL_INTERVAL_SEC = 0.01
 
 
-def _get_process_group_backend(process_group, device: str):
-    return process_group._get_backend(torch.device(device))
-
-
 def _iter_live_parallel_groups() -> Iterator[parallel_state.GroupCoordinator]:
     groups = []
     for group_ref in parallel_state._groups.values():

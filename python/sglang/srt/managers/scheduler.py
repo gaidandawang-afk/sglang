@@ -1550,7 +1550,6 @@ class Scheduler(
                 self.send_to_tokenizer.send_output(
                     FaultToleranceRankFaultOutput(
                         rank=self._ft_rank(),
-                        fault_type="exception",
                         message=str(exc),
                     )
                 )
