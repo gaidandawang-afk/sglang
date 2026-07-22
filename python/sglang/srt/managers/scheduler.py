@@ -105,6 +105,9 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
+    FaultToleranceCommandReqInput,
+    FaultToleranceCommandReqOutput,
+    FaultToleranceRankFaultOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     FreezeGCReq,
@@ -169,7 +172,10 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
-from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
+from sglang.srt.managers.scheduler_dp_attn_mixin import (
+    FT_ACTION_PAUSE_READY,
+    SchedulerDPAttnMixin,
+)
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
@@ -1063,6 +1069,7 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+        self._ft_pending_pause: Optional[FaultToleranceCommandReqInput] = None
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1472,6 +1479,7 @@ class Scheduler(
                 (GetLoadsReqInput, self.get_loads),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (FaultToleranceCommandReqInput, self.handle_fault_tolerance_command),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
                 (
@@ -1531,12 +1539,112 @@ class Scheduler(
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         with self.device_module.StreamContext(self.schedule_stream):
-            dispatch_event_loop(self)
+            if self.server_args.enable_fault_tolerance:
+                self._run_event_loop_fault_tolerance()
+            else:
+                dispatch_event_loop(self)
+
+    def _run_event_loop_fault_tolerance(self):
+        while True:
+            try:
+                dispatch_event_loop(self)
+            except Exception as exc:
+                recovered = self._ft_discard_inflight_window(exc)
+                self.send_to_tokenizer.send_output(
+                    FaultToleranceRankFaultOutput(
+                        rank=self._ft_rank(),
+                        message=str(exc),
+                    )
+                )
+                if (
+                    self.server_args.fault_tolerance_on_error_strategy == "continue"
+                    and recovered
+                ):
+                    continue
+                self._engine_paused = True
+
+    def _ft_rank(self) -> int:
+        return self.dp_rank if self.dp_rank is not None else 0
+
+    def _ft_discard_inflight_window(self, exc: Exception) -> bool:
+        window_batches = [self.cur_batch, self.last_batch, self.running_batch]
+        result_queue = getattr(self, "result_queue", None)
+        if result_queue is not None:
+            window_batches.extend(batch for batch, _ in result_queue)
+
+        discarded_by_rid = {}
+        for batch in window_batches:
+            if batch is None:
+                continue
+            for req in batch.reqs:
+                if not req.finished():
+                    discarded_by_rid.setdefault(req.rid, req)
+        if self.chunked_req is not None and not self.chunked_req.finished():
+            discarded_by_rid.setdefault(self.chunked_req.rid, self.chunked_req)
+        discarded_reqs = list(discarded_by_rid.values())
+
+        success = True
+        for req in discarded_reqs:
+            try:
+                # prepare_for_decode commits the newly allocated KV slot before
+                # ModelRunner.forward runs.  If that forward raises, no output
+                # token exists for the slot, so make release_kv_cache reclaim it
+                # through its overallocated-tail path instead of leaking it.
+                req.kv_committed_len = min(
+                    req.kv_committed_len,
+                    len(req.origin_input_ids) + len(req.output_ids),
+                )
+                release_kv_cache(
+                    req,
+                    self.tree_cache,
+                    is_insert=False,
+                    allow_non_spec_overallocated=True,
+                )
+                abort_reason = FINISH_ABORT(
+                    message=f"Request discarded after scheduler exception: {exc}",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    err_type="SchedulerFault",
+                )
+                req.finished_reason = abort_reason
+                self.send_to_tokenizer.send_output(
+                    AbortReq(
+                        finished_reason=abort_reason.to_json(),
+                        rid=req.rid,
+                    ),
+                    req,
+                )
+            except Exception:
+                logger.exception(
+                    "FT failed to discard request state: rid=%s",
+                    req.rid,
+                )
+                success = False
+
+        self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+        if self.chunked_req is not None and self.chunked_req.rid in discarded_by_rid:
+            self.chunked_req = None
+            self._chunked_req_scheduled_last_iter = False
+        if result_queue is not None:
+            result_queue.clear()
+        self.cur_batch = None
+        self.last_batch = None
+        logger.warning(
+            "FT discarded %d in-flight request(s) after scheduler exception: %s",
+            len(discarded_reqs),
+            exc,
+        )
+        return success
+
+    def _process_next_overlap_result(self):
+        batch, result = self.result_queue[0]
+        self.process_batch_result(batch, result)
+        self.result_queue.popleft()
 
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
+            self._complete_ft_pause()
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1567,12 +1675,8 @@ class Scheduler(
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
-        def pop_and_process():
-            # Process the results of the last batch
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
-
         while True:
+            self._complete_ft_pause()
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1587,7 +1691,7 @@ class Scheduler(
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
-                pop_and_process()
+                self._process_next_overlap_result()
 
             # Launch the current batch
             if batch:
@@ -1599,7 +1703,7 @@ class Scheduler(
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
-                    pop_and_process()
+                    self._process_next_overlap_result()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
@@ -1727,12 +1831,13 @@ class Scheduler(
                     src=self.attn_cp_group.ranks[0],
                 )
 
-            # When dp_attention_local_control_broadcast is enabled, each DP
-            # group leader already receives control messages from the DP
-            # controller, so we broadcast within attn_tp_group + attn_cp_group
-            # instead of the full tp_group.  This avoids an expensive
-            # all-ranks gloo sync.
-            _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
+            # FT commands are delivered to each target DP leader and must stay
+            # within that attention block. The original option remains unchanged
+            # when FT is disabled.
+            _local_ctrl = (
+                self.server_args.enable_fault_tolerance
+                or self.server_args.enable_dp_attention_local_control_broadcast
+            )
             if _local_ctrl:
                 if self.attn_tp_size != 1:
                     control_reqs = broadcast_pyobj(
@@ -2574,6 +2679,8 @@ class Scheduler(
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
             new_batch = self.maybe_prepare_mlp_sync_batch(new_batch)
+            if self._engine_paused:
+                return new_batch
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
@@ -3672,8 +3779,7 @@ class Scheduler(
 
         if self.enable_overlap and self.last_batch:
             # Process the results of the last batch
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
+            self._process_next_overlap_result()
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             chunked_req_to_exclude = set()
@@ -3717,6 +3823,129 @@ class Scheduler(
                 f"(freed {before_mb - after_mb:.1f} MB)"
             )
         self._engine_paused = False
+
+    def handle_fault_tolerance_command(
+        self, recv_req: FaultToleranceCommandReqInput
+    ) -> Optional[FaultToleranceCommandReqOutput]:
+        rank = self._ft_rank()
+        if os.getenv("SGLANG_FT_DEBUG_STACK_SIGNAL") == "1":
+            logger.info(
+                "FT scheduler command received: id=%s command=%s rank=%s targets=%s",
+                recv_req.request_id,
+                recv_req.command,
+                rank,
+                recv_req.target_ranks,
+            )
+        if rank not in recv_req.target_ranks:
+            return None
+
+        try:
+            if recv_req.command == "pause":
+                self._ft_pending_pause = recv_req
+                if os.getenv("SGLANG_FT_DEBUG_STACK_SIGNAL") == "1":
+                    logger.info(
+                        "FT scheduler pause ready: id=%s rank=%s targets=%s",
+                        recv_req.request_id,
+                        rank,
+                        recv_req.target_ranks,
+                    )
+                return None
+            elif recv_req.command == "resume":
+                self._engine_paused = False
+                message = "resumed"
+            else:
+                raise ValueError(f"unknown fault tolerance command: {recv_req.command}")
+            success = True
+        except Exception as exc:
+            success = False
+            message = str(exc)
+
+        success, message = self._aggregate_ft_command_result(success, message)
+        if os.getenv("SGLANG_FT_DEBUG_STACK_SIGNAL") == "1":
+            logger.info(
+                "FT scheduler command handled: id=%s command=%s rank=%s success=%s message=%s",
+                recv_req.request_id,
+                recv_req.command,
+                rank,
+                success,
+                message,
+            )
+        if self.attn_tp_rank != 0 or self.attn_cp_rank != 0:
+            return None
+        return FaultToleranceCommandReqOutput(
+            request_id=recv_req.request_id,
+            rank=rank,
+            success=success,
+            message=message,
+        )
+
+    def _update_ft_pause_from_mlp_sync(self, global_ft_actions) -> None:
+        pending = self._ft_pending_pause
+        if pending is None or self._engine_paused or global_ft_actions is None:
+            return
+        if all(
+            global_ft_actions[rank] == FT_ACTION_PAUSE_READY
+            for rank in pending.target_ranks
+        ):
+            self._engine_paused = True
+
+    def _complete_ft_pause(self) -> None:
+        pending = self._ft_pending_pause
+        if pending is None or not self._engine_paused:
+            return
+
+        self._ft_pending_pause = None
+        rank = self._ft_rank()
+        if os.getenv("SGLANG_FT_DEBUG_STACK_SIGNAL") == "1":
+            logger.info(
+                "FT scheduler pause committed: id=%s rank=%s targets=%s",
+                pending.request_id,
+                rank,
+                pending.target_ranks,
+            )
+        if self.attn_tp_rank != 0 or self.attn_cp_rank != 0:
+            return
+        output = FaultToleranceCommandReqOutput(
+            request_id=pending.request_id,
+            rank=rank,
+            success=True,
+            message="paused",
+        )
+        self.send_to_tokenizer.send_output(output, pending)
+
+    def _aggregate_ft_command_result(
+        self, success: bool, message: str
+    ) -> Tuple[bool, str]:
+        member_result = {
+            "tp_rank": self.tp_rank,
+            "success": success,
+            "message": message,
+        }
+
+        if self.server_args.enable_dp_attention:
+            if self.attn_cp_size != 1:
+                cp_results = self.attn_cp_group.all_gather_object(member_result)
+            else:
+                cp_results = [member_result]
+
+            if self.attn_tp_size != 1:
+                gathered_results = self.attn_tp_group.all_gather_object(cp_results)
+                member_results = [
+                    result for tp_results in gathered_results for result in tp_results
+                ]
+            else:
+                member_results = cp_results
+        elif self.tp_size != 1:
+            member_results = self.tp_group.all_gather_object(member_result)
+        else:
+            member_results = [member_result]
+
+        failures = [result for result in member_results if not result["success"]]
+        if not failures:
+            return True, message
+        return False, "; ".join(
+            f"tp_rank={result['tp_rank']}: {result['message']}" for result in failures
+        )
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
@@ -3969,6 +4198,16 @@ def configure_scheduler_process(
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
+    debug_stack_signal = getattr(signal, "SIGUSR2", None)
+    if (
+        os.getenv("SGLANG_FT_DEBUG_STACK_SIGNAL") == "1"
+        and debug_stack_signal is not None
+    ):
+        faulthandler.register(debug_stack_signal, all_threads=True)
+        logger.info(
+            "FT debug stack signal enabled: signal=%s",
+            debug_stack_signal,
+        )
 
     # Set cpu affinity to this gpu process
     if envs.SGLANG_SET_CPU_AFFINITY.get():

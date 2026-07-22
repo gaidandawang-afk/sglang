@@ -76,13 +76,12 @@ class TestSubprocessWatchdog(CustomTestCase):
         self._procs.append(proc)
         return proc
 
-    def _watch(self, procs, names=None, interval=0.1):
+    def _watch(self, procs, names=None):
         if not isinstance(procs, list):
             procs = [procs]
         self._monitor = SubprocessWatchdog(
             processes=procs,
             process_names=names,
-            interval=interval,
         )
         self._monitor.start()
         return self._monitor
@@ -103,7 +102,7 @@ class TestSubprocessWatchdog(CustomTestCase):
 
     def test_immediate_crash_detection(self):
         proc = self._spawn(crashing_worker)
-        self._watch(proc, interval=0.05)
+        self._watch(proc)
         self.assertTrue(
             self.sigquit_triggered.wait(timeout=5.0),
             "Immediate crash was not detected",
@@ -119,7 +118,7 @@ class TestSubprocessWatchdog(CustomTestCase):
         )
 
     def test_empty_processes_list(self):
-        self._watch([], interval=0.1)
+        self._watch([])
         time.sleep(0.3)
         self.assertFalse(self.sigquit_triggered.is_set())
 
@@ -132,6 +131,58 @@ class TestSubprocessWatchdog(CustomTestCase):
             self.sigquit_triggered.is_set(),
             "SIGQUIT should not be triggered for normal exit (exitcode=0)",
         )
+
+    def test_normal_exit_does_not_call_callback(self):
+        proc = self._spawn(noop_worker)
+        proc.join(timeout=2)
+        exit_seen = threading.Event()
+        self._monitor = SubprocessWatchdog(
+            processes=[proc],
+            on_exit=lambda index, process, name: exit_seen.set(),
+        )
+        self._monitor.start()
+
+        self.assertFalse(exit_seen.wait(timeout=0.3))
+        self.assertFalse(self.sigquit_triggered.is_set())
+
+    def test_callback_runs_before_default_sigquit(self):
+        exits = []
+        exit_seen = threading.Event()
+        process = self._spawn(slow_crash_worker, args=(0.1,))
+
+        def record_exit(index, process, name):
+            exits.append((index, process.pid, name, self.sigquit_triggered.is_set()))
+            exit_seen.set()
+
+        self._monitor = SubprocessWatchdog(
+            processes=[process],
+            on_exit=record_exit,
+        )
+        self._monitor.start()
+
+        self.assertTrue(exit_seen.wait(timeout=5.0))
+        self.assertEqual(exits, [(0, process.pid, "process_0", False)])
+        self.assertTrue(self.sigquit_triggered.wait(timeout=5.0))
+
+    def test_callback_can_isolate_crash_without_default_sigquit(self):
+        exits = []
+        exit_seen = threading.Event()
+        process = self._spawn(slow_crash_worker, args=(0.1,))
+
+        def record_exit(index, process, name):
+            exits.append((index, process.pid, name))
+            exit_seen.set()
+
+        self._monitor = SubprocessWatchdog(
+            processes=[process],
+            on_exit=record_exit,
+            fail_stop_on_exit=False,
+        )
+        self._monitor.start()
+
+        self.assertTrue(exit_seen.wait(timeout=5.0))
+        self.assertEqual(exits, [(0, process.pid, "process_0")])
+        self.assertFalse(self.sigquit_triggered.is_set())
 
 
 if __name__ == "__main__":

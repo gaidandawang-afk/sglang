@@ -138,10 +138,6 @@ class ElasticEPStateManager:
 _PEER_STATE_POLL_INTERVAL_SEC = 0.01
 
 
-def _get_process_group_backend(process_group, device: str):
-    return process_group._get_backend(torch.device(device))
-
-
 def _iter_live_parallel_groups() -> Iterator[parallel_state.GroupCoordinator]:
     groups = []
     for group_ref in parallel_state._groups.values():
@@ -180,6 +176,14 @@ def _maybe_create_message_queue(group) -> None:
 def _refresh_ep_members() -> None:
     from sglang.srt.layers.moe.token_dispatcher.mooncake import EPBuffer
 
+    if EPBuffer._buffer is None:
+        if os.environ.get("MOONCAKE_EP_FORCE_FALLBACK") == "1":
+            logger.info(
+                "Skip Mooncake EP member refresh before EPBuffer initialization "
+                "in Mooncake forced fallback rejoin path."
+            )
+            return
+        raise RuntimeError("Mooncake EPBuffer is not initialized")
     EPBuffer._buffer.update_ep_member()
 
 
