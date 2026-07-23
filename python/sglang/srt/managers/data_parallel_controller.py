@@ -19,7 +19,6 @@ import multiprocessing as mp
 import signal
 import threading
 import time
-from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Callable, List, Optional
 
@@ -73,12 +72,6 @@ logger = logging.getLogger(__name__)
 
 SCHEDULER_PIDS_ARG = "scheduler_pids"
 FT_PROCESS_EXIT_GRACE_PERIOD = 2
-
-
-@dataclass
-class SchedulerProcessInfo:
-    global_rank: int
-    dp_rank: int
 
 
 class LoadBalanceMethod(Enum):
@@ -157,13 +150,11 @@ class DataParallelController:
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
         self.send_to_tokenizer = None
-        if server_args.enable_fault_tolerance and server_args.node_rank == 0:
+        if (
+            server_args.enable_fault_tolerance
+            and (server_args.node_rank == 0 or server_args.elastic_ep_rejoin)
+        ):
             self.send_to_tokenizer = get_zmq_socket(
-                self.context, zmq.PUSH, port_args.tokenizer_ipc_name, False
-            )
-        self._process_state_sender = None
-        if server_args.enable_fault_tolerance and server_args.elastic_ep_rejoin:
-            self._process_state_sender = get_zmq_socket(
                 self.context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
 
@@ -185,35 +176,30 @@ class DataParallelController:
 
         # Launch data parallel workers
         self.scheduler_procs = []
-        self.scheduler_process_infos: List[SchedulerProcessInfo] = []
+        self.scheduler_process_dp_ranks: List[int] = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
         self.status: List[bool] = [True] * server_args.dp_size
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
-            # FT always uses block-local control, so every DP leader must receive
-            # generic control messages too. Without FT, preserve the explicit
-            # local-control option and the original full-TP fallback.
-            local_ctrl = (
-                server_args.enable_fault_tolerance
-                or server_args.enable_dp_attention_local_control_broadcast
-            )
+            # When local control broadcast is enabled, send control messages to
+            # every DP group leader (attn_tp_rank=0) so each leader broadcasts
+            # within its own attn_tp_group instead of the full tp_group.
+            # Otherwise fall back to the original behaviour: send to only the
+            # first leader, which then broadcasts over the full tp_group.
+            local_ctrl = server_args.enable_dp_attention_local_control_broadcast
             self.control_message_step = 1 if local_ctrl else server_args.tp_size
         else:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
-
-        self.local_dp_ranks = sorted(
-            {info.dp_rank for info in self.scheduler_process_infos}
-        )
 
         self._scheduler_watchdog = None
         if server_args.enable_fault_tolerance and self.scheduler_procs:
             self._scheduler_watchdog = SubprocessWatchdog(
                 processes=self.scheduler_procs,
                 process_names=[
-                    f"scheduler_global_{info.global_rank}_dp_{info.dp_rank}"
-                    for info in self.scheduler_process_infos
+                    f"scheduler_dp_{dp_rank}"
+                    for dp_rank in self.scheduler_process_dp_ranks
                 ],
                 on_exit=self._handle_scheduler_process_exit,
                 fail_stop_on_exit=False,
@@ -248,54 +234,26 @@ class DataParallelController:
         # FT commands are DP-scoped. Each target socket belongs to that DP's
         # attention leader. Do not gate command delivery on route status because
         # recovery may need to resume a DP while its route is still inactive.
-        for rank in sorted(set(obj.target_ranks)):
-            if not 0 <= rank < len(self.workers):
-                logger.warning("Ignoring FT command for unknown DP rank: rank=%s", rank)
-                continue
-            worker = self.workers[rank]
-            if worker is None:
-                logger.warning("Ignoring FT command without a local DP leader socket: rank=%s", rank)
-                continue
-            logger.info("DPC forwarding FT command: command=%s dp_rank=%s", obj.command, rank)
-            worker.send_pyobj(obj)
+        for rank in obj.target_ranks:
+            self.workers[rank].send_pyobj(obj)
 
     def _handle_scheduler_process_exit(self, index, proc, name):
-        info = self.scheduler_process_infos[index]
-        logger.warning(
-            "Global scheduler rank %s for DP rank %s exited (pid=%s); "
-            "marking that DP rank inactive",
-            info.global_rank,
-            info.dp_rank,
-            proc.pid,
+        dp_rank = self.scheduler_process_dp_ranks[index]
+        logger.warning("Scheduler for DP rank %s exited (pid=%s); marking that DP rank inactive", dp_rank, proc.pid)
+        context = zmq.Context()
+        sender = get_zmq_socket(
+            context, zmq.PUSH, self.port_args.tokenizer_ipc_name, False
         )
-        context = None
-        sender = None
-        try:
-            context = zmq.Context()
-            sender = get_zmq_socket(
-                context, zmq.PUSH, self.port_args.tokenizer_ipc_name, False
-            )
-            sender.send_pyobj(
-                ProcessActiveRanksOutput(
-                    ranks=[info.dp_rank],
-                    active=False,
-                )
-            )
-        except Exception:
-            logger.exception(
-                "Failed to report inactive DP rank %s", info.dp_rank
-            )
-        finally:
-            time.sleep(FT_PROCESS_EXIT_GRACE_PERIOD)
-            if sender is not None:
-                sender.close(linger=0)
-            if context is not None:
-                context.term()
+        sender.send_pyobj(ProcessActiveRanksOutput(ranks=[dp_rank], active=False))
+        # TODO：sleep 2 sec for unknown reason, to be debugged.
+        time.sleep(FT_PROCESS_EXIT_GRACE_PERIOD)
+        sender.close(linger=0)
+        context.term()
 
     def _report_process_active_ranks(self, *, active: bool) -> None:
-        self._process_state_sender.send_pyobj(
+        self.send_to_tokenizer.send_pyobj(
             ProcessActiveRanksOutput(
-                ranks=self.local_dp_ranks,
+                ranks=sorted(set(self.scheduler_process_dp_ranks)),
                 active=active,
             )
         )
@@ -307,29 +265,24 @@ class DataParallelController:
         if not self.server_args.enable_fault_tolerance:
             self.status = ranks.status
             return
-        success = True
-        message = "active ranks updated"
-        try:
-            self.status = list(ranks.status)
-        except Exception as exc:
-            success = False
-            message = str(exc)
-            logger.exception("Failed to update active DP ranks")
-        finally:
-            if ranks.request_id is not None and self.send_to_tokenizer is not None:
-                self.send_to_tokenizer.send_pyobj(
-                    ActiveRanksUpdateReqOutput(
-                        request_id=ranks.request_id,
-                        success=success,
-                        message=message,
-                    )
+        self.status = list(ranks.status)
+        if ranks.request_id is not None and self.send_to_tokenizer is not None:
+            self.send_to_tokenizer.send_pyobj(
+                ActiveRanksUpdateReqOutput(
+                    request_id=ranks.request_id,
+                    success=True,
+                    message="active ranks updated",
                 )
+            )
 
     def dispatching_with_trace(self, req: Req):
         req.time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
 
         req.time_stats.set_dp_dispatch_time()
-        self.dispatching(req)
+        if self.server_args.enable_fault_tolerance and not any(self.status):
+            self._reject_req(req, "no active DP rank")
+        else:
+            self.dispatching(req)
         req.time_stats.set_dp_dispatch_finish_time()
 
     def dispatch_batch_generate(self, batch_req: BatchTokenizedGenerateReqInput):
@@ -671,20 +624,7 @@ class DataParallelController:
                         proc.start()
                 self.scheduler_procs.append(proc)
                 if server_args.enable_fault_tolerance:
-                    if server_args.enable_dp_attention:
-                        global_rank = pp_rank * server_args.tp_size + tp_rank
-                    else:
-                        global_rank = (
-                            dp_rank * server_args.pp_size * server_args.tp_size
-                            + pp_rank * server_args.tp_size
-                            + tp_rank
-                        )
-                    self.scheduler_process_infos.append(
-                        SchedulerProcessInfo(
-                            global_rank=global_rank,
-                            dp_rank=dp_rank,
-                        )
-                    )
+                    self.scheduler_process_dp_ranks.append(dp_rank)
                 scheduler_pipe_readers.append(reader)
 
         # Wait for model to finish loading
@@ -697,21 +637,13 @@ class DataParallelController:
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
-            if (
-                self.server_args.enable_fault_tolerance
-                and not self.status[req.routed_dp_rank]
-            ):
-                self._reject_req(
-                    req, f"routed_dp_rank={req.routed_dp_rank} is inactive"
-                )
+            if self.server_args.enable_fault_tolerance and not self.status[req.routed_dp_rank]:
+                self._reject_req(req, f"routed_dp_rank={req.routed_dp_rank} is inactive")
                 return True
             logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
             self.workers[req.routed_dp_rank].send_pyobj(req)
             return True
         return False
-
-    def _ensure_active_rank_available(self):
-        return any(self.status)
 
     def _reject_req(self, req: Req, message: str):
         logger.warning("Rejecting DP request %s: %s", getattr(req, "rid", ""), message)
@@ -720,24 +652,8 @@ class DataParallelController:
                 AbortReq(rid=req.rid, abort_message=message)
             )
 
-    def _next_active_rank(self) -> int:
-        if not self._ensure_active_rank_available():
-            raise RuntimeError("No active DP rank available")
-        for offset in range(len(self.workers)):
-            rank = (self.round_robin_counter + offset) % len(self.workers)
-            if self.status[rank]:
-                self.round_robin_counter = (rank + 1) % len(self.workers)
-                return rank
-        raise RuntimeError("No active DP rank available")
-
     def round_robin_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
-            return
-        if (
-            self.server_args.enable_fault_tolerance
-            and not self._ensure_active_rank_available()
-        ):
-            self._reject_req(req, "no active DP rank")
             return
 
         while True:
@@ -755,51 +671,27 @@ class DataParallelController:
     def follow_bootstrap_room_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        if (
-            self.server_args.enable_fault_tolerance
-            and not self._ensure_active_rank_available()
-        ):
-            self._reject_req(req, "no active DP rank")
-            return
 
         assert req.bootstrap_room is not None, (
             "req.bootstrap_room should not be None. Do not send requests directly to "
             "prefill or decode instances; send to the router instead."
         )
         target_rank = req.bootstrap_room % len(self.workers)
-        if self.server_args.enable_fault_tolerance and not self.status[target_rank]:
-            target_rank = self._next_active_rank()
         self.workers[target_rank].send_pyobj(req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        if (
-            self.server_args.enable_fault_tolerance
-            and not self._ensure_active_rank_available()
-        ):
-            self._reject_req(req, "no active DP rank")
-            return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        if self.server_args.enable_fault_tolerance and not self.status[target_worker]:
-            target_worker = self._next_active_rank()
         self.workers[target_worker].send_pyobj(req)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        if (
-            self.server_args.enable_fault_tolerance
-            and not self._ensure_active_rank_available()
-        ):
-            self._reject_req(req, "no active DP rank")
-            return
         estimated_tokens = len(req.input_ids)
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
-        if self.server_args.enable_fault_tolerance and not self.status[target_worker]:
-            target_worker = self._next_active_rank()
         self.workers[target_worker].send_pyobj(req)
 
     def event_loop(self):
@@ -850,14 +742,16 @@ def run_data_parallel_controller_process(
         )
         if server_args.node_rank == 0:
             controller.event_loop()
-        if server_args.node_rank != 0 and controller._scheduler_watchdog is not None:
+        elif (
+            server_args.enable_fault_tolerance
+            and controller._scheduler_watchdog is not None
+        ):
             controller._scheduler_watchdog.wait()
-        else:
-            for proc in controller.scheduler_procs:
-                proc.join()
-                logger.error(
-                    f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
-                )
+        for proc in controller.scheduler_procs:
+            proc.join()
+            logger.error(
+                f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
+            )
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"DataParallelController hit an exception: {traceback}")

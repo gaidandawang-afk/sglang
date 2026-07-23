@@ -191,7 +191,6 @@ class SubprocessWatchdog:
         self._stop_join_timeout = stop_join_timeout
         self._on_exit = on_exit
         self._fail_stop_on_exit = fail_stop_on_exit
-        self._stop_event = threading.Event()
         self._stop_reader, self._stop_writer = Pipe(duplex=False)
         self._thread: Optional[threading.Thread] = None
 
@@ -204,12 +203,8 @@ class SubprocessWatchdog:
         self._thread.start()
 
     def stop(self) -> None:
-        self._stop_event.set()
         if self._thread is not None:
-            try:
-                self._stop_writer.send_bytes(b"\0")
-            except (BrokenPipeError, EOFError, OSError):
-                pass
+            self._stop_writer.send_bytes(b"\0")
             self._thread.join(timeout=self._stop_join_timeout)
             self._thread = None
 
@@ -224,7 +219,7 @@ class SubprocessWatchdog:
                 for index, (proc, name) in enumerate(zip(self._processes, self._names))
             }
             remaining = set(sentinel_to_process)
-            while remaining and not self._stop_event.is_set():
+            while remaining:
                 ready = connection.wait([self._stop_reader, *remaining])
                 if self._stop_reader in ready:
                     return
@@ -242,19 +237,10 @@ class SubprocessWatchdog:
             return False
 
         if self._on_exit is not None:
-            try:
-                self._on_exit(index, proc, name)
-            except Exception:
-                logger.exception(
-                    "Subprocess watchdog on-exit callback failed for %s", name
-                )
+            self._on_exit(index, proc, name)
 
         if not self._fail_stop_on_exit:
-            logger.error(
-                f"Subprocess {name} (pid={proc.pid}) crashed "
-                f"with exit code {proc.exitcode}. "
-                f"Continuing to monitor remaining subprocesses."
-            )
+            logger.warning(f"Subprocess {name} (pid={proc.pid}) crashed with exit code {proc.exitcode}.")
             return False
 
         logger.error(
