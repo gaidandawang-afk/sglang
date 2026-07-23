@@ -171,9 +171,10 @@ class TestFaultToleranceState(unittest.TestCase):
     def test_scale_down_cannot_remove_last_effective_route(self):
         state = FaultToleranceState(dp_size=2, strategy="pause")
         state.process_active_ranks = [True, False]
+        state.paused_dp_ranks = {0}
 
         self.assertEqual(
-            state.validate_scale_down_ranks([0]),
+            state.validate_apply("scale_down", [0]),
             "cannot_isolate_all_active_ranks",
         )
 
@@ -192,6 +193,25 @@ class TestFaultToleranceState(unittest.TestCase):
         self.assertEqual(state.begin_exception_pause(), [])
         state.finish_pause({0, 1})
         self.assertEqual(state.begin_exception_pause(), [])
+
+    def test_unpublished_effective_active_mask_contract(self):
+        state = FaultToleranceState(dp_size=2, strategy="pause")
+
+        # 无变化 -> None
+        self.assertIsNone(state.get_unpublished_effective_active_mask())
+
+        # 变化但未 mark -> 每次读取都返回该 mask
+        state.process_active_ranks = [True, False]
+        self.assertEqual(
+            state.get_unpublished_effective_active_mask(), [True, False]
+        )
+        self.assertEqual(
+            state.get_unpublished_effective_active_mask(), [True, False]
+        )
+
+        # mark 后再次读取 -> None
+        state.mark_effective_active_mask_published([True, False])
+        self.assertIsNone(state.get_unpublished_effective_active_mask())
 
 
 if __name__ == "__main__":

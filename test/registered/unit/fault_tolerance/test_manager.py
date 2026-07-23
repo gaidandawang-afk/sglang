@@ -165,7 +165,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager = make_manager()
         manager.state.disabled_dp_ranks.add(1)
         manager.state.paused_dp_ranks = {0, 1}
-        manager.state._last_effective_active_ranks = [True, False]
+        manager.state._last_published_effective_active_mask = [True, False]
         manager._publish_active_ranks = AsyncMock()
         manager._send_command_collect = AsyncMock()
 
@@ -225,7 +225,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
     async def test_recover_route_failure_does_not_restore_disabled_state(self):
         manager = make_manager(strategy="continue")
         manager.state.disabled_dp_ranks.add(1)
-        manager.state._last_effective_active_ranks = [True, False]
+        manager.state._last_published_effective_active_mask = [True, False]
         manager._publish_active_ranks = AsyncMock(side_effect=TimeoutError("route ack"))
         manager._send_command_collect = AsyncMock()
 

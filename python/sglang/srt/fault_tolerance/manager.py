@@ -6,10 +6,11 @@ import logging
 import os
 import sys
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.fault_tolerance.controller import (
     FaultToleranceState,
+    build_apply_op,
     ft_error_status,
     ft_failure,
 )
@@ -68,53 +69,60 @@ class FaultToleranceManager:
     def status(self) -> tuple[int, dict]:
         return 200, self.state.status_response()
 
+    def _parse_apply_args(
+        self, instruction: str, params: Dict[str, Any], timeout: Any
+    ) -> Tuple[Optional[List[int]], Optional[int], Optional[str]]:
+        try:
+            timeout = int(timeout)
+        except (TypeError, ValueError):
+            return None, None, "invalid_fault_tolerance_timeout"
+        if timeout <= 0:
+            return None, None, "invalid_fault_tolerance_timeout"
+
+        if instruction in ("scale_down", "recover"):
+            ranks = params.get("ranks")
+            if not isinstance(ranks, list):
+                return None, None, f"{instruction}_requires_non_empty_ranks"
+            try:
+                ranks = [int(rank) for rank in ranks]
+            except (TypeError, ValueError):
+                return None, None, "unknown_rank"
+            if instruction == "scale_down" and "shutdown" in params:
+                return None, None, "scale_down_does_not_accept_shutdown"
+            return ranks, timeout, None
+        if instruction == "retry":
+            if params:
+                return None, None, "retry_does_not_accept_params"
+            return None, timeout, None
+        return None, timeout, None
+
     async def apply(self, obj: Dict[str, Any]) -> tuple[int, dict]:
         instruction = obj.get("fault_tolerance_instruction")
         params = obj.get("fault_tolerance_params") or {}
         timeout = obj.get(
             "fault_tolerance_timeout", self.server_args.fault_tolerance_timeout
         )
-        try:
-            timeout = int(timeout)
-        except (TypeError, ValueError):
-            return 400, ft_failure("invalid_fault_tolerance_timeout")
-        if timeout <= 0:
-            return 400, ft_failure("invalid_fault_tolerance_timeout")
-
-        ranks = None
-        if instruction in ("scale_down", "recover"):
-            ranks = params.get("ranks")
-            if not isinstance(ranks, list):
-                return 400, ft_failure(f"{instruction}_requires_non_empty_ranks")
-            try:
-                ranks = [int(rank) for rank in ranks]
-            except (TypeError, ValueError):
-                return 400, ft_failure("unknown_rank")
-            if instruction == "scale_down" and "shutdown" in params:
-                return 400, ft_failure("scale_down_does_not_accept_shutdown")
-        elif instruction == "retry":
-            if params:
-                return 400, ft_failure("retry_does_not_accept_params")
-            ranks = None
+        ranks, timeout, error = self._parse_apply_args(instruction, params, timeout)
+        if error:
+            return 400, ft_failure(error)
 
         error = self.state.validate_apply(instruction, ranks)
         if error:
             return ft_error_status(error), ft_failure(error)
 
+        op = build_apply_op(instruction, ranks)
         resume_targets = self.state.begin_recover(instruction, ranks)
         logger.info(
-            "Fault tolerance apply plan: instruction=%s active_mask=%s "
-            "resume_targets=%s ranks=%s",
+            "Fault tolerance apply plan: instruction=%s resume_targets=%s ranks=%s",
             instruction,
-            self.state.effective_active_mask(),
             resume_targets,
             ranks,
         )
         try:
-            pending_route = self.state.pending_effective_active_update()
+            pending_route = self.state.get_unpublished_effective_active_mask()
             if pending_route is not None:
                 await self._publish_active_ranks(pending_route, timeout)
-                self.state.mark_effective_active_published(pending_route)
+                self.state.mark_effective_active_mask_published(pending_route)
         except Exception as exc:
             logger.exception("Fault tolerance apply failed: %s", exc)
             response = self.state.commit_recover(resumed_ranks=set())
@@ -127,7 +135,7 @@ class FaultToleranceManager:
             return 503, response
 
         acked = set()
-        if instruction != "recover":
+        if op.needs_resume():
             resume_targets = set(resume_targets)
             try:
                 acked = await self._send_command_collect(
@@ -143,7 +151,7 @@ class FaultToleranceManager:
 
         response = self.state.commit_recover(
             resumed_ranks=acked,
-            isolated_ranks=(ranks if instruction == "scale_down" else None),
+            isolated_ranks=op.isolated_ranks(),
         )
         logger.info(
             "Fault tolerance apply committed: instruction=%s ranks=%s",
@@ -165,9 +173,10 @@ class FaultToleranceManager:
         targets = self.state.observe_mooncake_active_ranks(ranks.status)
         if targets:
             self._create_task(self._pause_schedulers(targets))
-        active_mask = self.state.take_effective_active_update()
+        active_mask = self.state.get_unpublished_effective_active_mask()
         if active_mask is None:
             return None
+        self.state.mark_effective_active_mask_published(active_mask)
         return ActiveRanksOutput(status=active_mask)
 
     def observe_process_active_ranks(
@@ -180,9 +189,10 @@ class FaultToleranceManager:
             self._drop_process_inactive_pause_targets(set(ranks.ranks))
         if targets:
             self._create_task(self._pause_schedulers(targets))
-        active_mask = self.state.take_effective_active_update()
+        active_mask = self.state.get_unpublished_effective_active_mask()
         if active_mask is None:
             return None
+        self.state.mark_effective_active_mask_published(active_mask)
         return ActiveRanksOutput(status=active_mask)
 
     def handle_command_output(self, output: FaultToleranceCommandReqOutput) -> None:
@@ -298,10 +308,6 @@ class FaultToleranceManager:
                 ActiveRanksOutput(status=active_mask, request_id=request_id)
             )
             await asyncio.wait_for(future, timeout=timeout_sec)
-        except asyncio.TimeoutError as exc:
-            raise TimeoutError(
-                f"active-ranks routing update timed out: request_id={request_id}"
-            ) from exc
         finally:
             self._pending_active_rank_updates.pop(request_id, None)
 
@@ -337,15 +343,6 @@ class FaultToleranceManager:
         await self.send_to_scheduler.send_pyobj(req)
         try:
             await asyncio.wait_for(pending.future, timeout=timeout_sec)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Fault tolerance command timeout: id=%s command=%s acked=%s pending=%s",
-                request_id,
-                command,
-                sorted(pending.acked),
-                sorted(pending.target_ranks - pending.acked),
-            )
-            raise
         finally:
             self._pending_commands.pop(request_id, None)
 
