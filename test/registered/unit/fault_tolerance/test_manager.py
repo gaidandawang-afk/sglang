@@ -341,6 +341,19 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(manager.state.ft_operation_in_progress)
         self.assertEqual(manager.state.paused_dp_ranks, {0, 1})
 
+    async def test_fatal_task_wrapper_reuses_failstop(self):
+        manager = make_manager()
+        manager._failstop = Mock(side_effect=RuntimeError("failstop"))
+
+        async def fail():
+            raise ValueError("unexpected")
+
+        with self.assertRaisesRegex(RuntimeError, "failstop"):
+            await manager._fatal_task_wrapper(fail())
+
+        manager._failstop.assert_called_once()
+        self.assertIn("FaultToleranceManager hit an exception", manager._failstop.call_args.args[0])
+
     async def test_scale_down_rejects_removed_shutdown_parameter(self):
         manager = make_manager()
         manager.state.begin_exception_pause()

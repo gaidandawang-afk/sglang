@@ -4,7 +4,6 @@ import asyncio
 import dataclasses
 import logging
 import os
-import sys
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -248,10 +247,7 @@ class FaultToleranceManager:
         try:
             await coro
         except Exception:
-            traceback = get_exception_traceback()
-            logger.error("FaultToleranceManager hit an exception: %s", traceback)
-            kill_process_tree(os.getpid(), include_parent=True)
-            sys.exit(1)
+            self._failstop(f"FaultToleranceManager hit an exception: {get_exception_traceback()}")
 
     async def _pause_schedulers(self, targets: List[int]):
         acked = await self._send_command_collect(
