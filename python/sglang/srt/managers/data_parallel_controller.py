@@ -250,27 +250,13 @@ class DataParallelController:
         # recovery may need to resume a DP while its route is still inactive.
         for rank in sorted(set(obj.target_ranks)):
             if not 0 <= rank < len(self.workers):
-                logger.warning(
-                    "Ignoring FT command for unknown DP rank: id=%s rank=%s",
-                    obj.request_id,
-                    rank,
-                )
+                logger.warning("Ignoring FT command for unknown DP rank: rank=%s", rank)
                 continue
             worker = self.workers[rank]
             if worker is None:
-                logger.warning(
-                    "Ignoring FT command without a local DP leader socket: "
-                    "id=%s rank=%s",
-                    obj.request_id,
-                    rank,
-                )
+                logger.warning("Ignoring FT command without a local DP leader socket: rank=%s", rank)
                 continue
-            logger.info(
-                "DPC forwarding FT command: id=%s command=%s dp_rank=%s",
-                obj.request_id,
-                obj.command,
-                rank,
-            )
+            logger.info("DPC forwarding FT command: command=%s dp_rank=%s", obj.command, rank)
             worker.send_pyobj(obj)
 
     def _handle_scheduler_process_exit(self, index, proc, name):

@@ -112,12 +112,7 @@ class FaultToleranceManager:
 
         op = build_apply_op(instruction, ranks)
         resume_targets = self.state.begin_recover(instruction, ranks)
-        logger.info(
-            "Fault tolerance apply plan: instruction=%s resume_targets=%s ranks=%s",
-            instruction,
-            resume_targets,
-            ranks,
-        )
+        logger.info("Fault tolerance apply plan: instruction=%s resume_targets=%s ranks=%s", instruction, resume_targets, ranks)
         try:
             pending_route = self.state.get_unpublished_effective_active_mask()
             if pending_route is not None:
@@ -153,11 +148,7 @@ class FaultToleranceManager:
             resumed_ranks=acked,
             isolated_ranks=op.isolated_ranks(),
         )
-        logger.info(
-            "Fault tolerance apply committed: instruction=%s ranks=%s",
-            instruction,
-            ranks,
-        )
+        logger.info("Fault tolerance apply committed: instruction=%s ranks=%s", instruction, ranks)
         return 200, response
 
     def validate_routed_rank(self, rank: int) -> None:
@@ -198,11 +189,7 @@ class FaultToleranceManager:
     def handle_command_output(self, output: FaultToleranceCommandReqOutput) -> None:
         pending = self._pending_commands.get(output.request_id)
         if pending is None:
-            logger.warning(
-                "Unknown fault tolerance command ack: request_id=%s rank=%s",
-                output.request_id,
-                output.rank,
-            )
+            logger.warning("Unknown fault tolerance command ack: rank=%s", output.rank)
             return
         if output.success:
             pending.acked.add(output.rank)
@@ -221,13 +208,7 @@ class FaultToleranceManager:
             if not dropped_ranks:
                 continue
             pending.target_ranks.difference_update(dropped_ranks)
-            logger.info(
-                "FT pause targets became runtime-inactive: id=%s "
-                "dropped=%s remaining=%s",
-                request_id,
-                sorted(dropped_ranks),
-                sorted(pending.target_ranks),
-            )
+            logger.info("FT pause targets became runtime-inactive: dropped=%s", sorted(dropped_ranks))
             pending.finish_if_ready()
 
     def handle_active_ranks_update_output(
@@ -235,11 +216,7 @@ class FaultToleranceManager:
     ) -> None:
         future = self._pending_active_rank_updates.get(output.request_id)
         if future is None:
-            logger.warning(
-                "Unknown active-ranks update ack: request_id=%s success=%s",
-                output.request_id,
-                output.success,
-            )
+            logger.warning("Unknown active-ranks update ack: success=%s", output.success)
             return
         if future.done():
             return
@@ -250,13 +227,13 @@ class FaultToleranceManager:
 
     def handle_rank_fault(self, event: FaultToleranceRankFaultOutput) -> None:
         if self.state.strategy == "continue":
-            logger.warning(
-                "FT continue observed scheduler exception on rank %s: %s",
-                event.rank,
-                event.message,
-            )
+            logger.warning("FT continue observed scheduler exception on rank %s: %s", event.rank, event.message)
             return
-        self._create_task(self._handle_exception_pause(event))
+        targets = self.state.begin_exception_pause()
+        if not targets:
+            logger.warning("Ignoring FT exception with no healthy pause target: rank=%s", event.rank)
+            return
+        self._create_task(self._pause_schedulers(targets))
 
     def _create_task(self, coro):
         if self.event_loop is None:
@@ -275,19 +252,6 @@ class FaultToleranceManager:
             logger.error("FaultToleranceManager hit an exception: %s", traceback)
             kill_process_tree(os.getpid(), include_parent=True)
             sys.exit(1)
-
-    async def _handle_exception_pause(self, event: FaultToleranceRankFaultOutput):
-        targets = self.state.begin_exception_pause()
-        if not targets:
-            logger.warning(
-                "Ignoring FT exception with no healthy pause target: "
-                "rank=%s message=%s",
-                event.rank,
-                event.message,
-            )
-            return
-
-        await self._pause_schedulers(targets)
 
     async def _pause_schedulers(self, targets: List[int]):
         acked = await self._send_command_collect(
@@ -334,12 +298,7 @@ class FaultToleranceManager:
             command=command,
             target_ranks=sorted(target_set),
         )
-        logger.info(
-            "FT command dispatch: id=%s command=%s targets=%s",
-            request_id,
-            command,
-            req.target_ranks,
-        )
+        logger.info("FT command dispatch: command=%s targets=%s", command, req.target_ranks)
         await self.send_to_scheduler.send_pyobj(req)
         try:
             await asyncio.wait_for(pending.future, timeout=timeout_sec)
@@ -350,12 +309,7 @@ class FaultToleranceManager:
             raise RuntimeError(
                 f"fault tolerance command {command} failed: {pending.failed}"
             )
-        logger.info(
-            "FT command complete: id=%s command=%s acked=%s",
-            request_id,
-            command,
-            sorted(pending.acked),
-        )
+        logger.info("FT command complete: command=%s acked=%s", command, sorted(pending.acked))
         return pending.acked
 
     @staticmethod

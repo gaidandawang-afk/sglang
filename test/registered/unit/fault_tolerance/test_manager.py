@@ -244,7 +244,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
 
     async def test_exception_does_not_change_availability_sources(self):
         manager = make_manager()
-        manager._handle_exception_pause = AsyncMock()
+        manager._pause_schedulers = AsyncMock()
         before = (
             list(manager.state.process_active_ranks),
             list(manager.state.mooncake_active_ranks),
@@ -258,7 +258,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager.handle_rank_fault(event)
         await asyncio.sleep(0)
 
-        manager._handle_exception_pause.assert_awaited_once_with(event)
+        manager._pause_schedulers.assert_awaited_once_with([0, 1])
         self.assertEqual(
             before,
             (
