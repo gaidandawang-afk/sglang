@@ -3826,19 +3826,17 @@ class Scheduler(
             return None
         elif recv_req.command == "resume":
             self._engine_paused = False
-            success = True
         else:
             logger.warning("FT scheduler received unknown command: %s", recv_req.command)
             return None
 
-        success = self._aggregate_ft_command_result(success)
         if self.attn_tp_rank != 0 or self.attn_cp_rank != 0:
             return None
         return FaultToleranceCommandReqOutput(
             request_id=recv_req.request_id,
             rank=rank,
-            success=success,
-            message="",
+            success=True,
+            message="resumed",
         )
 
     def _update_ft_pause_from_mlp_sync(self, global_ft_actions) -> None:
@@ -3867,33 +3865,6 @@ class Scheduler(
             message="paused",
         )
         self.send_to_tokenizer.send_output(output, pending)
-
-    def _aggregate_ft_command_result(self, success: bool) -> bool:
-        # Gather which members of this DP block participated, then report whoever
-        # is missing. No per-member message: failures surface only as absent ranks.
-        if self.server_args.enable_dp_attention:
-            if self.attn_cp_size != 1:
-                cp_ranks = self.attn_cp_group.all_gather_object(self.attn_cp_rank)
-            else:
-                cp_ranks = [self.attn_cp_rank]
-            expected = self.attn_cp_size
-            gathered = cp_ranks
-
-            if self.attn_tp_size != 1:
-                gathered = [
-                    rank
-                    for tp_ranks in self.attn_tp_group.all_gather_object(gathered)
-                    for rank in tp_ranks
-                ]
-                expected *= self.attn_tp_size
-        elif self.tp_size != 1:
-            gathered = self.tp_group.all_gather_object(self.tp_rank)
-            expected = self.tp_size
-        else:
-            gathered = [self.tp_rank]
-            expected = 1
-
-        return success and len(gathered) == expected
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
