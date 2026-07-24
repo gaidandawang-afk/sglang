@@ -67,6 +67,91 @@
 
 ---
 
+## 第 5 批 — 当前会话交接状态（2026-07-24）
+
+> **下一位 agent 的起点**：先执行 `git status --short` 和 `git log --oneline -5`，确认仍在 `worktree-dp-only-ft-revise` 且 HEAD 为 `b0c1416d5`。若不一致，先检查漂移，不能按本节直接继续改代码。
+
+| # | 提交 | 已完成内容 | 已确认的边界/结论 | 状态 |
+|---|---|---|---|---|
+| 5.1 | `94ee057ca` | FT 相关日志统一为物理一行；同步收缩 FT control 日志 | 不保留仅用于定位的 FT 日志信息；全仓扫描范围不只 `manager.py` | [x] |
+| 5.2 | `806abd21d` | `_fatal_task_wrapper` 与 `_failstop` 收敛 | 后台 FT task 的未预期异常仍 fail-stop；预期的 FT 命令/API失败由各自事务路径处理 | [x] |
+| 5.3 | `b0c1416d5` | DPC FT 消息、进程映射和 watchdog 简化 | `SchedulerProcessInfo` 删除，仅保留与 `scheduler_procs` 同序的 `scheduler_process_dp_ranks`；watchdog 仍以 `connection.wait()`/sentinel 为核心 | [x] |
+| 5.4 | `b0c1416d5` | watchdog 去除冗余防御层 | 删除 `_on_exit` 异常吞噬、`_stop_event` 和 `stop()` pipe 写入异常吞噬；保留 `stop_join_timeout`、Pipe、`remaining` 与 `wait()` | [x] |
+| 5.5 | `b0c1416d5` | DPC dispatch 还原 e63 的四种负载策略 | FT 的全 DP 不可用拦截只在 `dispatching_with_trace()`；显式 `routed_dp_rank` 的 inactive 拦截只在 `maybe_external_dp_rank_routing()`；不引入 `_next_active_rank` | [x] |
+| 5.6 | `b0c1416d5` | 本地 scheduler 异常退出上报 | 每个本地 DPC 的后台 watchdog 均监听（含 node0）；node0 主线程运行 `event_loop()`，非 node0 FT 主线程 `watchdog.wait()`；随后统一执行 e63 的 `proc.join()` | [x] |
+
+### 5.7 消息与路由结论（继续 review 时不得反转）
+
+- `FaultToleranceCommandReqInput`：FT manager → Node0 DPC → 指定 DP leader；scheduler 将它作为 control request 在本地 attention TP/CP block 内传播。
+- `FaultToleranceCommandReqOutput`、`ActiveRanksUpdateReqOutput`、`FaultToleranceRankFaultOutput`、`ProcessActiveRanksOutput`：均回流到 TokenizerManager 的 dispatcher，不是 DPC 下行请求。
+- `ProcessActiveRanksOutput(ranks: List[int], active: bool)` 的 `ranks` 是逻辑 DP rank；watchdog 单 child 异常上报 `[dp_rank]`，rejoin DPC 上报本节点去重后的 DP rank 集合。
+- `enable_dp_attention_local_control_broadcast` 仍只决定 DPC 原生 `send_control_message()` 的广播范围；FT command 不经该 fallback。scheduler 内部的 FT local broadcast 是另一层语义，不能混为一个 `local_ctrl` 判断。
+
+### 5.8 当前验证与限制
+
+- 已通过：`python -m py_compile python/sglang/srt/managers/data_parallel_controller.py python/sglang/srt/utils/watchdog.py`，`git diff --check`（提交前）。
+- 未能运行 watchdog pytest：Windows 上即使设置 `PYTHONPATH=python`，收集阶段仍因 `python/sglang/srt/utils/common.py` 导入 Unix-only `resource` 失败。Linux/CI 应运行：`PYTHONPATH=python python -m pytest test/registered/unit/utils/test_subprocess_watchdog.py -q`。
+- 架构/场景事实以 `D:\Codex\shared\2026-07-17\SGLang DP-only FT 架构设计与验证指南\README.md` 第 3.5、3.7、5.2、5.3、7、8 节为准；该共享文档不属于本仓库提交。
+
+### 5.9 后续 review 入口
+
+1. 继续按 OWNER 的逐段 code review 推进；每个新问题先与 e63 和第 5.7 节消息边界对照，再决定是否修改。
+2. 若改动 watchdog：不得删除 `connection.wait()`、sentinel `remaining`、Pipe stop 唤醒、`fail_stop_on_exit=False` 或非 node0 的 `wait()`，除非同步修改共享架构指南并给出覆盖多本地 child / 整节点退出 / rejoin 的验证。
+3. 每次提交后在本节追加提交号、结论、验证与未决问题；`README.md` 的第 7、8 节只记录架构/验证进展，不承担逐条 code-review 交接。
+
+---
+
+## 第 6 批 — io_struct FT dataclass 字段审查
+
+| # | 位置 | 问题 | 结论 | 状态 |
+|---|------|------|------|------|
+| 6.1 | `io_struct.py` 六个 FT dataclass | 是否有不需要的字段 | **无冗余**。逐字段核对消费方后，每个字段都有下游用途，且非"仅为定位"的噪声（符合字段最小化原则）。详见下方字段说明 | [OK] |
+
+### 6.1.1 字段说明（io_struct.py FT dataclass）
+
+| Dataclass | 字段 | 消费方 / 用途 |
+|---|---|---|
+| `FaultToleranceCommandReqInput` | `request_id` | scheduler 回填到 Output；manager 查 `_pending_commands` |
+| | `command` | scheduler 判 pause/resume |
+| | `target_ranks` | DPC 投递 + scheduler MLP-sync 等待 |
+| `FaultToleranceCommandReqOutput` | `request_id` / `rank` / `success` / `message` | manager 查 pending、`acked.add(rank)`、分 ack/failed；`message` 设进 future exception 透传到 apply 的 503 响应体 |
+| `FaultToleranceRankFaultOutput` | `rank` / `message` | manager 单行 warning 日志 |
+| `ActiveRanksOutput` | `status` | manager 喂 `observe_mooncake_active_ranks` |
+| | `request_id` | observe 路径留 `None`（fire-and-forget）；仅 `_publish_active_ranks` 的 apply 路径填 `uuid` 做路由 ACK 关联。**有意的双路径 Optional 设计** |
+| `ProcessActiveRanksOutput` | `ranks` / `active` | manager `observe_process_active_ranks`、`_drop_process_inactive_pause_targets` |
+| `ActiveRanksUpdateReqOutput` | `request_id` / `success` / `message` | manager 查 `_pending_active_rank_updates`、分 set_result/set_exception；`message` 进 `RuntimeError` |
+
+### 6.1.2 `rid` vs `request_id`（不可复用）
+
+`rid`（`BaseReq` 基类，`io_struct.py:52`）是**推理请求级** ID：`Optional[Union[str, List[str]]]`，关联用户请求输入↔输出，配 `regenerate_rid()`。
+
+FT 的 `request_id` 是**控制事务级** ID：manager 在 `_publish_active_ranks` 现造 `uuid`，关联"下发的命令/路由发布"↔"回流的 ACK"。
+
+**不应复用 `rid`**：① 类型不合（`rid` 可 None/list，`request_id` 需非空 str）；② 语义分层——5.7 节明确 FT 控制消息与推理数据消息的 ID 命名空间隔离，混用会撞名、模糊 e63 对齐边界。`ActiveRanksOutput.request_id` 用 `Optional[str]=None` 是为了单类型承载 observe/apply 双路径，是合理最小实现。
+
+### 6.2 `_ft_rank()` 的 None 兜底不可达
+
+`scheduler.py:1566` `_ft_rank()` = `dp_rank if dp_rank is not None else 0`。FT gate 已含 `_dp_attention_gate` + `ft_requires_dp_gt1`，FT 启用时 `dp_rank` 恒非 None，`else 0` 分支不可达；且返回 0 会把非 DP 配置误标成 DP0，反误导。**OWNER 已批：删 `_ft_rank()`，三处调用（1555/3823/3873）直接用 `self.dp_rank`。** 状态：[~] 待改
+
+### 6.3 FT 只支持 DP attention 的根因（设计前提澄清）
+
+不是"mooncake EP 代码明写只支持 DP attention"，而是 **FT 的三源状态模型必须按 DP 聚合，DP 聚合只在 DP attention 下存在**：
+
+1. rank 布局 `dp_rank = tp_rank // (A*C)`（README 3.2）只在 DP attention 下定义；`model_runner.py:365` `dp_size = ... if enable_dp_attention else 1`。
+2. mooncake→DP 投影在 `scheduler.py:3227-3238`：发送 `ActiveRanksOutput`（mooncake DP mask）本身就以 `enable_dp_attention` 为前提，`reshape(dp_size,-1).prod(axis=1)` 依赖连续 `(dp,cp,tp)` 布局；非 DP attention 下 `dp_size=1`，"按 DP 隔离/路由"语义不成立。
+3. **代码无明写绑定**：`_handle_elastic_ep`（server_args.py:3303）只断言 `pp_size==1`、设 IB device，不强制 `enable_dp_attention`。`elastic_ep_backend` 与 `enable_dp_attention` 是两个独立开关，无硬绑定。
+4. **文档未单独记录**：共享指南 README/GRAVEYARD 无专段解释，只在 3.2/4.8 隐含。"mooncake EP 只支持 DP attention"更像经验性事实。
+
+这条解释了 dp_gt1 / mooncake backend / tp 整除三个 gate 的共同根因。**待办：建议把该设计前提同步进共享指南 README 4.8 节。** 状态：[x] 结论记录，README 同步待办
+
+### 6.4 `_process_next_overlap_result` 替代 e63 `pop_and_process` —— 非单纯等效
+
+e63 把"取队首→process→移除"写两遍：`event_loop_overlap` 闭包 `pop_and_process`（先 popleft 再 process）+ `pause_generation` 内联展开。当前统一为 `_process_next_overlap_result()` 方法（`scheduler.py:1631`），三处复用（1687/1699/3775），消重复。
+
+**关键不只是消重复——顺序本身是 FT 必要加固**：当前是**先 `process_batch_result` 后 `popleft`**。`_ft_discard_inflight_window`（1571-1573）的 fault window 依赖 `result_queue` 里躺着的失败批次副本；若像 e63 先 popleft，`process_batch_result` 抛异常时该批次已被移出队列，且与 `last_batch` 非同一对象（是 `batch.copy()`），discard 会漏掉它——那些请求拿不到 503、KV 可能泄漏。**先 process 后 popleft 保证失败批次仍留在 result_queue 供完整 abort。** 状态：[x] 结论记录
+
+---
+
 ## 待对齐 / 待你决定
 
 1. ~~3.3 `_ApplyOp` 去留~~ → **已全批，已做。**
@@ -79,3 +164,4 @@
 
 - 2026-07-23：建文档；录入 12 条意见。
 - 2026-07-23：**第 0/1/2/3 批全部完成**（0 越界退回；1 controller 写法；2 manager 风格+降 try；3.1 pause 骨架+availability 收编；3.2 pending/mark 两接口+单测；3.3 _ApplyOp 策略对象）。`test_controller.py` 15/15 通过。待 OWNER review + `test_manager.py` Linux 复跑。
+- 2026-07-24：补齐第 5 批交接状态：记录 `94ee057ca`、`806abd21d`、`b0c1416d5` 的 DPC/watchdog review 结论、消息边界与 Windows 验证限制。后续 agent 以第 5 批作为本轮 review/revise 的续接入口。
