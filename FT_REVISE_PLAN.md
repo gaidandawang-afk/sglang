@@ -163,6 +163,15 @@ e63 把"取队首→process→移除"写两遍：`event_loop_overlap` 闭包 `po
 
 **与 6.2 的对照（判断 None 兜底是否冗余的标准）**：`_ft_rank()` 是真冗余，因为 FT gate 锁死了"FT 启用 ⇒ dp_rank 非 None"这一前提；而 `result_queue` 的 None 在 non-overlap FT 下**真实可达**，故保留。**标准：一个 None 兜底是否冗余，看它对应的状态组合在 FT gate 下是否真的不可达。** 状态：[OK] 拆解完成，无改动
 
+### 6.6 `SGLANG_FT_DEBUG_STACK_SIGNAL` 定位日志 —— 已删
+
+`scheduler.py` 五处全删（提交 `b09d8f0d5`，-15 行）：
+- `handle_fault_tolerance_command` 三处 `logger.info`（received / pause ready / handled）
+- `_complete_ft_pause` 一处 `logger.info`（pause committed）
+- `run_scheduler_process` 的 faulthandler 调试钩子（`getattr(signal,"SIGUSR2")` + `faulthandler.register` + 一行 enabled 日志）
+
+属"仅用于定位"的调试残留，违一行日志原则，全删。`signal`（4234 `SIGQUIT`）与 `faulthandler`（4155 `enable()`）另有正当用途，import 保留。`py_compile` 通过，源码无残留（仅 `.pyc` 缓存）。状态：[x]
+
 ---
 
 ## 待对齐 / 待你决定
