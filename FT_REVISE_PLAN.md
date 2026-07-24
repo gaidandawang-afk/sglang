@@ -211,6 +211,22 @@ e63 把"取队首→process→移除"写两遍：`event_loop_overlap` 闭包 `po
 - **CP 支持**：原函数同时处理 CP/TP 两维。FT 对 CP 是"设计不拒绝（`_dp_attention_gate` 把 `attn_cp_size` 纳入整除布局）、验证未覆盖（已验证拓扑均 `C=1`）"。删除聚合后该维度不再有此函数涉及，留待别处讨论统一处理。
 - **行为变化**：unknown command 从"回失败 ACK"改为"记日志 + 不回 ACK（manager 端超时 fail-stop）"；resume ACK 从"聚合各成员结果"改为"leader 单点 ACK"。`py_compile` 通过。状态：[x]（聚合一致性问题转别处）
 
+### 6.10 elastic-ep rank-fault 两次 `_update_expert_layout...` 调用 —— 已整体 revert 回 e63
+
+`664843da6`（"preserve live replicas after rank faults"）把 e63 的 `_maybe_rebalance_after_rank_fault`（forward 后单次调用 + 内部条件重跑）重构为 `_update_expert_layout_after_rank_fault_if_needed`（返回 bool、调用点显式重跑），并**新增 forward 前那次调用**。
+
+**讨论结论**：e63 只靠 forward 后一次已能保证**最终 output 正确**——第一次 forward 若用旧（含死 rank）布局，其 output 会被 forward 后检测到拓扑变化触发的**重跑整个覆盖**，错误输出不到上层。forward 前那次买到的**不是正确性，是效率**（省掉一次基于旧布局的浪费 forward + 集合对齐），非必需。**OWNER 决定：先删 forward 前那次（`c00e71559`），再整体 revert `664843da6`（`4d60a7527`）**，回到与 e63 逐字节一致的 `_maybe_rebalance_after_rank_fault`。三文件（model_runner / expert_location / mooncake）回退，`NoActiveExpertReplicaError`、`init_by_mapping` 保留副本逻辑全移除。`py_compile` 通过。状态：[x]
+
+### 6.11 `server_args.py` rejoin 端口守卫 —— 保留，非为单机模拟多节点
+
+`init_new` 启动时 `wait_port_available` 检查一批端口空闲。FT 加的两处 `if not server_args.elastic_ep_rejoin:` 守卫（7823-7827 跳 `dist_init/port_base/detokenizer/nccl`，仍查 `rpc/metrics`；7832 跳 `scheduler_input_port`）。
+
+**原因（真实 rejoin，非单机模拟多节点）**：rejoin 是"以同一 node rank 重拉已死节点进程组"（README 5.3），新进程要绑和旧进程**相同的端口**恢复 ZMQ/NCCL 身份；旧进程残留连接（TIME_WAIT/未回收）会让 `wait_port_available` 误报端口冲突、拒绝启动，rejoin 永远起不来。故 rejoin 跳过这些检查。`rpc/metrics` 无前身残留仍检查。单机模拟多节点用**不同端口**本不冲突，只是测试载体，非此逻辑存在的原因。属 FT 自有改动、rejoin 必要前提，非冗余。状态：[OK] 保留
+
+### 6.12 watchdog assert 格式化 —— 已贴回 e63
+
+`watchdog.py` `assert test_stuck_time == 0` 一段当前分支与 e63 仅换行/括号位置差异（black 风格），语义一字未变。**OWNER：别碰，别浪费 reviewer 时间**。已贴回 e63 写法（`f29d8b7bf`），消除该处纯格式化 diff。watchdog.py 与 e63 的其余差异（`fail_stop_on_exit`、非 node0 `wait()` 等 FT 实质改动）保留。状态：[x]
+
 ---
 
 ## 待对齐 / 待你决定
