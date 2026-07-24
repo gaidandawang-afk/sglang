@@ -199,6 +199,15 @@ e63 把"取队首→process→移除"写两遍：`event_loop_overlap` 闭包 `po
 
 **判断标准**：抽策略对象的收益 = 分叉维度数 × 命令数。控制面 4×3，执行面 1×2。在执行面也套 ApplyOp 才是过度设计——为一个两分支 if 引入类和查表。`Literal["pause","resume"]` 类型注解已编译期约束合法值，else 的 `raise ValueError unknown command` 只是防御非法穿越。**现状不应改动。** 状态：[OK] 记录
 
+### 6.9 `handle_fault_tolerance_command` try + `_aggregate_ft_command_result` message —— 已删
+
+**OWNER 决策**：① try/except 纯属多余——它唯一真实捕获的是自己 raise 的 unknown command；不支持的 command 不需要抛异常，记一行日志返回 None。② `_aggregate_ft_command_result` 的 `member_result`/`message` 冗余——只收集谁参与通信，缺谁报谁，不需要各成员 message。已执行（提交 `e16fb48e2`，-38/+27）：
+
+- `handle_fault_tolerance_command`：删 try/except；pause 与 unknown command 均提前 `return None`（unknown 记一行 warning），只有 resume 走到聚合 + 回 ACK。`message=""`。
+- `_aggregate_ft_command_result`：签名 `(self, success: bool) -> bool`（原 `(success, message) -> Tuple[bool, str]`）；不再 `all_gather` 各成员 `{tp_rank,success,message}` dict，改为只 gather 参与通信的 rank（CP 维 gather `attn_cp_rank`、TP 维 gather 后展平），与期望成员数 `attn_cp_size*attn_tp_size`（或非 DP 下 `tp_size`）比对，缺员即 `success=False`。下游 `message` 仅进 `pending.failed[rank]` 拼 RuntimeError 字符串，格式自由，无破坏。
+- **CP 支持**：该函数同时处理 CP/TP 两维，非只针对 CP。FT 对 CP 是"设计不拒绝（`_dp_attention_gate` 把 `attn_cp_size` 纳入整除布局）、验证未覆盖（已验证拓扑均 `C=1`）"，CP 分支为合法 CP>1 拓扑保留，非冗余。
+- **行为变化**：unknown command 从"回失败 ACK"改为"记日志 + 不回 ACK（manager 端超时 fail-stop）"——协议错误语义，非业务失败。`py_compile` 通过。状态：[x]
+
 ---
 
 ## 待对齐 / 待你决定
