@@ -3818,16 +3818,12 @@ class Scheduler(
         self, recv_req: FaultToleranceCommandReqInput
     ) -> Optional[FaultToleranceCommandReqOutput]:
         rank = self.dp_rank
-        if os.getenv("SGLANG_FT_DEBUG_STACK_SIGNAL") == "1":
-            logger.info("FT scheduler command received: command=%s rank=%s targets=%s", recv_req.command, rank, recv_req.target_ranks)
         if rank not in recv_req.target_ranks:
             return None
 
         try:
             if recv_req.command == "pause":
                 self._ft_pending_pause = recv_req
-                if os.getenv("SGLANG_FT_DEBUG_STACK_SIGNAL") == "1":
-                    logger.info("FT scheduler pause ready: rank=%s targets=%s", rank, recv_req.target_ranks)
                 return None
             elif recv_req.command == "resume":
                 self._engine_paused = False
@@ -3840,8 +3836,6 @@ class Scheduler(
             message = str(exc)
 
         success, message = self._aggregate_ft_command_result(success, message)
-        if os.getenv("SGLANG_FT_DEBUG_STACK_SIGNAL") == "1":
-            logger.info("FT scheduler command handled: command=%s rank=%s success=%s message=%s", recv_req.command, rank, success, message)
         if self.attn_tp_rank != 0 or self.attn_cp_rank != 0:
             return None
         return FaultToleranceCommandReqOutput(
@@ -3868,8 +3862,6 @@ class Scheduler(
 
         self._ft_pending_pause = None
         rank = self.dp_rank
-        if os.getenv("SGLANG_FT_DEBUG_STACK_SIGNAL") == "1":
-            logger.info("FT scheduler pause committed: rank=%s targets=%s", rank, pending.target_ranks)
         if self.attn_tp_rank != 0 or self.attn_cp_rank != 0:
             return
         output = FaultToleranceCommandReqOutput(
@@ -4165,13 +4157,6 @@ def configure_scheduler_process(
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
-    debug_stack_signal = getattr(signal, "SIGUSR2", None)
-    if (
-        os.getenv("SGLANG_FT_DEBUG_STACK_SIGNAL") == "1"
-        and debug_stack_signal is not None
-    ):
-        faulthandler.register(debug_stack_signal, all_threads=True)
-        logger.info("FT debug stack signal enabled: signal=%s", debug_stack_signal)
 
     # Set cpu affinity to this gpu process
     if envs.SGLANG_SET_CPU_AFFINITY.get():
