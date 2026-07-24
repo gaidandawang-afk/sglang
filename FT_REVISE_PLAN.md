@@ -150,6 +150,19 @@ e63 把"取队首→process→移除"写两遍：`event_loop_overlap` 闭包 `po
 
 **关键不只是消重复——顺序本身是 FT 必要加固**：当前是**先 `process_batch_result` 后 `popleft`**。`_ft_discard_inflight_window`（1571-1573）的 fault window 依赖 `result_queue` 里躺着的失败批次副本；若像 e63 先 popleft，`process_batch_result` 抛异常时该批次已被移出队列，且与 `last_batch` 非同一对象（是 `batch.copy()`），discard 会漏掉它——那些请求拿不到 503、KV 可能泄漏。**先 process 后 popleft 保证失败批次仍留在 result_queue 供完整 abort。** 状态：[x] 结论记录
 
+### 6.5 `_ft_discard_inflight_window` 拆解 —— 无实质冗余
+
+函数职责清晰（收集 fault window → 按 rid 去重 → 逐 req 释放 KV + abort → 清空状态）。逐候选点拆解结论（OWNER 已同意保留）：
+
+| 候选冗余点 | 判断 | 理由 |
+|---|---|---|
+| `getattr(self, "result_queue", None)`（1571） | 保留 | FT 下 `enable_overlap` 可为 False（`disable_overlap_schedule`/mlx），此时 `dispatch_event_loop` 走 `event_loop_normal`，**不初始化 `result_queue`**。`getattr`+None 兜底是区分 overlap/non-overlap 的必要分支，非无脑防御。印证 README 4.6"non-overlap 清当前批；overlap 清完整窗口" |
+| `if result_queue is not None` 两次（1572 extend、1624 clear） | 保留 | 同源：non-overlap 下无该属性，extend 与 clear 各需守卫；两次判断服务不同操作，不能合并 |
+| `discarded_by_rid.setdefault` 去重 | 保留 | 按 rid 去重保序的标准写法；overlap 下同 req 可同时出现在 cur/last/running/result_queue 多个 batch，必须去重避免重复 abort/重复释放 KV |
+| 逐字段清空（1620-1627） | 保留 | running_batch 重置空 batch、chunked_req 条件置 None（含 `_chunked_req_scheduled_last_iter` 联动）、result_queue clear、cur/last 置 None——各自语义不同，不能并 |
+
+**与 6.2 的对照（判断 None 兜底是否冗余的标准）**：`_ft_rank()` 是真冗余，因为 FT gate 锁死了"FT 启用 ⇒ dp_rank 非 None"这一前提；而 `result_queue` 的 None 在 non-overlap FT 下**真实可达**，故保留。**标准：一个 None 兜底是否冗余，看它对应的状态组合在 FT gate 下是否真的不可达。** 状态：[OK] 拆解完成，无改动
+
 ---
 
 ## 待对齐 / 待你决定
