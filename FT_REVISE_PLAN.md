@@ -172,6 +172,33 @@ e63 把"取队首→process→移除"写两遍：`event_loop_overlap` 闭包 `po
 
 属"仅用于定位"的调试残留，违一行日志原则，全删。`signal`（4234 `SIGQUIT`）与 `faulthandler`（4155 `enable()`）另有正当用途，import 保留。`py_compile` 通过，源码无残留（仅 `.pyc` 缓存）。状态：[x]
 
+### 6.7 FT 为什么不复用原生 `pause_generation`
+
+`pause_generation` 是 e63 已有的运行时暂停（RL 权重更新/运维），三模式 abort/retract/in_place。FT pause 走 `handle_fault_tolerance_command`，**刻意不复用**，非不知有它：
+
+| 维度 | `pause_generation` | FT pause |
+|---|---|---|
+| 作用范围 | 整个 scheduler 进程 | DP 粒度（`target_ranks`，只 pause 指定 DP block） |
+| batch 处理 | abort/retract/in_place，会 merge `last_batch`→`running_batch`、回收请求 | 不动 batch——故障窗口由 `_ft_discard_inflight_window` 按 rid 去重单独清理 |
+| 协调 | 单进程本地 | 跨 DP 的 MLP-sync 协同（`_ft_pending_pause`+`PAUSE_READY` 粘滞传播，全部存活 DP ready 才 ACK，见 `74cafe366`） |
+| ACK | 无 | 回 `FaultToleranceCommandReqOutput` 完成 pause 事务 |
+| 触发源 | 上层主动 | 故障下降沿自动 |
+
+**核心**：`pause_generation` 假设进程健康、可慢慢 merge/retract；FT 面对的是**部分 DP 已死、不能再跑 collective** 的场景，必须用 MLP-sync 让幸存 DP 同步停，否则卡在 `all_gather_into_tensor` 等故障 DP。复用其 abort/retract 路径会在故障场景再次触碰已损坏的 batch 状态。**共享的只是无状态工具方法 `_process_next_overlap_result`（3772 被原生 pause 复用），不共享带故障语义的 pause 流程。** 状态：[OK] 记录
+
+### 6.8 ApplyOp（控制面）vs scheduler 字符串解析 —— 非失败重构/非半成品
+
+3.3 把控制面 apply 重构为 `_ApplyOp` 策略对象，但 `handle_fault_tolerance_command` 仍 `if recv_req.command == "pause"` 字符串解析。**这是恰到好处的非对称设计，不是没重构完：**
+
+| | ApplyOp（controller，TokenizerManager 进程） | `handle_fault_tolerance_command`（scheduler 进程） |
+|---|---|---|
+| 命令集 | retry / scale_down / recover（3 个） | pause / resume（2 个） |
+| 各命令差异 | 大——validate 规则、disabled 副作用、resume targets、是否需 ACK 全不同 | 小——都是置 `_engine_paused`/`_ft_pending_pause`，差异仅一个布尔 |
+| 分叉维度 | 4 个（validate/apply_to_disabled/resume_targets/needs_resume） | 1 个（置哪个字段） |
+| 多态收益 | 高（3.3：否则 4 段平行 if-else 瀑布） | 低（一个 if/elif 两分支装下） |
+
+**判断标准**：抽策略对象的收益 = 分叉维度数 × 命令数。控制面 4×3，执行面 1×2。在执行面也套 ApplyOp 才是过度设计——为一个两分支 if 引入类和查表。`Literal["pause","resume"]` 类型注解已编译期约束合法值，else 的 `raise ValueError unknown command` 只是防御非法穿越。**现状不应改动。** 状态：[OK] 记录
+
 ---
 
 ## 待对齐 / 待你决定
