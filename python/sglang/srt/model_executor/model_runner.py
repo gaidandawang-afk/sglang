@@ -3320,8 +3320,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch,
             ) as recorder_outputs,
         ):
-            if self.enable_elastic_ep:
-                self._update_expert_layout_after_rank_fault_if_needed()
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
