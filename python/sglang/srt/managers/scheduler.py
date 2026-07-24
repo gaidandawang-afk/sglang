@@ -3821,28 +3821,24 @@ class Scheduler(
         if rank not in recv_req.target_ranks:
             return None
 
-        try:
-            if recv_req.command == "pause":
-                self._ft_pending_pause = recv_req
-                return None
-            elif recv_req.command == "resume":
-                self._engine_paused = False
-                message = "resumed"
-            else:
-                raise ValueError(f"unknown fault tolerance command: {recv_req.command}")
+        if recv_req.command == "pause":
+            self._ft_pending_pause = recv_req
+            return None
+        elif recv_req.command == "resume":
+            self._engine_paused = False
             success = True
-        except Exception as exc:
-            success = False
-            message = str(exc)
+        else:
+            logger.warning("FT scheduler received unknown command: %s", recv_req.command)
+            return None
 
-        success, message = self._aggregate_ft_command_result(success, message)
+        success = self._aggregate_ft_command_result(success)
         if self.attn_tp_rank != 0 or self.attn_cp_rank != 0:
             return None
         return FaultToleranceCommandReqOutput(
             request_id=recv_req.request_id,
             rank=rank,
             success=success,
-            message=message,
+            message="",
         )
 
     def _update_ft_pause_from_mlp_sync(self, global_ft_actions) -> None:
@@ -3872,39 +3868,32 @@ class Scheduler(
         )
         self.send_to_tokenizer.send_output(output, pending)
 
-    def _aggregate_ft_command_result(
-        self, success: bool, message: str
-    ) -> Tuple[bool, str]:
-        member_result = {
-            "tp_rank": self.tp_rank,
-            "success": success,
-            "message": message,
-        }
-
+    def _aggregate_ft_command_result(self, success: bool) -> bool:
+        # Gather which members of this DP block participated, then report whoever
+        # is missing. No per-member message: failures surface only as absent ranks.
         if self.server_args.enable_dp_attention:
             if self.attn_cp_size != 1:
-                cp_results = self.attn_cp_group.all_gather_object(member_result)
+                cp_ranks = self.attn_cp_group.all_gather_object(self.attn_cp_rank)
             else:
-                cp_results = [member_result]
+                cp_ranks = [self.attn_cp_rank]
+            expected = self.attn_cp_size
+            gathered = cp_ranks
 
             if self.attn_tp_size != 1:
-                gathered_results = self.attn_tp_group.all_gather_object(cp_results)
-                member_results = [
-                    result for tp_results in gathered_results for result in tp_results
+                gathered = [
+                    rank
+                    for tp_ranks in self.attn_tp_group.all_gather_object(gathered)
+                    for rank in tp_ranks
                 ]
-            else:
-                member_results = cp_results
+                expected *= self.attn_tp_size
         elif self.tp_size != 1:
-            member_results = self.tp_group.all_gather_object(member_result)
+            gathered = self.tp_group.all_gather_object(self.tp_rank)
+            expected = self.tp_size
         else:
-            member_results = [member_result]
+            gathered = [self.tp_rank]
+            expected = 1
 
-        failures = [result for result in member_results if not result["success"]]
-        if not failures:
-            return True, message
-        return False, "; ".join(
-            f"tp_rank={result['tp_rank']}: {result['message']}" for result in failures
-        )
+        return success and len(gathered) == expected
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
