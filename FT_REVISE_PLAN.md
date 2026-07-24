@@ -131,7 +131,7 @@ FT 的 `request_id` 是**控制事务级** ID：manager 在 `_publish_active_ran
 
 ### 6.2 `_ft_rank()` 的 None 兜底不可达
 
-`scheduler.py:1566` `_ft_rank()` = `dp_rank if dp_rank is not None else 0`。FT gate 已含 `_dp_attention_gate` + `ft_requires_dp_gt1`，FT 启用时 `dp_rank` 恒非 None，`else 0` 分支不可达；且返回 0 会把非 DP 配置误标成 DP0，反误导。**OWNER 已批：删 `_ft_rank()`，三处调用（1555/3823/3873）直接用 `self.dp_rank`。** 状态：[~] 待改
+`scheduler.py:1566` `_ft_rank()` = `dp_rank if dp_rank is not None else 0`。FT gate 已含 `_dp_attention_gate` + `ft_requires_dp_gt1`，FT 启用时 `dp_rank` 恒非 None，`else 0` 分支不可达；且返回 0 会把非 DP 配置误标成 DP0，反误导。**OWNER 已批：删 `_ft_rank()`，三处调用（1555/3823/3873）直接用 `self.dp_rank`。** 已执行：方法删除 + 三处替换，`grep _ft_rank` 无残留，`py_compile` 通过。状态：[x]
 
 ### 6.3 FT 只支持 DP attention 的根因（设计前提澄清）
 

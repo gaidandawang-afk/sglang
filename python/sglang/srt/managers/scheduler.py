@@ -1552,7 +1552,7 @@ class Scheduler(
                 recovered = self._ft_discard_inflight_window(exc)
                 self.send_to_tokenizer.send_output(
                     FaultToleranceRankFaultOutput(
-                        rank=self._ft_rank(),
+                        rank=self.dp_rank,
                         message=str(exc),
                     )
                 )
@@ -1562,9 +1562,6 @@ class Scheduler(
                 ):
                     continue
                 self._engine_paused = True
-
-    def _ft_rank(self) -> int:
-        return self.dp_rank if self.dp_rank is not None else 0
 
     def _ft_discard_inflight_window(self, exc: Exception) -> bool:
         window_batches = [self.cur_batch, self.last_batch, self.running_batch]
@@ -3820,7 +3817,7 @@ class Scheduler(
     def handle_fault_tolerance_command(
         self, recv_req: FaultToleranceCommandReqInput
     ) -> Optional[FaultToleranceCommandReqOutput]:
-        rank = self._ft_rank()
+        rank = self.dp_rank
         if os.getenv("SGLANG_FT_DEBUG_STACK_SIGNAL") == "1":
             logger.info("FT scheduler command received: command=%s rank=%s targets=%s", recv_req.command, rank, recv_req.target_ranks)
         if rank not in recv_req.target_ranks:
@@ -3870,7 +3867,7 @@ class Scheduler(
             return
 
         self._ft_pending_pause = None
-        rank = self._ft_rank()
+        rank = self.dp_rank
         if os.getenv("SGLANG_FT_DEBUG_STACK_SIGNAL") == "1":
             logger.info("FT scheduler pause committed: rank=%s targets=%s", rank, pending.target_ranks)
         if self.attn_tp_rank != 0 or self.attn_cp_rank != 0:
