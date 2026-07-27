@@ -1708,6 +1708,12 @@ class ProcessActiveRanksOutput(BaseReq):
 
 
 @dataclass
+class WatchdogHeartbeatOutput(BaseReq):
+    node_rank: int
+    ranks: List[int]
+
+
+@dataclass
 class ActiveRanksUpdateReqOutput(BaseReq):
     request_id: str
     success: bool

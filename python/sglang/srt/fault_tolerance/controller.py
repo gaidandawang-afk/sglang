@@ -79,9 +79,6 @@ class _ApplyOp:
     def needs_resume(self) -> bool:
         return True
 
-    def isolated_ranks(self) -> Optional[List[int]]:
-        return None
-
 
 class _RetryOp(_ApplyOp):
     name = "retry"
@@ -116,9 +113,6 @@ class _ScaleDownOp(_ApplyOp):
 
     def apply_to_disabled(self, st):
         st.disabled_dp_ranks.update(self.ranks)
-
-    def isolated_ranks(self):
-        return list(self.ranks)
 
 
 class _RecoverOp(_ApplyOp):
@@ -284,9 +278,9 @@ class FaultToleranceState:
         return self._try_begin_pause()
 
     def finish_pause(self, paused_ranks: Iterable[int]) -> None:
-        self.paused_dp_ranks.update(
+        self.paused_dp_ranks = {
             rank for rank in paused_ranks if 0 <= rank < self.dp_size
-        )
+        }
         self.ft_operation_in_progress = False
 
     def validate_apply(
@@ -310,11 +304,12 @@ class FaultToleranceState:
     def commit_recover(
         self,
         resumed_ranks: Iterable[int],
-        isolated_ranks: Optional[Iterable[int]] = None,
+        *,
+        clear_paused: bool = False,
     ) -> Dict[str, Any]:
         committed_resumed_ranks = sorted(self.paused_dp_ranks & set(resumed_ranks))
-        self.paused_dp_ranks.difference_update(committed_resumed_ranks)
-        self.paused_dp_ranks.difference_update(isolated_ranks or [])
+        if clear_paused:
+            self.paused_dp_ranks.clear()
         self.ft_operation_in_progress = False
         body = self.status_response()
         body.update(

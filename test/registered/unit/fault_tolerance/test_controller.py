@@ -79,6 +79,16 @@ class TestFaultToleranceState(unittest.TestCase):
             ],
         )
 
+    def test_finish_pause_replaces_paused_ranks_with_valid_acks(self):
+        state = FaultToleranceState(dp_size=3, strategy="pause")
+        state.paused_dp_ranks = {0}
+        state.ft_operation_in_progress = True
+
+        state.finish_pause({-1, 1, 3})
+
+        self.assertEqual(state.paused_dp_ranks, {1})
+        self.assertFalse(state.ft_operation_in_progress)
+
     def test_no_effective_route_rejects_admission_for_continue_strategy(self):
         state = FaultToleranceState(dp_size=2, strategy="continue")
         state.process_active_ranks = [False, False]
@@ -158,8 +168,9 @@ class TestFaultToleranceState(unittest.TestCase):
         self.assertEqual(state.process_active_ranks, [True, True])
         self.assertEqual(state.mooncake_active_ranks, [True, True])
 
-        response = state.commit_recover({0, 1})
+        response = state.commit_recover({0, 1}, clear_paused=True)
         self.assertEqual(response["resumed_ranks"], [0, 1])
+        self.assertEqual(state.paused_dp_ranks, set())
         self.assertEqual(
             response["ranks"],
             [

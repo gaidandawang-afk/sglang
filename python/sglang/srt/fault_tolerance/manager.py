@@ -4,6 +4,7 @@ import asyncio
 import dataclasses
 import logging
 import os
+import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -20,11 +21,15 @@ from sglang.srt.managers.io_struct import (
     FaultToleranceCommandReqOutput,
     FaultToleranceRankFaultOutput,
     ProcessActiveRanksOutput,
+    WatchdogHeartbeatOutput,
 )
 from sglang.srt.utils import kill_process_tree
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+WATCHDOG_LEASE_SWEEP_INTERVAL_SEC = 1
+WATCHDOG_LEASE_TIMEOUT_SEC = 5
 
 
 @dataclasses.dataclass
@@ -54,6 +59,8 @@ class FaultToleranceManager:
         self.asyncio_tasks = None
         self._pending_commands: Dict[str, PendingFTCommand] = {}
         self._pending_active_rank_updates: Dict[str, asyncio.Future] = {}
+        self._watchdog_leases: Dict[int, Tuple[float, Tuple[int, ...]]] = {}
+        self._watchdog_lease_task: Optional[asyncio.Task] = None
 
     def bind_event_loop(self, loop) -> None:
         if self.event_loop is loop:
@@ -119,7 +126,9 @@ class FaultToleranceManager:
                 self.state.mark_effective_active_mask_published(pending_route)
         except Exception as exc:
             logger.exception("Fault tolerance apply failed: %s", exc)
-            response = self.state.commit_recover(resumed_ranks=set())
+            response = self.state.commit_recover(
+                resumed_ranks=set(), clear_paused=False
+            )
             response.update(
                 {
                     "success": False,
@@ -145,7 +154,7 @@ class FaultToleranceManager:
 
         response = self.state.commit_recover(
             resumed_ranks=acked,
-            isolated_ranks=op.isolated_ranks(),
+            clear_paused=op.needs_resume(),
         )
         logger.info("Fault tolerance apply committed: instruction=%s ranks=%s", instruction, ranks)
         return 200, response
@@ -184,6 +193,58 @@ class FaultToleranceManager:
             return None
         self.state.mark_effective_active_mask_published(active_mask)
         return ActiveRanksOutput(status=active_mask)
+
+    def observe_watchdog_heartbeat(self, heartbeat: WatchdogHeartbeatOutput) -> None:
+        now = time.monotonic()
+        existing = self._watchdog_leases.get(heartbeat.node_rank)
+        if existing is None:
+            dp_ranks = tuple(sorted(set(heartbeat.ranks)))
+        else:
+            dp_ranks = existing[1]
+        self._watchdog_leases[heartbeat.node_rank] = (now, dp_ranks)
+
+        if self._watchdog_lease_task is None or self._watchdog_lease_task.done():
+            self._watchdog_lease_task = self._create_task(
+                self._watchdog_lease_sweep_loop()
+            )
+
+    async def _watchdog_lease_sweep_loop(self) -> None:
+        try:
+            while self._watchdog_leases:
+                await asyncio.sleep(WATCHDOG_LEASE_SWEEP_INTERVAL_SEC)
+                await self._sweep_expired_watchdog_leases()
+        finally:
+            self._watchdog_lease_task = None
+
+    async def _sweep_expired_watchdog_leases(
+        self, now: Optional[float] = None
+    ) -> None:
+        now = time.monotonic() if now is None else now
+        expired_nodes = [
+            node_rank
+            for node_rank, (last_seen, _) in self._watchdog_leases.items()
+            if now - last_seen >= WATCHDOG_LEASE_TIMEOUT_SEC
+        ]
+        if not expired_nodes:
+            return
+
+        inactive_ranks = set()
+        for node_rank in expired_nodes:
+            _, dp_ranks = self._watchdog_leases.pop(node_rank)
+            inactive_ranks.update(dp_ranks)
+
+        logger.warning("FT watchdog lease expired: nodes=%s dp_ranks=%s", sorted(expired_nodes), sorted(inactive_ranks))
+        if not inactive_ranks:
+            return
+
+        active_ranks = self.observe_process_active_ranks(
+            ProcessActiveRanksOutput(
+                ranks=sorted(inactive_ranks),
+                active=False,
+            )
+        )
+        if active_ranks is not None:
+            await self.send_to_scheduler.send_pyobj(active_ranks)
 
     def handle_command_output(self, output: FaultToleranceCommandReqOutput) -> None:
         pending = self._pending_commands.get(output.request_id)

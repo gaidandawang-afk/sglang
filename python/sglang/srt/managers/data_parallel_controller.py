@@ -40,6 +40,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    WatchdogHeartbeatOutput,
     WatchLoadUpdateReq,
 )
 from sglang.srt.managers.schedule_batch import Req
@@ -71,7 +72,8 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 logger = logging.getLogger(__name__)
 
 SCHEDULER_PIDS_ARG = "scheduler_pids"
-FT_PROCESS_EXIT_GRACE_PERIOD = 2
+FT_WATCHDOG_POLL_INTERVAL = 1.0
+FT_WATCHDOG_SEND_TIMEOUT_MS = 1000
 
 
 class LoadBalanceMethod(Enum):
@@ -150,10 +152,7 @@ class DataParallelController:
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
         self.send_to_tokenizer = None
-        if (
-            server_args.enable_fault_tolerance
-            and (server_args.node_rank == 0 or server_args.elastic_ep_rejoin)
-        ):
+        if server_args.enable_fault_tolerance:
             self.send_to_tokenizer = get_zmq_socket(
                 self.context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
@@ -179,6 +178,8 @@ class DataParallelController:
         self.scheduler_process_dp_ranks: List[int] = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
         self.status: List[bool] = [True] * server_args.dp_size
+        self._watchdog_context = None
+        self._watchdog_sender = None
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
@@ -202,8 +203,13 @@ class DataParallelController:
                     for dp_rank in self.scheduler_process_dp_ranks
                 ],
                 on_exit=self._handle_scheduler_process_exit,
+                on_poll=self._report_watchdog_heartbeat,
+                on_thread_stop=self._close_watchdog_sender,
+                interval=FT_WATCHDOG_POLL_INTERVAL,
                 fail_stop_on_exit=False,
+                report_clean_exit=True,
             )
+            self._report_initial_watchdog_heartbeat()
             self._scheduler_watchdog.start()
             if server_args.elastic_ep_rejoin:
                 self._report_process_active_ranks(active=True)
@@ -240,15 +246,55 @@ class DataParallelController:
     def _handle_scheduler_process_exit(self, index, proc, name):
         dp_rank = self.scheduler_process_dp_ranks[index]
         logger.warning("Scheduler for DP rank %s exited (pid=%s); marking that DP rank inactive", dp_rank, proc.pid)
-        context = zmq.Context()
-        sender = get_zmq_socket(
-            context, zmq.PUSH, self.port_args.tokenizer_ipc_name, False
+        self._get_watchdog_sender().send_pyobj(
+            ProcessActiveRanksOutput(ranks=[dp_rank], active=False)
         )
-        sender.send_pyobj(ProcessActiveRanksOutput(ranks=[dp_rank], active=False))
-        # TODO：sleep 2 sec for unknown reason, to be debugged.
-        time.sleep(FT_PROCESS_EXIT_GRACE_PERIOD)
-        sender.close(linger=0)
-        context.term()
+
+    def _get_watchdog_sender(self):
+        if self._watchdog_sender is not None:
+            return self._watchdog_sender
+
+        context = zmq.Context()
+        self._watchdog_context = context
+        sender = context.socket(zmq.PUSH)
+        self._watchdog_sender = sender
+        sender.setsockopt(zmq.LINGER, 0)
+        sender.setsockopt(zmq.SNDHWM, 1)
+        sender.setsockopt(zmq.IMMEDIATE, 1)
+        sender.setsockopt(zmq.SNDTIMEO, FT_WATCHDOG_SEND_TIMEOUT_MS)
+        if "[" in self.port_args.tokenizer_ipc_name:
+            sender.setsockopt(zmq.IPV6, 1)
+        sender.connect(self.port_args.tokenizer_ipc_name)
+        return sender
+
+    def _watchdog_heartbeat(self):
+        return WatchdogHeartbeatOutput(
+            node_rank=self.server_args.node_rank,
+            ranks=sorted(set(self.scheduler_process_dp_ranks)),
+        )
+
+    def _report_initial_watchdog_heartbeat(self):
+        self.send_to_tokenizer.send_pyobj(self._watchdog_heartbeat())
+
+    def _report_watchdog_heartbeat(self):
+        try:
+            self._get_watchdog_sender().send_pyobj(
+                self._watchdog_heartbeat(), flags=zmq.NOBLOCK
+            )
+        except zmq.Again:
+            logger.debug("Dropping watchdog heartbeat because tokenizer is unavailable")
+
+    def _close_watchdog_sender(self):
+        sender = self._watchdog_sender
+        context = self._watchdog_context
+        self._watchdog_sender = None
+        self._watchdog_context = None
+        try:
+            if sender is not None:
+                sender.close(linger=0)
+        finally:
+            if context is not None:
+                context.term()
 
     def _report_process_active_ranks(self, *, active: bool) -> None:
         self.send_to_tokenizer.send_pyobj(

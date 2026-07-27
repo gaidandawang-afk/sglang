@@ -76,6 +76,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    WatchdogHeartbeatOutput,
     WatchLoadUpdateReq, BaseReq,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
@@ -540,6 +541,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         self.fault_tolerance.handle_rank_fault,
                     ),
                     (ProcessActiveRanksOutput, self.update_process_active_ranks),
+                    (
+                        WatchdogHeartbeatOutput,
+                        self.fault_tolerance.observe_watchdog_heartbeat,
+                    ),
                 ]
             )
         self._result_dispatcher = TypeBasedDispatcher(handlers)

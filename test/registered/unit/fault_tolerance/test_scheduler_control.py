@@ -28,6 +28,10 @@ class ProcessActiveRanksOutput(Struct):
     pass
 
 
+class WatchdogHeartbeatOutput(Struct):
+    pass
+
+
 class AbortReq(Struct):
     pass
 
@@ -99,36 +103,58 @@ class GatherGroup:
 class Sender:
     def __init__(self):
         self.sent = []
+        self.send_flags = []
+        self.socket_options = []
+        self.connected_endpoint = None
+        self.fail_all_sends = False
+        self.fail_nonblocking_sends = False
         self.closed = False
 
-    def send_pyobj(self, value):
+    def send_pyobj(self, value, flags=0):
+        if self.fail_all_sends:
+            raise RuntimeError("send failed")
+        if flags and self.fail_nonblocking_sends:
+            raise FakeAgain()
         self.sent.append(value)
+        self.send_flags.append(flags)
 
     def send_output(self, value, *args):
         self.sent.append((value, *args))
+
+    def setsockopt(self, option, value):
+        self.socket_options.append((option, value))
+
+    def connect(self, endpoint):
+        self.connected_endpoint = endpoint
 
     def close(self, linger=None):
         self.closed = True
 
 
+class FakeAgain(Exception):
+    pass
+
+
 class FakeContext:
     def __init__(self):
         self.terminated = False
+        self.socket_types = []
+
+    def socket(self, socket_type):
+        self.socket_types.append(socket_type)
+        return DPC_RUNTIME.sender
 
     def term(self):
         self.terminated = True
 
 
-DPC_RUNTIME = SimpleNamespace(sender=None, context=None, sleeps=[])
+DPC_RUNTIME = SimpleNamespace(sender=None, context=None, context_count=0)
 
 
 def make_context():
     DPC_RUNTIME.context = FakeContext()
+    DPC_RUNTIME.context_count += 1
     return DPC_RUNTIME.context
-
-
-def get_zmq_socket(context, socket_type, endpoint, bind):
-    return DPC_RUNTIME.sender
 
 
 class TestSchedulerFaultToleranceControl(unittest.TestCase):
@@ -141,7 +167,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 "handle_fault_tolerance_command",
                 "_update_ft_pause_from_mlp_sync",
                 "_complete_ft_pause",
-                "_aggregate_ft_command_result",
                 "_ft_discard_inflight_window",
                 "_process_next_overlap_result",
             },
@@ -163,9 +188,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         cls.handle_command = staticmethod(
             scheduler_methods["handle_fault_tolerance_command"]
         )
-        cls.aggregate_result = staticmethod(
-            scheduler_methods["_aggregate_ft_command_result"]
-        )
         cls.update_pause_from_mlp_sync = staticmethod(
             scheduler_methods["_update_ft_pause_from_mlp_sync"]
         )
@@ -182,24 +204,51 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             "DataParallelController",
             {
                 "send_fault_tolerance_command",
+                "_get_watchdog_sender",
                 "_handle_scheduler_process_exit",
+                "_watchdog_heartbeat",
+                "_report_initial_watchdog_heartbeat",
+                "_report_watchdog_heartbeat",
+                "_close_watchdog_sender",
                 "_report_process_active_ranks",
             },
             {
                 "FaultToleranceCommandReqInput": FaultToleranceCommandReqInput,
                 "ProcessActiveRanksOutput": ProcessActiveRanksOutput,
-                "FT_PROCESS_EXIT_GRACE_PERIOD": 2,
+                "WatchdogHeartbeatOutput": WatchdogHeartbeatOutput,
+                "FT_WATCHDOG_SEND_TIMEOUT_MS": 1000,
                 "logger": logging.getLogger(__name__),
-                "zmq": SimpleNamespace(Context=make_context, PUSH=object()),
-                "get_zmq_socket": get_zmq_socket,
-                "time": SimpleNamespace(
-                    sleep=lambda seconds: DPC_RUNTIME.sleeps.append(seconds)
+                "zmq": SimpleNamespace(
+                    Context=make_context,
+                    PUSH="push",
+                    LINGER="linger",
+                    SNDHWM="sndhwm",
+                    IMMEDIATE="immediate",
+                    SNDTIMEO="sndtimeo",
+                    IPV6="ipv6",
+                    NOBLOCK=1,
+                    Again=FakeAgain,
                 ),
             },
         )
         cls.send_dpc_command = staticmethod(dpc_methods["send_fault_tolerance_command"])
+        cls.get_watchdog_sender = staticmethod(
+            dpc_methods["_get_watchdog_sender"]
+        )
         cls.handle_process_exit = staticmethod(
             dpc_methods["_handle_scheduler_process_exit"]
+        )
+        cls.watchdog_heartbeat = staticmethod(
+            dpc_methods["_watchdog_heartbeat"]
+        )
+        cls.report_initial_watchdog_heartbeat = staticmethod(
+            dpc_methods["_report_initial_watchdog_heartbeat"]
+        )
+        cls.report_watchdog_heartbeat = staticmethod(
+            dpc_methods["_report_watchdog_heartbeat"]
+        )
+        cls.close_watchdog_sender = staticmethod(
+            dpc_methods["_close_watchdog_sender"]
         )
         cls.report_process_active = staticmethod(
             dpc_methods["_report_process_active_ranks"]
@@ -208,13 +257,31 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
     def setUp(self):
         DPC_RUNTIME.sender = Sender()
         DPC_RUNTIME.context = None
-        DPC_RUNTIME.sleeps = []
+        DPC_RUNTIME.context_count = 0
+
+    def make_watchdog_dpc(
+        self,
+        scheduler_process_dp_ranks,
+        tokenizer_ipc_name="tcp://node0:1",
+    ):
+        dpc = SimpleNamespace(
+            scheduler_process_dp_ranks=scheduler_process_dp_ranks,
+            server_args=SimpleNamespace(node_rank=3),
+            port_args=SimpleNamespace(tokenizer_ipc_name=tokenizer_ipc_name),
+            send_to_tokenizer=Sender(),
+            _watchdog_context=None,
+            _watchdog_sender=None,
+        )
+        dpc._get_watchdog_sender = lambda: self.get_watchdog_sender(dpc)
+        dpc._watchdog_heartbeat = lambda: self.watchdog_heartbeat(dpc)
+        return dpc
 
     def make_scheduler(self, *, attn_tp_rank=0, remote_failure=False):
         events = []
         scheduler = SimpleNamespace(
             tp_rank=0,
             tp_size=4,
+            dp_rank=1,
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=2,
             attn_cp_rank=0,
@@ -237,9 +304,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         scheduler.attn_cp_group = GatherGroup("attn_cp", events, [cp_remote])
         scheduler.attn_tp_group = GatherGroup("attn_tp", events, [tp_remote])
         scheduler.tp_group = None
-        scheduler._aggregate_ft_command_result = lambda success, message: (
-            self.aggregate_result(scheduler, success, message)
-        )
         return scheduler, events
 
     def test_pause_waits_for_all_target_dp_ranks_before_ack(self):
@@ -286,7 +350,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertIsNone(self.handle_command(scheduler, request))
         self.assertFalse(scheduler._engine_paused)
 
-    def test_remote_resume_failure_is_returned_by_leader(self):
+    def test_leader_returns_local_resume_ack(self):
         scheduler, _ = self.make_scheduler(remote_failure=True)
         request = FaultToleranceCommandReqInput(
             request_id="request",
@@ -296,8 +360,8 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         output = self.handle_command(scheduler, request)
 
-        self.assertFalse(output.success)
-        self.assertIn("tp_rank=1: boom", output.message)
+        self.assertTrue(output.success)
+        self.assertEqual(output.message, "resumed")
 
     def test_exception_discards_the_overlap_window_once_per_request(self):
         shared = FakeReq("shared")
@@ -393,32 +457,165 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertEqual(workers[0].sent, [])
         self.assertEqual(workers[1].sent, [request])
 
-    def test_local_process_exit_reports_only_affected_dp_rank_then_waits(self):
-        dpc = SimpleNamespace(
-            scheduler_process_infos=[
-                SimpleNamespace(global_rank=8, dp_rank=2),
-                SimpleNamespace(global_rank=9, dp_rank=2),
-            ],
-            local_dp_ranks=[2, 3],
-            port_args=SimpleNamespace(tokenizer_ipc_name="tcp://node0:1"),
-        )
+    def test_watchdog_heartbeat_and_process_exit_share_persistent_sender(self):
+        dpc = self.make_watchdog_dpc([2, 2, 3])
         process = SimpleNamespace(pid=123)
 
         self.assertIsNone(self.handle_process_exit(dpc, 0, process, "scheduler"))
+        self.assertIsNone(self.report_watchdog_heartbeat(dpc))
 
-        self.assertEqual(len(DPC_RUNTIME.sender.sent), 1)
-        output = DPC_RUNTIME.sender.sent[0]
-        self.assertEqual(output.ranks, [2])
-        self.assertFalse(output.active)
-        self.assertEqual(DPC_RUNTIME.sleeps, [2])
+        self.assertEqual(DPC_RUNTIME.context_count, 1)
+        self.assertIs(dpc._watchdog_sender, DPC_RUNTIME.sender)
+        self.assertIs(dpc._watchdog_context, DPC_RUNTIME.context)
+        self.assertEqual(len(DPC_RUNTIME.sender.sent), 2)
+
+        process_down, heartbeat = DPC_RUNTIME.sender.sent
+        self.assertIsInstance(process_down, ProcessActiveRanksOutput)
+        self.assertEqual(process_down.ranks, [2])
+        self.assertFalse(process_down.active)
+        self.assertIsInstance(heartbeat, WatchdogHeartbeatOutput)
+        self.assertEqual(heartbeat.node_rank, 3)
+        self.assertEqual(heartbeat.ranks, [2, 3])
+        self.assertEqual(DPC_RUNTIME.sender.send_flags, [0, 1])
+        self.assertEqual(
+            DPC_RUNTIME.sender.socket_options,
+            [
+                ("linger", 0),
+                ("sndhwm", 1),
+                ("immediate", 1),
+                ("sndtimeo", 1000),
+            ],
+        )
+        self.assertEqual(
+            DPC_RUNTIME.sender.connected_endpoint,
+            "tcp://node0:1",
+        )
+        self.assertFalse(DPC_RUNTIME.sender.closed)
+        self.assertFalse(DPC_RUNTIME.context.terminated)
+
+        self.close_watchdog_sender(dpc)
+
         self.assertTrue(DPC_RUNTIME.sender.closed)
         self.assertTrue(DPC_RUNTIME.context.terminated)
+        self.assertIsNone(dpc._watchdog_sender)
+        self.assertIsNone(dpc._watchdog_context)
+
+    def test_initial_watchdog_heartbeat_uses_main_thread_sender(self):
+        dpc = self.make_watchdog_dpc([2, 2, 3])
+
+        self.assertIsNone(self.report_initial_watchdog_heartbeat(dpc))
+
+        self.assertEqual(len(dpc.send_to_tokenizer.sent), 1)
+        heartbeat = dpc.send_to_tokenizer.sent[0]
+        self.assertIsInstance(heartbeat, WatchdogHeartbeatOutput)
+        self.assertEqual(heartbeat.node_rank, 3)
+        self.assertEqual(heartbeat.ranks, [2, 3])
+        self.assertEqual(DPC_RUNTIME.context_count, 0)
+
+    def test_dpc_registers_lease_before_starting_watchdog(self):
+        path = (
+            REPO_ROOT
+            / "python"
+            / "sglang"
+            / "srt"
+            / "managers"
+            / "data_parallel_controller.py"
+        )
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        dpc_class = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "DataParallelController"
+        )
+        init = next(
+            node
+            for node in dpc_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+        )
+        calls = sorted(
+            (
+                node.lineno,
+                node.func.attr,
+            )
+            for node in ast.walk(init)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        )
+
+        initial_heartbeat_line = next(
+            line
+            for line, name in calls
+            if name == "_report_initial_watchdog_heartbeat"
+        )
+        watchdog_start_line = next(
+            line
+            for line, name in calls
+            if name == "start"
+            and line > initial_heartbeat_line
+        )
+        self.assertLess(initial_heartbeat_line, watchdog_start_line)
+
+        watchdog_constructor = next(
+            node
+            for node in ast.walk(init)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "SubprocessWatchdog"
+        )
+        keywords = {
+            keyword.arg: keyword.value
+            for keyword in watchdog_constructor.keywords
+        }
+        self.assertTrue(ast.literal_eval(keywords["report_clean_exit"]))
+
+    def test_watchdog_heartbeat_drops_nonblocking_send_failure(self):
+        dpc = self.make_watchdog_dpc([1])
+        DPC_RUNTIME.sender.fail_nonblocking_sends = True
+
+        self.assertIsNone(self.report_watchdog_heartbeat(dpc))
+
+        self.assertEqual(DPC_RUNTIME.sender.sent, [])
+        self.assertFalse(DPC_RUNTIME.sender.closed)
+
+    def test_watchdog_heartbeat_unexpected_failure_stops_watchdog(self):
+        dpc = self.make_watchdog_dpc([1])
+        DPC_RUNTIME.sender.fail_all_sends = True
+
+        with self.assertRaisesRegex(RuntimeError, "send failed"):
+            self.report_watchdog_heartbeat(dpc)
+
+    def test_process_exit_send_failure_stops_watchdog_heartbeat(self):
+        dpc = self.make_watchdog_dpc([1])
+        DPC_RUNTIME.sender.fail_all_sends = True
+
+        with self.assertRaisesRegex(RuntimeError, "send failed"):
+            self.handle_process_exit(
+                dpc,
+                0,
+                SimpleNamespace(pid=123),
+                "scheduler",
+            )
+
+    def test_watchdog_sender_enables_ipv6_before_connect(self):
+        dpc = self.make_watchdog_dpc(
+            [1],
+            tokenizer_ipc_name="tcp://[::1]:2000",
+        )
+
+        self.get_watchdog_sender(dpc)
+
+        self.assertIn(("ipv6", 1), DPC_RUNTIME.sender.socket_options)
+        self.assertEqual(
+            DPC_RUNTIME.sender.connected_endpoint,
+            "tcp://[::1]:2000",
+        )
 
     def test_rejoined_dpc_reports_all_local_dp_ranks_active(self):
         sender = Sender()
         dpc = SimpleNamespace(
-            local_dp_ranks=[2, 3],
-            _process_state_sender=sender,
+            scheduler_process_dp_ranks=[2, 2, 3],
+            send_to_tokenizer=sender,
         )
 
         self.report_process_active(dpc, active=True)

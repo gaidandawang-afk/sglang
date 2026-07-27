@@ -1,7 +1,8 @@
 import asyncio
 import unittest
+from contextlib import suppress
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from sglang.srt.fault_tolerance.manager import FaultToleranceManager
 from sglang.srt.managers.io_struct import (
@@ -9,6 +10,7 @@ from sglang.srt.managers.io_struct import (
     FaultToleranceCommandReqOutput,
     FaultToleranceRankFaultOutput,
     ProcessActiveRanksOutput,
+    WatchdogHeartbeatOutput,
 )
 
 
@@ -27,6 +29,15 @@ def make_manager(*, dp_size=2, strategy="pause"):
 
 
 class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
+    async def _stop_watchdog_lease_sweep(self, manager):
+        await asyncio.sleep(0)
+        task = manager._watchdog_lease_task
+        if task is None:
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
     async def test_process_and_native_masks_publish_only_effective_changes(self):
         manager = make_manager(strategy="continue")
 
@@ -291,6 +302,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
             manager._send_command_collect.await_args.kwargs["target_ranks"],
             [0],
         )
+        self.assertEqual(manager.state.paused_dp_ranks, set())
 
     async def test_scale_down_is_logical_isolation(self):
         manager = make_manager()
@@ -340,6 +352,164 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager._failstop.assert_called_once()
         self.assertTrue(manager.state.ft_operation_in_progress)
         self.assertEqual(manager.state.paused_dp_ranks, {0, 1})
+
+    async def test_scale_down_route_failure_preserves_paused_ranks(self):
+        manager = make_manager()
+        manager.state.begin_exception_pause()
+        manager.state.finish_pause({0, 1})
+        manager._publish_active_ranks = AsyncMock(side_effect=TimeoutError("route ack"))
+        manager._send_command_collect = AsyncMock()
+
+        status, response = await manager.apply(
+            {
+                "fault_tolerance_instruction": "scale_down",
+                "fault_tolerance_params": {"ranks": [1]},
+            }
+        )
+
+        self.assertEqual(status, 503)
+        self.assertFalse(response["success"])
+        self.assertEqual(manager.state.paused_dp_ranks, {0, 1})
+        manager._send_command_collect.assert_not_awaited()
+
+    async def test_watchdog_heartbeat_registers_and_refreshes_without_process_up(self):
+        manager = make_manager(strategy="continue")
+        manager.state.process_active_ranks[1] = False
+
+        try:
+            with patch(
+                "sglang.srt.fault_tolerance.manager.time.monotonic",
+                return_value=10.0,
+            ):
+                manager.observe_watchdog_heartbeat(
+                    WatchdogHeartbeatOutput(node_rank=3, ranks=[1])
+                )
+
+            self.assertEqual(manager._watchdog_leases, {3: (10.0, (1,))})
+            self.assertEqual(manager.state.process_active_ranks, [True, False])
+            self.assertEqual(manager.state.mooncake_active_ranks, [True, True])
+
+            with patch(
+                "sglang.srt.fault_tolerance.manager.time.monotonic",
+                return_value=12.0,
+            ):
+                manager.observe_watchdog_heartbeat(
+                    WatchdogHeartbeatOutput(node_rank=3, ranks=[0])
+                )
+
+            self.assertEqual(manager._watchdog_leases, {3: (12.0, (1,))})
+            self.assertEqual(manager.state.process_active_ranks, [True, False])
+            manager.send_to_scheduler.send_pyobj.assert_not_awaited()
+        finally:
+            await self._stop_watchdog_lease_sweep(manager)
+
+    async def test_watchdog_lease_timeout_and_late_reregistration_do_not_mark_up(self):
+        manager = make_manager(strategy="continue")
+
+        try:
+            with patch(
+                "sglang.srt.fault_tolerance.manager.time.monotonic",
+                return_value=10.0,
+            ):
+                manager.observe_watchdog_heartbeat(
+                    WatchdogHeartbeatOutput(node_rank=3, ranks=[1])
+                )
+
+            await manager._sweep_expired_watchdog_leases(now=14.99)
+            self.assertIn(3, manager._watchdog_leases)
+            manager.send_to_scheduler.send_pyobj.assert_not_awaited()
+
+            await manager._sweep_expired_watchdog_leases(now=15.0)
+            self.assertNotIn(3, manager._watchdog_leases)
+            self.assertEqual(manager.state.process_active_ranks, [True, False])
+            self.assertEqual(manager.state.mooncake_active_ranks, [True, True])
+            manager.send_to_scheduler.send_pyobj.assert_awaited_once()
+
+            await manager._sweep_expired_watchdog_leases(now=20.0)
+            manager.send_to_scheduler.send_pyobj.assert_awaited_once()
+
+            with patch(
+                "sglang.srt.fault_tolerance.manager.time.monotonic",
+                return_value=21.0,
+            ):
+                manager.observe_watchdog_heartbeat(
+                    WatchdogHeartbeatOutput(node_rank=3, ranks=[1])
+                )
+
+            self.assertEqual(manager._watchdog_leases, {3: (21.0, (1,))})
+            self.assertEqual(manager.state.process_active_ranks, [True, False])
+            manager.send_to_scheduler.send_pyobj.assert_awaited_once()
+        finally:
+            await self._stop_watchdog_lease_sweep(manager)
+
+    async def test_watchdog_sweep_unions_duplicate_ranks_into_one_down_update(self):
+        manager = make_manager(dp_size=4, strategy="continue")
+        observe_process_active_ranks = manager.observe_process_active_ranks
+        manager.observe_process_active_ranks = Mock(
+            wraps=observe_process_active_ranks
+        )
+
+        try:
+            with patch(
+                "sglang.srt.fault_tolerance.manager.time.monotonic",
+                return_value=10.0,
+            ):
+                manager.observe_watchdog_heartbeat(
+                    WatchdogHeartbeatOutput(node_rank=3, ranks=[1, 2])
+                )
+                manager.observe_watchdog_heartbeat(
+                    WatchdogHeartbeatOutput(node_rank=4, ranks=[2, 3])
+                )
+
+            await manager._sweep_expired_watchdog_leases(now=15.0)
+
+            manager.observe_process_active_ranks.assert_called_once()
+            process_down = manager.observe_process_active_ranks.call_args.args[0]
+            self.assertEqual(process_down.ranks, [1, 2, 3])
+            self.assertFalse(process_down.active)
+            self.assertEqual(
+                manager.state.process_active_ranks,
+                [True, False, False, False],
+            )
+            self.assertEqual(
+                manager.state.mooncake_active_ranks,
+                [True, True, True, True],
+            )
+            manager.send_to_scheduler.send_pyobj.assert_awaited_once()
+
+            await manager._sweep_expired_watchdog_leases(now=20.0)
+            manager.observe_process_active_ranks.assert_called_once()
+            manager.send_to_scheduler.send_pyobj.assert_awaited_once()
+        finally:
+            await self._stop_watchdog_lease_sweep(manager)
+
+    async def test_watchdog_lease_timeout_schedules_pause_for_runtime_ranks(self):
+        manager = make_manager(dp_size=3)
+        manager._pause_schedulers = AsyncMock()
+
+        try:
+            with patch(
+                "sglang.srt.fault_tolerance.manager.time.monotonic",
+                return_value=10.0,
+            ):
+                manager.observe_watchdog_heartbeat(
+                    WatchdogHeartbeatOutput(node_rank=3, ranks=[1])
+                )
+
+            await manager._sweep_expired_watchdog_leases(now=15.0)
+            await asyncio.sleep(0)
+
+            manager._pause_schedulers.assert_awaited_once_with([0, 2])
+            self.assertEqual(
+                manager.state.process_active_ranks,
+                [True, False, True],
+            )
+            self.assertEqual(
+                manager.state.mooncake_active_ranks,
+                [True, True, True],
+            )
+        finally:
+            await self._stop_watchdog_lease_sweep(manager)
 
     async def test_fatal_task_wrapper_reuses_failstop(self):
         manager = make_manager()
