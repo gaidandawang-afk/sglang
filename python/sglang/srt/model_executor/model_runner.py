@@ -1727,7 +1727,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 src=get_world_group().ranks[0],
             )
             logger.info(f"recover ranks {ranks_to_recover} done")
-
     def _get_healthy_expert_location_src_rank(
         self, invoked_in_elastic_ep_rejoin_path: bool
     ) -> int:
