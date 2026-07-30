@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
@@ -71,6 +72,44 @@ class ElasticEPState:
             self.active_ranks[: self.effective_ep_size] = 1
             self.snapshot_active_to_last()
             self.sync_active_to_cpu()
+
+    def maybe_inject_test_rank_fault(self) -> bool:
+        ranks_raw = os.environ.get("SGLANG_TEST_ELASTIC_EP_FAULT_RANKS", "")
+        if not ranks_raw or self.active_ranks is None:
+            return False
+        trigger_file = os.environ.get("SGLANG_TEST_ELASTIC_EP_FAULT_FILE", "")
+        if trigger_file and not os.path.exists(trigger_file):
+            return False
+        if getattr(self, "_test_rank_fault_injected", False):
+            return False
+
+        ranks = []
+        for item in ranks_raw.replace(",", " ").split():
+            try:
+                rank = int(item)
+            except ValueError:
+                continue
+            if 0 <= rank < self.active_ranks.numel():
+                ranks.append(rank)
+        if not ranks:
+            return False
+
+        self.active_ranks[ranks] = 0
+        self.sync_active_to_cpu()
+        setattr(self, "_test_rank_fault_injected", True)
+        done_file = os.environ.get("SGLANG_TEST_ELASTIC_EP_FAULT_DONE_FILE", "")
+        if done_file:
+            try:
+                with open(done_file, "a", encoding="utf-8") as f:
+                    f.write(f"pid={os.getpid()} ranks={ranks}\n")
+            except OSError:
+                pass
+        logger.warning(
+            "[ElasticEPTest] Injected inactive ranks %s; active_ranks=%s",
+            ranks,
+            self.active_ranks.detach().cpu().tolist(),
+        )
+        return True
 
 
 class ElasticEPStateManager:
