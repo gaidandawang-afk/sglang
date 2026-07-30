@@ -34,7 +34,7 @@ from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from http import HTTPStatus
-from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import fastapi
 import pybase64
@@ -49,6 +49,8 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.fault_tolerance.controller import ft_failure
+from sglang.srt.fault_tolerance.manager import FaultToleranceManager
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -56,6 +58,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    ActiveRanksUpdateReqOutput,
     BaseBatchReq,
     BaseReq,
     BatchEmbeddingOutput,
@@ -67,12 +70,15 @@ from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
+    FaultToleranceCommandReqOutput,
+    FaultToleranceRankFaultOutput,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    ProcessActiveRanksOutput,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
     SessionParams,
@@ -81,6 +87,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    WatchdogHeartbeatOutput,
     async_sock_recv,
     async_sock_send,
     sock_send,
@@ -310,6 +317,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Init running status
         self.init_running_status()
 
+        # Init fault tolerance state. Disabled FT keeps this as None.
+        self.init_fault_tolerance()
+
         # Init logging and dumping
         self.init_request_logging_and_dumping()
 
@@ -461,6 +471,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
 
+    def init_fault_tolerance(self):
+        self.fault_tolerance: Optional[FaultToleranceManager] = None
+        if not self.server_args.enable_fault_tolerance:
+            return
+        self.fault_tolerance = FaultToleranceManager(
+            server_args=self.server_args,
+            send_to_scheduler=self._async_dispatch_to_scheduler,
+        )
+
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
         # Request logging
@@ -605,23 +624,44 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
     def init_request_dispatcher(self):
-        self._result_dispatcher = TypeBasedDispatcher(
-            [
-                (AbortReq, self._handle_abort_req),
-                (OpenSessionReqOutput, self._handle_open_session_req_output),
-                (
-                    UpdateWeightFromDiskReqOutput,
-                    self._handle_update_weights_from_disk_req_output,
-                ),
-                (FreezeGCReq, lambda x: None),
-                # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
-                (HealthCheckOutput, lambda x: None),
-                # Same skip-detokenizer forwarding case as above.
-                (ConfigureLoggingReq, lambda x: None),
-                (ActiveRanksOutput, self.update_active_ranks),
-                (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
-            ]
-        )
+        handlers: list[tuple[type[BaseReq], Callable[[Any], Any]]] = [
+            (AbortReq, self._handle_abort_req),
+            (OpenSessionReqOutput, self._handle_open_session_req_output),
+            (
+                UpdateWeightFromDiskReqOutput,
+                self._handle_update_weights_from_disk_req_output,
+            ),
+            (FreezeGCReq, lambda x: None),
+            # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
+            (HealthCheckOutput, lambda x: None),
+            # Same skip-detokenizer forwarding case as above.
+            (ConfigureLoggingReq, lambda x: None),
+            (ActiveRanksOutput, self.update_active_ranks),
+            (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
+        ]
+        if self.fault_tolerance is not None:
+            handlers.extend(
+                [
+                    (
+                        ActiveRanksUpdateReqOutput,
+                        self.fault_tolerance.handle_active_ranks_update_output,
+                    ),
+                    (
+                        FaultToleranceCommandReqOutput,
+                        self.fault_tolerance.handle_command_output,
+                    ),
+                    (
+                        FaultToleranceRankFaultOutput,
+                        self.fault_tolerance.handle_rank_fault,
+                    ),
+                    (ProcessActiveRanksOutput, self.update_process_active_ranks),
+                    (
+                        WatchdogHeartbeatOutput,
+                        self.fault_tolerance.observe_watchdog_heartbeat,
+                    ),
+                ]
+            )
+        self._result_dispatcher = TypeBasedDispatcher(handlers)
         self.init_communicators(self.server_args)
 
         self.sampling_params_class = SamplingParams
@@ -648,6 +688,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
+            if self.fault_tolerance is not None:
+                self.fault_tolerance.validate_routed_rank(obj.routed_dp_rank)
+
+        if (
+            self.fault_tolerance is not None
+            and self.fault_tolerance.should_reject_admission()
+        ):
+            raise RuntimeError("fault_tolerance_paused")
 
         self._init_req_state(obj, request)
         try:
@@ -1754,6 +1802,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             await self._async_dispatch_to_scheduler(obj)
             self.is_pause_cond.notify_all()
 
+    def fault_tolerance_status(self):
+        if self.fault_tolerance is None:
+            return 503, ft_failure("fault_tolerance_disabled")
+        return self.fault_tolerance.status()
+
+    async def fault_tolerance_apply(self, obj: Dict[str, Any]):
+        if self.fault_tolerance is None:
+            return 503, ft_failure("fault_tolerance_disabled")
+        return await self.fault_tolerance.apply(obj)
+
     async def update_weights_from_disk(
         self,
         obj: UpdateWeightFromDiskReqInput,
@@ -1872,6 +1930,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )
         self.event_loop = loop
+        if self.fault_tolerance is not None:
+            self.fault_tolerance.bind_event_loop(loop)
 
         # We only add signal handler when the tokenizer manager is in the main thread
         # due to the CPython limitation.
@@ -2838,6 +2898,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state.event.set()
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
+        if self.fault_tolerance is not None:
+            ranks = self.fault_tolerance.observe_active_ranks(ranks)
+            if ranks is None:
+                return
         self._dispatch_to_scheduler(ranks)
 
     def forward_elastic_scale_update(self, msg: ElasticScaleUpdateReq):
@@ -2893,6 +2957,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_scale_phase = responses[0].scale_phase
         self.elastic_last_error = None
         return responses[0]
+
+    def update_process_active_ranks(self, ranks: ProcessActiveRanksOutput):
+        active_ranks = self.fault_tolerance.observe_process_active_ranks(ranks)
+        if active_ranks is not None:
+            self._dispatch_to_scheduler(active_ranks)
 
     def _handle_open_session_req_output(self, recv_obj):
         future = self.session_futures.get(recv_obj.session_id)
