@@ -268,6 +268,7 @@ from sglang.srt.utils import (
     is_hip,
     is_mps,
     kill_itself_when_parent_died,
+    notify_node_main_process_failure,
     require_mlp_sync,
     set_gpu_proc_affinity,
     set_random_seed,
@@ -1022,6 +1023,7 @@ class Scheduler(
         self.forward_sleep_time = None
         self._engine_paused = False
         self._ft_pending_pause: Optional[FaultToleranceCommandReqInput] = None
+        self._ft_pause_deadline: Optional[float] = None
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1661,6 +1663,7 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self._check_ft_pause_deadline()
             if self._engine_paused:
                 continue
 
@@ -1705,6 +1708,7 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self._check_ft_pause_deadline()
             if self._engine_paused:
                 continue
 
@@ -4493,6 +4497,7 @@ class Scheduler(
             return None
         if recv_req.command == "resume":
             self._engine_paused = False
+            self._ft_pause_deadline = None
         else:
             logger.warning(
                 "FT scheduler received unknown command: %s", recv_req.command
@@ -4524,6 +4529,11 @@ class Scheduler(
             return
 
         self._ft_pending_pause = None
+        if self._ft_pause_deadline is None:
+            self._ft_pause_deadline = (
+                time.monotonic()
+                + self.server_args.fault_tolerance_pause_timeout
+            )
         if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:
             return
         output = FaultToleranceCommandReqOutput(
@@ -4533,6 +4543,18 @@ class Scheduler(
             message="paused",
         )
         self.ipc_channels.send_to_tokenizer.send_output(output, pending)
+
+    def _check_ft_pause_deadline(self) -> None:
+        deadline = self._ft_pause_deadline
+        if deadline is None or time.monotonic() < deadline:
+            return
+        self._ft_pause_deadline = None
+        logger.error(
+            "Fault tolerance pause unattended: timeout_sec=%s dp_rank=%s",
+            self.server_args.fault_tolerance_pause_timeout,
+            self.ps.dp_rank,
+        )
+        notify_node_main_process_failure()
 
     def handle_scale_elastic_ep(
         self, recv_req: ScaleElasticEPReqInput

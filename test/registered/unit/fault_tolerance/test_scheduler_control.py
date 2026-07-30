@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional, Tuple
+from unittest.mock import Mock
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -89,6 +90,19 @@ def load_class_methods(path: Path, class_name: str, method_names, namespace):
     return {name: namespace[name] for name in method_names}
 
 
+def load_functions(path: Path, function_names, namespace):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in function_names
+    ]
+    module = ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[]))
+    exec(compile(module, str(path), "exec"), namespace)
+    return {name: namespace[name] for name in function_names}
+
+
 class GatherGroup:
     def __init__(self, label, events, extra_results=None):
         self.label = label
@@ -167,6 +181,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 "handle_fault_tolerance_command",
                 "_update_ft_pause_from_mlp_sync",
                 "_complete_ft_pause",
+                "_check_ft_pause_deadline",
                 "_ft_discard_inflight_window",
                 "_process_next_overlap_result",
             },
@@ -181,8 +196,10 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 "ScheduleBatch": FakeBatch,
                 "Tuple": Tuple,
                 "logger": logging.getLogger(__name__),
+                "notify_node_main_process_failure": Mock(),
                 "os": os,
                 "release_kv_cache": lambda *args, **kwargs: None,
+                "time": SimpleNamespace(monotonic=lambda: 100.0),
             },
         )
         cls.handle_command = staticmethod(
@@ -192,6 +209,9 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             scheduler_methods["_update_ft_pause_from_mlp_sync"]
         )
         cls.complete_pause = staticmethod(scheduler_methods["_complete_ft_pause"])
+        cls.check_pause_deadline = staticmethod(
+            scheduler_methods["_check_ft_pause_deadline"]
+        )
         cls.discard_inflight = staticmethod(
             scheduler_methods["_ft_discard_inflight_window"]
         )
@@ -257,10 +277,22 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             dpc_methods["_report_process_active_ranks"]
         )
 
+        common_functions = load_functions(
+            REPO_ROOT / "python/sglang/srt/utils/common.py",
+            {"notify_node_main_process_failure"},
+            {},
+        )
+        cls.notify_node_main_failure = staticmethod(
+            common_functions["notify_node_main_process_failure"]
+        )
+
     def setUp(self):
         DPC_RUNTIME.sender = Sender()
         DPC_RUNTIME.context = None
         DPC_RUNTIME.context_count = 0
+        self.check_pause_deadline.__globals__[
+            "notify_node_main_process_failure"
+        ].reset_mock()
 
     def make_watchdog_dpc(
         self,
@@ -292,9 +324,13 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 attn_tp_rank=attn_tp_rank,
                 attn_cp_rank=0,
             ),
-            server_args=SimpleNamespace(enable_dp_attention=True),
+            server_args=SimpleNamespace(
+                enable_dp_attention=True,
+                fault_tolerance_pause_timeout=30,
+            ),
             _engine_paused=False,
             _ft_pending_pause=None,
+            _ft_pause_deadline=None,
             _ft_rank=lambda: 1,
             send_to_tokenizer=sender,
             ipc_channels=SimpleNamespace(send_to_tokenizer=sender),
@@ -339,6 +375,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         self.complete_pause(scheduler)
         self.assertIsNone(scheduler._ft_pending_pause)
+        self.assertEqual(scheduler._ft_pause_deadline, 130.0)
         self.assertEqual(len(scheduler.send_to_tokenizer.sent), 1)
         ack, original_request = scheduler.send_to_tokenizer.sent[0]
         self.assertEqual(ack.request_id, "request")
@@ -356,6 +393,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         self.assertIsNone(self.handle_command(scheduler, request))
         self.assertFalse(scheduler._engine_paused)
+        self.assertIsNone(scheduler._ft_pause_deadline)
 
     def test_leader_returns_local_resume_ack(self):
         scheduler, _ = self.make_scheduler(remote_failure=True)
@@ -369,6 +407,53 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         self.assertTrue(output.success)
         self.assertEqual(output.message, "resumed")
+
+    def test_resume_clears_pause_deadline(self):
+        scheduler, _ = self.make_scheduler()
+        scheduler._engine_paused = True
+        scheduler._ft_pause_deadline = 130.0
+        request = FaultToleranceCommandReqInput(
+            request_id="request",
+            command="resume",
+            target_ranks=[1],
+        )
+
+        self.handle_command(scheduler, request)
+
+        self.assertFalse(scheduler._engine_paused)
+        self.assertIsNone(scheduler._ft_pause_deadline)
+
+    def test_pause_deadline_notifies_node_main_once(self):
+        scheduler, _ = self.make_scheduler()
+        scheduler._ft_pause_deadline = 101.0
+        notify = self.check_pause_deadline.__globals__[
+            "notify_node_main_process_failure"
+        ]
+
+        self.check_pause_deadline(scheduler)
+        notify.assert_not_called()
+
+        scheduler._ft_pause_deadline = 100.0
+        self.check_pause_deadline(scheduler)
+        self.check_pause_deadline(scheduler)
+
+        notify.assert_called_once_with()
+        self.assertIsNone(scheduler._ft_pause_deadline)
+
+    def test_notify_node_main_process_failure_signals_scheduler_grandparent(self):
+        signals = []
+        node_main = SimpleNamespace(send_signal=signals.append)
+        dpc = SimpleNamespace(parent=lambda: node_main)
+        scheduler = SimpleNamespace(parent=lambda: dpc)
+        notify = self.notify_node_main_failure
+        notify.__globals__.update(
+            psutil=SimpleNamespace(Process=lambda: scheduler),
+            signal=SimpleNamespace(SIGQUIT="SIGQUIT"),
+        )
+
+        notify()
+
+        self.assertEqual(signals, ["SIGQUIT"])
 
     def test_exception_discards_the_overlap_window_once_per_request(self):
         shared = FakeReq("shared")
