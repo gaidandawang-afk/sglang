@@ -19,6 +19,7 @@ def make_manager(*, dp_size=2, strategy="pause"):
         dp_size=dp_size,
         fault_tolerance_on_error_strategy=strategy,
         fault_tolerance_timeout=1,
+        fault_tolerance_pause_timeout=1,
     )
     manager = FaultToleranceManager(
         server_args=server_args,
@@ -37,6 +38,63 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+
+    async def test_unattended_pause_failstops(self):
+        manager = make_manager()
+        manager.server_args.fault_tolerance_pause_timeout = 0.01
+        manager._send_command_collect = AsyncMock(return_value={0, 1})
+        manager._failstop = Mock()
+
+        await manager._pause_schedulers([0, 1])
+        await asyncio.sleep(0.03)
+
+        manager._failstop.assert_called_once()
+        self.assertIn("pause unattended", manager._failstop.call_args.args[0])
+
+    async def test_valid_retry_cancels_paused_failstop(self):
+        manager = make_manager()
+        manager.state.finish_pause({0, 1})
+        manager._arm_paused_failstop()
+        handle = manager._paused_failstop_handle
+        manager._send_command_collect = AsyncMock(return_value={0, 1})
+
+        status, _ = await manager.apply(
+            {"fault_tolerance_instruction": "retry"}
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(handle.cancelled())
+        self.assertIsNone(manager._paused_failstop_handle)
+
+    async def test_failed_retry_rearms_paused_failstop(self):
+        manager = make_manager()
+        manager.state.finish_pause({0, 1})
+        manager.state.process_active_ranks[1] = False
+        manager._arm_paused_failstop()
+        original_handle = manager._paused_failstop_handle
+        manager._publish_active_ranks = AsyncMock(
+            side_effect=RuntimeError("route update failed")
+        )
+
+        status, _ = await manager.apply(
+            {"fault_tolerance_instruction": "retry"}
+        )
+
+        self.assertEqual(status, 503)
+        self.assertTrue(original_handle.cancelled())
+        self.assertIsNot(manager._paused_failstop_handle, original_handle)
+        manager._cancel_paused_failstop()
+
+    async def test_arming_paused_failstop_is_idempotent(self):
+        manager = make_manager()
+        manager.state.finish_pause({0, 1})
+
+        manager._arm_paused_failstop()
+        handle = manager._paused_failstop_handle
+        manager._arm_paused_failstop()
+
+        self.assertIs(manager._paused_failstop_handle, handle)
+        manager._cancel_paused_failstop()
 
     async def test_process_and_native_masks_publish_only_effective_changes(self):
         manager = make_manager(strategy="continue")

@@ -529,6 +529,7 @@ class ServerArgs:
     enable_fault_tolerance: bool = False
     fault_tolerance_on_error_strategy: Literal["pause", "continue"] = "pause"
     fault_tolerance_timeout: int = 60
+    fault_tolerance_pause_timeout: float = 300
 
     attn_cp_size: int = 1
     moe_dp_size: int = 1
@@ -6538,6 +6539,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.fault_tolerance_timeout,
             help="Timeout in seconds for fault tolerance control commands.",
+        )
+        parser.add_argument(
+            "--fault-tolerance-pause-timeout",
+            type=float,
+            default=ServerArgs.fault_tolerance_pause_timeout,
+            help="Fail-stop timeout in seconds for an unattended fault tolerance pause.",
         )
         parser.add_argument(
             "--enable-two-batch-overlap",

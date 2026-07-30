@@ -61,6 +61,7 @@ class FaultToleranceManager:
         self._pending_active_rank_updates: Dict[str, asyncio.Future] = {}
         self._watchdog_leases: Dict[int, Tuple[float, Tuple[int, ...]]] = {}
         self._watchdog_lease_task: Optional[asyncio.Task] = None
+        self._paused_failstop_handle: Optional[asyncio.TimerHandle] = None
 
     def bind_event_loop(self, loop) -> None:
         if self.event_loop is loop:
@@ -117,6 +118,8 @@ class FaultToleranceManager:
             return ft_error_status(error), ft_failure(error)
 
         op = build_apply_op(instruction, ranks)
+        if op.needs_resume():
+            self._cancel_paused_failstop()
         resume_targets = self.state.begin_recover(instruction, ranks)
         logger.info("Fault tolerance apply plan: instruction=%s resume_targets=%s ranks=%s", instruction, resume_targets, ranks)
         try:
@@ -135,6 +138,8 @@ class FaultToleranceManager:
                     "message": f"fault_tolerance_apply_failed: {exc}",
                 }
             )
+            if op.needs_resume():
+                self._arm_paused_failstop()
             return 503, response
 
         acked = set()
@@ -317,6 +322,39 @@ class FaultToleranceManager:
             timeout_sec=self.server_args.fault_tolerance_timeout,
         )
         self.state.finish_pause(acked)
+        self._arm_paused_failstop()
+
+    def _arm_paused_failstop(self) -> None:
+        if (
+            not self.state.has_paused_rank()
+            or self._paused_failstop_handle is not None
+        ):
+            return
+        timeout_sec = float(self.server_args.fault_tolerance_pause_timeout)
+        self._paused_failstop_handle = self.event_loop.call_later(
+            timeout_sec, self._failstop_if_still_paused, timeout_sec
+        )
+        logger.info(
+            "Fault tolerance paused fail-stop armed: timeout_sec=%s paused_ranks=%s",
+            timeout_sec,
+            sorted(self.state.paused_dp_ranks),
+        )
+
+    def _cancel_paused_failstop(self) -> None:
+        if self._paused_failstop_handle is None:
+            return
+        self._paused_failstop_handle.cancel()
+        self._paused_failstop_handle = None
+
+    def _failstop_if_still_paused(self, timeout_sec: float) -> None:
+        self._paused_failstop_handle = None
+        if not self.state.has_paused_rank():
+            return
+        self._failstop(
+            "Fault tolerance pause unattended: "
+            f"timeout_sec={timeout_sec} "
+            f"paused_ranks={sorted(self.state.paused_dp_ranks)}"
+        )
 
     async def _publish_active_ranks(
         self, active_mask: List[bool], timeout_sec: int
