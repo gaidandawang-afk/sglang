@@ -9069,14 +9069,17 @@ class PortArgs:
             # (no availability-based search). If incrementing would
             # overflow the valid TCP range, decrement instead.
             NUM_DERIVED_PORTS = 5
+            if dist_init_port + NUM_DERIVED_PORTS > 65535:
+                primary_port_base = dist_init_port - NUM_DERIVED_PORTS - 1
+            else:
+                primary_port_base = dist_init_port + 1
+
             if server_args.is_ep_joiner:
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA
-            elif dist_init_port + NUM_DERIVED_PORTS > 65535:
-                port_base = dist_init_port - NUM_DERIVED_PORTS - 1
             else:
-                port_base = dist_init_port + 1
+                port_base = primary_port_base
 
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
@@ -9091,6 +9094,9 @@ class PortArgs:
 
             is_joiner = server_args.is_ep_joiner
             is_recovery_joiner = server_args.ep_join_mode == "recover"
+            tokenizer_port = (
+                primary_port_base if is_recovery_joiner else port_base
+            )
             # Under SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE, SGLang never binds
             # dist_init_port / nccl_port (rendezvous uses the externally-managed
             # store; see distributed/bootstrap.py:_resolve_dist_init_method), so
@@ -9124,7 +9130,9 @@ class PortArgs:
                 raise
 
             return PortArgs(
-                tokenizer_ipc_name=NetworkAddress(dist_init_host, port_base).to_tcp(),
+                tokenizer_ipc_name=NetworkAddress(
+                    dist_init_host, tokenizer_port
+                ).to_tcp(),
                 scheduler_input_ipc_name=NetworkAddress(
                     dist_init_host, scheduler_input_port
                 ).to_tcp(),
