@@ -101,7 +101,22 @@ class EPLBManager:
 
         logger.info("[EPLBManager] rebalance start")
 
-        enable_timing = self._rebalance_layers_per_chunk is None
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        elastic_ep_state = ElasticEPStateManager.instance()
+        recovering_from_rank_fault = (
+            elastic_ep_state is not None
+            and elastic_ep_state.active_ranks_cpu is not None
+            and not bool(elastic_ep_state.active_ranks_cpu.all().item())
+        )
+        enable_timing = (
+            self._rebalance_layers_per_chunk is None
+            and not recovering_from_rank_fault
+        )
+        if recovering_from_rank_fault:
+            logger.info(
+                "[EPLBManager] skip device-wide timing synchronization during rank-fault recovery"
+            )
 
         if enable_timing:
             torch.get_device_module().synchronize()

@@ -1028,6 +1028,26 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "auto"
+    enable_fault_tolerance: A[
+        bool,
+        "Enable the DP-only fault-tolerance control plane.",
+        NS("parallel"),
+    ] = False
+    fault_tolerance_on_error_strategy: A[
+        Literal["pause", "continue"],
+        "Fault-tolerance strategy for scheduler exceptions.",
+        NS("parallel"),
+    ] = "pause"
+    fault_tolerance_timeout: A[
+        int,
+        "Timeout in seconds for fault-tolerance control commands.",
+        NS("parallel"),
+    ] = 60
+    fault_tolerance_pause_timeout: A[
+        float,
+        "Fail-stop timeout in seconds for an unattended fault-tolerance pause.",
+        NS("parallel"),
+    ] = 300
     attn_cp_size: A[
         int,
         Arg(
@@ -3535,6 +3555,9 @@ class ServerArgs:
         self._handle_elastic_ep()
         self._validate_experimental_sgl_marlin()
 
+        # Validate FT only after MoE and Elastic EP settings have settled.
+        self._handle_fault_tolerance()
+
         # Handle pipeline parallelism.
         self._handle_pipeline_parallelism()
 
@@ -3771,6 +3794,16 @@ class ServerArgs:
                 else "round_robin"
             )
             return
+
+    def _handle_fault_tolerance(self):
+        if not self.enable_fault_tolerance:
+            return
+
+        from sglang.srt.fault_tolerance.controller import is_ft_supported_config
+
+        supported, reason = is_ft_supported_config(self)
+        if not supported:
+            raise ValueError(f"Fault tolerance v5 unsupported config: {reason}")
 
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""
@@ -9057,6 +9090,7 @@ class PortArgs:
                 scheduler_input_port = worker_ports[dp_rank]
 
             is_joiner = server_args.is_ep_joiner
+            is_recovery_joiner = server_args.ep_join_mode == "recover"
             # Under SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE, SGLang never binds
             # dist_init_port / nccl_port (rendezvous uses the externally-managed
             # store; see distributed/bootstrap.py:_resolve_dist_init_method), so
@@ -9068,9 +9102,10 @@ class PortArgs:
                 if dp_rank is None:
                     if not (is_joiner or dist_init_overridden):
                         wait_port_available(dist_init_port, "dist_init_port")
-                    wait_port_available(port_base, "port_base")
-                    wait_port_available(detokenizer_port, "detokenizer_port")
-                    if not dist_init_overridden:
+                    if not is_recovery_joiner:
+                        wait_port_available(port_base, "port_base")
+                        wait_port_available(detokenizer_port, "detokenizer_port")
+                    if not (is_recovery_joiner or dist_init_overridden):
                         wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_port, "metrics_port")
@@ -9078,7 +9113,9 @@ class PortArgs:
                         wait_port_available(load_collector_port, "load_collector_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
-                if dp_rank is None or worker_ports is None:
+                if not is_recovery_joiner and (
+                    dp_rank is None or worker_ports is None
+                ):
                     wait_port_available(scheduler_input_port, "scheduler_input_port")
             except ValueError:
                 logger.exception(
