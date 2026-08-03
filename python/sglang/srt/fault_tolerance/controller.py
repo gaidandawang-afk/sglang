@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from enum import Enum
-from http import HTTPStatus
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
@@ -14,12 +13,6 @@ class RankState(str, Enum):
 
 def ft_failure(message: str) -> Dict[str, Any]:
     return {"success": False, "message": message}
-
-
-def ft_error_status(error: str) -> int:
-    if error == "ft_operation_in_progress":
-        return HTTPStatus.CONFLICT
-    return HTTPStatus.BAD_REQUEST
 
 
 def _dp_attention_gate(server_args) -> bool:
@@ -66,98 +59,6 @@ def is_ft_supported_config(server_args) -> Tuple[bool, str]:
         if not supported(server_args):
             return False, error
     return True, ""
-
-
-class _ApplyOp:
-    """一次 /fault_tolerance/apply 指令：封装校验与状态变更语义。"""
-
-    name = ""
-
-    def __init__(self, ranks: Optional[List[int]] = None):
-        self.ranks = ranks
-
-    def validate(self, st: "FaultToleranceState") -> Optional[str]:
-        raise NotImplementedError
-
-    def apply_to_disabled(self, st: "FaultToleranceState") -> None:
-        """apply 成功时对 disabled 集合的副作用。默认不动。"""
-
-    def resume_targets(self, st: "FaultToleranceState") -> List[int]:
-        return st.resume_targets()
-
-    def needs_resume(self) -> bool:
-        return True
-
-
-class _RetryOp(_ApplyOp):
-    name = "retry"
-
-    def validate(self, st):
-        if not st.has_paused_rank():
-            return "no_paused_rank"
-        if self.ranks is not None:
-            return "retry_does_not_accept_ranks"
-        return None
-
-
-class _ScaleDownOp(_ApplyOp):
-    name = "scale_down"
-
-    def validate(self, st):
-        if not st.has_paused_rank():
-            return "no_paused_rank"
-        if not self.ranks:
-            return "scale_down_requires_non_empty_ranks"
-        requested = set(self.ranks)
-        if any(rank < 0 or rank >= st.dp_size for rank in requested):
-            return "unknown_rank"
-        disabled = st.disabled_dp_ranks | requested
-        runtime_active = st.runtime_active_mask()
-        if not any(
-            is_active and rank not in disabled
-            for rank, is_active in enumerate(runtime_active)
-        ):
-            return "cannot_isolate_all_active_ranks"
-        return None
-
-    def apply_to_disabled(self, st):
-        st.disabled_dp_ranks.update(self.ranks)
-
-
-class _RecoverOp(_ApplyOp):
-    name = "recover"
-
-    def validate(self, st):
-        # recover 不查 has_paused_rank：它拉回 disabled rank，不要求有 paused。
-        if not self.ranks:
-            return "recover_requires_non_empty_ranks"
-        requested = set(self.ranks)
-        if any(rank < 0 or rank >= st.dp_size for rank in requested):
-            return "unknown_rank"
-        if not requested.issubset(st.disabled_dp_ranks):
-            return "recover_requires_disabled_ranks"
-        return None
-
-    def apply_to_disabled(self, st):
-        st.disabled_dp_ranks.difference_update(self.ranks)
-
-    def resume_targets(self, st):
-        return []
-
-    def needs_resume(self) -> bool:
-        return False
-
-
-_APPLY_OPS = {
-    op.name: op for op in (_RetryOp, _ScaleDownOp, _RecoverOp)
-}
-
-
-def build_apply_op(
-    instruction: str, ranks: Optional[List[int]] = None
-) -> Optional[_ApplyOp]:
-    cls = _APPLY_OPS.get(instruction)
-    return None if cls is None else cls(ranks)
 
 
 class FaultToleranceState:
@@ -291,24 +192,6 @@ class FaultToleranceState:
             rank for rank in paused_ranks if 0 <= rank < self.dp_size
         }
         self.ft_operation_in_progress = False
-
-    def validate_apply(
-        self, instruction: str, ranks: Optional[List[int]]
-    ) -> Optional[str]:
-        if self.ft_operation_in_progress:
-            return "ft_operation_in_progress"
-        op = build_apply_op(instruction, ranks)
-        if op is None:
-            return "unknown_instruction"
-        return op.validate(self)
-
-    def begin_recover(
-        self, instruction: str, ranks: Optional[List[int]] = None
-    ) -> List[int]:
-        self.ft_operation_in_progress = True
-        op = build_apply_op(instruction, ranks)
-        op.apply_to_disabled(self)
-        return op.resume_targets(self)
 
     def commit_recover(
         self,

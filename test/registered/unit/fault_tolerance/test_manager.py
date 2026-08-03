@@ -59,7 +59,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager._send_command_collect = AsyncMock(return_value={0, 1})
 
         status, _ = await manager.apply(
-            {"fault_tolerance_instruction": "retry"}
+            {"instruction": "retry", "params": {}}
         )
 
         self.assertEqual(status, 200)
@@ -77,7 +77,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         )
 
         status, _ = await manager.apply(
-            {"fault_tolerance_instruction": "retry"}
+            {"instruction": "retry", "params": {}}
         )
 
         self.assertEqual(status, 503)
@@ -191,8 +191,8 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
 
         status, response = await manager.apply(
             {
-                "fault_tolerance_instruction": "recover",
-                "fault_tolerance_params": {"ranks": [1]},
+                "instruction": "recover",
+                "params": {"ranks": [1]},
             }
         )
 
@@ -213,8 +213,8 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
 
         status, response = await manager.apply(
             {
-                "fault_tolerance_instruction": "recover",
-                "fault_tolerance_params": {"ranks": [1]},
+                "instruction": "recover",
+                "params": {"ranks": [1]},
             }
         )
 
@@ -240,8 +240,8 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
 
         status, response = await manager.apply(
             {
-                "fault_tolerance_instruction": "recover",
-                "fault_tolerance_params": {"ranks": [1]},
+                "instruction": "recover",
+                "params": {"ranks": [1]},
             }
         )
 
@@ -257,39 +257,50 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
 
         status, response = await manager.apply(
             {
-                "fault_tolerance_instruction": "recover",
-                "fault_tolerance_params": {"ranks": [1]},
+                "instruction": "recover",
+                "params": {"ranks": [1]},
             }
         )
 
         self.assertEqual(status, 409)
         self.assertEqual(response["message"], "ft_operation_in_progress")
 
-    async def test_recover_validation_rejects_invalid_rank_requests(self):
+    async def test_apply_rejects_invalid_params(self):
         manager = make_manager()
         cases = [
-            ({}, "recover_requires_non_empty_ranks"),
             (
-                {"fault_tolerance_params": {"ranks": []}},
-                "recover_requires_non_empty_ranks",
+                {"instruction": "unknown"},
+                "invalid params: unsupported instruction: unknown",
             ),
             (
-                {"fault_tolerance_params": {"ranks": "1"}},
-                "recover_requires_non_empty_ranks",
+                {"instruction": "retry", "params": {"timeout": 0}},
+                "invalid params: timeout must be positive",
             ),
-            ({"fault_tolerance_params": {"ranks": [2]}}, "unknown_rank"),
             (
-                {"fault_tolerance_params": {"ranks": [1]}},
-                "recover_requires_disabled_ranks",
+                {"instruction": "recover", "params": {"ranks": [2]}},
+                "invalid params: rank out of range",
+            ),
+            (
+                {"instruction": "retry"},
+                "invalid params: 'params'",
             ),
         ]
 
-        for extra, expected_message in cases:
-            with self.subTest(expected_message=expected_message, extra=extra):
-                request = {"fault_tolerance_instruction": "recover", **extra}
+        for request, expected_message in cases:
+            with self.subTest(expected_message=expected_message, request=request):
                 status, response = await manager.apply(request)
                 self.assertEqual(status, 400)
                 self.assertEqual(response["message"], expected_message)
+
+    async def test_recover_requires_disabled_ranks(self):
+        manager = make_manager()
+
+        status, response = await manager.apply(
+            {"instruction": "recover", "params": {"ranks": [1]}}
+        )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(response["message"], "recover_requires_disabled_ranks")
 
     async def test_recover_route_failure_does_not_restore_disabled_state(self):
         manager = make_manager(strategy="continue")
@@ -300,8 +311,8 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
 
         status, response = await manager.apply(
             {
-                "fault_tolerance_instruction": "recover",
-                "fault_tolerance_params": {"ranks": [1]},
+                "instruction": "recover",
+                "params": {"ranks": [1]},
             }
         )
 
@@ -345,7 +356,9 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager._publish_active_ranks = AsyncMock()
         manager._send_command_collect = AsyncMock(return_value={0})
 
-        status, response = await manager.apply({"fault_tolerance_instruction": "retry"})
+        status, response = await manager.apply(
+            {"instruction": "retry", "params": {}}
+        )
 
         self.assertEqual(status, 200)
         self.assertEqual(response["resumed_ranks"], [0])
@@ -371,8 +384,8 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
 
         status, response = await manager.apply(
             {
-                "fault_tolerance_instruction": "scale_down",
-                "fault_tolerance_params": {"ranks": [1]},
+                "instruction": "scale_down",
+                "params": {"timeout": 120, "ranks": [1]},
             }
         )
 
@@ -382,8 +395,9 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager._send_command_collect.assert_awaited_once_with(
             command="resume",
             target_ranks=[0, 1],
-            timeout_sec=1,
+            timeout_sec=120,
         )
+        manager._publish_active_ranks.assert_awaited_once_with([True, False], 120)
         self.assertEqual(manager.state.disabled_dp_ranks, {1})
         self.assertEqual(manager.state.process_active_ranks, [True, True])
         self.assertEqual(
@@ -393,6 +407,22 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
                 {"rank": 1, "state": "disabled"},
             ],
         )
+
+    async def test_scale_down_cannot_remove_last_effective_route(self):
+        manager = make_manager()
+        manager.state.process_active_ranks = [True, False]
+        manager.state.paused_dp_ranks = {0}
+
+        status, response = await manager.apply(
+            {
+                "instruction": "scale_down",
+                "params": {"ranks": [0]},
+            }
+        )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(response["message"], "cannot_isolate_all_active_ranks")
+        self.assertFalse(manager.state.ft_operation_in_progress)
 
     async def test_resume_timeout_enters_failstop_without_partial_commit(self):
         manager = make_manager()
@@ -405,7 +435,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager._failstop = Mock(side_effect=RuntimeError("failstop"))
 
         with self.assertRaisesRegex(RuntimeError, "failstop"):
-            await manager.apply({"fault_tolerance_instruction": "retry"})
+            await manager.apply({"instruction": "retry", "params": {}})
 
         manager._failstop.assert_called_once()
         self.assertTrue(manager.state.ft_operation_in_progress)
@@ -420,8 +450,8 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
 
         status, response = await manager.apply(
             {
-                "fault_tolerance_instruction": "scale_down",
-                "fault_tolerance_params": {"ranks": [1]},
+                "instruction": "scale_down",
+                "params": {"ranks": [1]},
             }
         )
 
@@ -581,22 +611,6 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
 
         manager._failstop.assert_called_once()
         self.assertIn("FaultToleranceManager hit an exception", manager._failstop.call_args.args[0])
-
-    async def test_scale_down_rejects_removed_shutdown_parameter(self):
-        manager = make_manager()
-        manager.state.begin_exception_pause()
-        manager.state.finish_pause({0, 1})
-
-        status, response = await manager.apply(
-            {
-                "fault_tolerance_instruction": "scale_down",
-                "fault_tolerance_params": {"ranks": [1], "shutdown": True},
-            }
-        )
-
-        self.assertEqual(status, 400)
-        self.assertEqual(response["message"], "scale_down_does_not_accept_shutdown")
-
 
 if __name__ == "__main__":
     unittest.main()

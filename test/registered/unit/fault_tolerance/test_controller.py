@@ -95,7 +95,7 @@ class TestFaultToleranceState(unittest.TestCase):
 
         self.assertTrue(state.should_reject_admission())
 
-    def test_only_explicit_recovery_clears_disabled(self):
+    def test_availability_updates_do_not_clear_disabled(self):
         state = FaultToleranceState(dp_size=2, strategy="continue")
         state.disabled_dp_ranks.add(1)
 
@@ -103,11 +103,6 @@ class TestFaultToleranceState(unittest.TestCase):
         self.assertEqual(state.disabled_dp_ranks, {1})
         state.observe_mooncake_active_ranks([True, True])
         self.assertEqual(state.disabled_dp_ranks, {1})
-
-        self.assertIsNone(state.validate_apply("recover", [1]))
-        self.assertEqual(state.begin_recover("recover", [1]), [])
-        state.commit_recover(set())
-        self.assertEqual(state.disabled_dp_ranks, set())
 
     def test_status_prioritizes_dead_then_paused_then_disabled(self):
         state = FaultToleranceState(dp_size=3, strategy="pause")
@@ -124,29 +119,6 @@ class TestFaultToleranceState(unittest.TestCase):
             ],
         )
 
-    def test_recover_does_not_require_runtime_to_be_active(self):
-        state = FaultToleranceState(dp_size=2, strategy="continue")
-        state.disabled_dp_ranks.add(1)
-        state.process_active_ranks[1] = False
-
-        self.assertIsNone(state.validate_apply("recover", [1]))
-        state.begin_recover("recover", [1])
-        response = state.commit_recover(set())
-
-        self.assertEqual(response["ranks"][1]["state"], "dead")
-        state.observe_process_active_ranks([1], active=True)
-        self.assertEqual(state.status_response()["ranks"][1]["state"], "healthy")
-
-    def test_recover_is_rejected_while_ft_operation_is_in_progress(self):
-        state = FaultToleranceState(dp_size=2, strategy="pause")
-        state.disabled_dp_ranks.add(1)
-        state.ft_operation_in_progress = True
-
-        self.assertEqual(
-            state.validate_apply("recover", [1]),
-            "ft_operation_in_progress",
-        )
-
     def test_process_rejoin_updates_only_reported_ranks(self):
         state = FaultToleranceState(dp_size=3, strategy="continue")
         state.process_active_ranks = [False, False, True]
@@ -154,40 +126,6 @@ class TestFaultToleranceState(unittest.TestCase):
         state.observe_process_active_ranks([0], active=True)
 
         self.assertEqual(state.process_active_ranks, [True, False, True])
-
-    def test_scale_down_only_changes_disabled_source(self):
-        state = FaultToleranceState(dp_size=2, strategy="pause")
-        state.begin_exception_pause()
-        state.finish_pause({0, 1})
-
-        resume_targets = state.begin_recover("scale_down", [1])
-
-        self.assertEqual(state.effective_active_mask(), [True, False])
-        self.assertEqual(resume_targets, [0, 1])
-        self.assertEqual(state.disabled_dp_ranks, {1})
-        self.assertEqual(state.process_active_ranks, [True, True])
-        self.assertEqual(state.mooncake_active_ranks, [True, True])
-
-        response = state.commit_recover({0, 1}, clear_paused=True)
-        self.assertEqual(response["resumed_ranks"], [0, 1])
-        self.assertEqual(state.paused_dp_ranks, set())
-        self.assertEqual(
-            response["ranks"],
-            [
-                {"rank": 0, "state": "healthy"},
-                {"rank": 1, "state": "disabled"},
-            ],
-        )
-
-    def test_scale_down_cannot_remove_last_effective_route(self):
-        state = FaultToleranceState(dp_size=2, strategy="pause")
-        state.process_active_ranks = [True, False]
-        state.paused_dp_ranks = {0}
-
-        self.assertEqual(
-            state.validate_apply("scale_down", [0]),
-            "cannot_isolate_all_active_ranks",
-        )
 
     def test_resume_targets_use_paused_runtime_sources(self):
         state = FaultToleranceState(dp_size=3, strategy="pause")

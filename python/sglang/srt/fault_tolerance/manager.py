@@ -10,8 +10,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.fault_tolerance.controller import (
     FaultToleranceState,
-    build_apply_op,
-    ft_error_status,
     ft_failure,
 )
 from sglang.srt.managers.io_struct import (
@@ -76,93 +74,116 @@ class FaultToleranceManager:
     def status(self) -> tuple[int, dict]:
         return 200, self.state.status_response()
 
-    def _parse_apply_args(
-        self, instruction: str, params: Dict[str, Any], timeout: Any
-    ) -> Tuple[Optional[List[int]], Optional[int], Optional[str]]:
-        try:
-            timeout = int(timeout)
-        except (TypeError, ValueError):
-            return None, None, "invalid_fault_tolerance_timeout"
-        if timeout <= 0:
-            return None, None, "invalid_fault_tolerance_timeout"
+    def _parse_apply_args(self, obj: Dict[str, Any]) -> Tuple[str, List[int], int]:
+        instruction = obj["instruction"]
+        if instruction not in ("retry", "scale_down", "recover"):
+            raise ValueError(f"unsupported instruction: {instruction}")
 
-        if instruction in ("scale_down", "recover"):
-            ranks = params.get("ranks")
-            if not isinstance(ranks, list):
-                return None, None, f"{instruction}_requires_non_empty_ranks"
-            try:
-                ranks = [int(rank) for rank in ranks]
-            except (TypeError, ValueError):
-                return None, None, "unknown_rank"
-            if instruction == "scale_down" and "shutdown" in params:
-                return None, None, "scale_down_does_not_accept_shutdown"
-            return ranks, timeout, None
-        if instruction == "retry":
-            if params:
-                return None, None, "retry_does_not_accept_params"
-            return None, timeout, None
-        return None, timeout, None
+        params = obj["params"]
+        timeout = params.get("timeout", self.server_args.fault_tolerance_timeout)
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+
+        ranks = params.get("ranks", [])
+        if any(rank < 0 or rank >= self.state.dp_size for rank in ranks):
+            raise ValueError("rank out of range")
+        return instruction, ranks, timeout
 
     async def apply(self, obj: Dict[str, Any]) -> tuple[int, dict]:
-        instruction = obj.get("fault_tolerance_instruction")
-        params = obj.get("fault_tolerance_params") or {}
-        timeout = obj.get(
-            "fault_tolerance_timeout", self.server_args.fault_tolerance_timeout
-        )
-        ranks, timeout, error = self._parse_apply_args(instruction, params, timeout)
-        if error:
-            return 400, ft_failure(error)
-
-        error = self.state.validate_apply(instruction, ranks)
-        if error:
-            return ft_error_status(error), ft_failure(error)
-
-        op = build_apply_op(instruction, ranks)
-        if op.needs_resume():
-            self._cancel_paused_failstop()
-        resume_targets = self.state.begin_recover(instruction, ranks)
-        logger.info("Fault tolerance apply plan: instruction=%s resume_targets=%s ranks=%s", instruction, resume_targets, ranks)
         try:
-            pending_route = self.state.get_unpublished_effective_active_mask()
-            if pending_route is not None:
-                await self._publish_active_ranks(pending_route, timeout)
-                self.state.mark_effective_active_mask_published(pending_route)
+            instruction, ranks, timeout = self._parse_apply_args(obj)
+        except Exception as exc:
+            return 400, ft_failure(f"invalid params: {exc}")
+        if self.state.ft_operation_in_progress:
+            return 409, ft_failure("ft_operation_in_progress")
+
+        try:
+            if instruction == "retry":
+                return await self._apply_retry(timeout)
+            if instruction == "scale_down":
+                return await self._apply_scale_down(ranks, timeout)
+            return await self._apply_recover(ranks, timeout)
+        except Exception as exc:
+            self._failstop(f"fault tolerance apply {instruction} failed: {exc}")
+
+    async def _publish_pending_route(self, timeout: int) -> Optional[tuple[int, dict]]:
+        st = self.state
+        pending = st.get_unpublished_effective_active_mask()
+        if pending is None:
+            return None
+        try:
+            await self._publish_active_ranks(pending, timeout)
+            st.mark_effective_active_mask_published(pending)
+            return None
         except Exception as exc:
             logger.exception("Fault tolerance apply failed: %s", exc)
-            response = self.state.commit_recover(
-                resumed_ranks=set(), clear_paused=False
-            )
-            response.update(
+            body = st.commit_recover(resumed_ranks=set(), clear_paused=False)
+            body.update(
                 {
                     "success": False,
                     "message": f"fault_tolerance_apply_failed: {exc}",
                 }
             )
-            if op.needs_resume():
-                self._arm_paused_failstop()
-            return 503, response
+            return 503, body
 
-        acked = set()
-        if op.needs_resume():
-            resume_targets = set(resume_targets)
-            try:
-                acked = await self._send_command_collect(
-                    command="resume",
-                    target_ranks=sorted(resume_targets),
-                    timeout_sec=timeout,
-                )
-            except Exception as exc:
-                self._failstop(
-                    f"fault tolerance resume failed for ranks "
-                    f"{sorted(resume_targets)}: {exc}"
-                )
+    async def _apply_retry(self, timeout: int) -> tuple[int, dict]:
+        st = self.state
+        if not st.has_paused_rank():
+            return 400, ft_failure("no_paused_rank")
 
-        response = self.state.commit_recover(
-            resumed_ranks=acked,
-            clear_paused=op.needs_resume(),
+        self._cancel_paused_failstop()
+        st.ft_operation_in_progress = True
+        error = await self._publish_pending_route(timeout)
+        if error is not None:
+            self._arm_paused_failstop()
+            return error
+        acked = await self._send_command_collect(
+            command="resume",
+            target_ranks=st.resume_targets(),
+            timeout_sec=timeout,
         )
-        logger.info("Fault tolerance apply committed: instruction=%s ranks=%s", instruction, ranks)
-        return 200, response
+        return 200, st.commit_recover(resumed_ranks=acked, clear_paused=True)
+
+    async def _apply_scale_down(
+        self, ranks: List[int], timeout: int
+    ) -> tuple[int, dict]:
+        st = self.state
+        if not st.has_paused_rank():
+            return 400, ft_failure("no_paused_rank")
+        requested = set(ranks)
+        disabled = st.disabled_dp_ranks | requested
+        if not any(
+            is_active and rank not in disabled
+            for rank, is_active in enumerate(st.runtime_active_mask())
+        ):
+            return 400, ft_failure("cannot_isolate_all_active_ranks")
+
+        self._cancel_paused_failstop()
+        st.ft_operation_in_progress = True
+        st.disabled_dp_ranks |= requested
+        error = await self._publish_pending_route(timeout)
+        if error is not None:
+            self._arm_paused_failstop()
+            return error
+        acked = await self._send_command_collect(
+            command="resume",
+            target_ranks=st.resume_targets(),
+            timeout_sec=timeout,
+        )
+        return 200, st.commit_recover(resumed_ranks=acked, clear_paused=True)
+
+    async def _apply_recover(self, ranks: List[int], timeout: int) -> tuple[int, dict]:
+        st = self.state
+        requested = set(ranks)
+        if not requested.issubset(st.disabled_dp_ranks):
+            return 400, ft_failure("recover_requires_disabled_ranks")
+
+        st.ft_operation_in_progress = True
+        st.disabled_dp_ranks -= requested
+        error = await self._publish_pending_route(timeout)
+        if error is not None:
+            return error
+        return 200, st.commit_recover(resumed_ranks=set(), clear_paused=False)
 
     def validate_routed_rank(self, rank: int) -> None:
         if not self.state.is_rank_routable(rank):
