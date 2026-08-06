@@ -36,10 +36,6 @@ if TYPE_CHECKING:
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
-FT_ACTION_NONE = 0
-FT_ACTION_PAUSE_READY = 1
-
-
 def _resolve_elastic_world_dp_size(
     dp_size: int,
     *,
@@ -90,7 +86,6 @@ class MLPSyncBatchInfo:
     local_can_run_tbo: bool
     local_forward_mode: int
     can_run_breakable_cuda_graph: bool
-    ft_action: int
 
     # some gathered elements
     tp0_info: torch.Tensor = None
@@ -98,7 +93,6 @@ class MLPSyncBatchInfo:
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
-    global_ft_actions: list[int] = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
@@ -111,7 +105,6 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_breakable_cuda_graph),
-                self.ft_action,
             ],
             device=device,
             dtype=dtype,
@@ -127,8 +120,6 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_breakable_cuda_graph
-                # An inactive DP no longer participates in the pending pause.
-                FT_ACTION_PAUSE_READY,
             ],
             device=device,
             dtype=dtype,
@@ -188,10 +179,9 @@ class MLPSyncBatchInfo:
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
         # Perform only one Device-to-Host (D2H) memory copy
-        cpu_data = tp0_info[:, [0, 1, 7]].cpu()
+        cpu_data = tp0_info[:, [0, 1]].cpu()
         self.global_num_tokens = cpu_data[:, 0].tolist()
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
-        self.global_ft_actions = cpu_data[:, 2].tolist()
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
         self.can_run_breakable_cuda_graph = bool(tp0_info[:, 6].min().item())
@@ -236,8 +226,6 @@ def prepare_mlp_sync_batch_raw(
     disable_overlap_schedule: bool,
     offload_tags: set[str],
     dwdp: bool = False,
-    ft_action: int = FT_ACTION_NONE,
-    update_ft_pause: Optional[Callable[[Optional[list[int]]], None]] = None,
 ):
     # Check if other DP workers have running batches
     if (
@@ -322,7 +310,6 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         can_run_breakable_cuda_graph=can_run_breakable_cuda_graph,
-        ft_action=ft_action,
     )
 
     if not skip_all_gather:
@@ -370,9 +357,6 @@ def prepare_mlp_sync_batch_raw(
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
         local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info
 
-    if update_ft_pause is not None:
-        update_ft_pause(mlp_sync_info.global_ft_actions)
-
     return local_batch
 
 
@@ -389,8 +373,6 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
-    get_ft_action: Optional[Callable[[], int]] = None
-    update_ft_pause: Optional[Callable[[Optional[list[int]]], None]] = None
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return prepare_mlp_sync_batch_raw(
@@ -405,12 +387,6 @@ class SchedulerDPAttnAdapter:
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
             dwdp=self.server_args.dwdp_size > 1,
-            ft_action=(
-                self.get_ft_action()
-                if self.get_ft_action is not None
-                else FT_ACTION_NONE
-            ),
-            update_ft_pause=self.update_ft_pause,
         )
 
     def maybe_prepare_mlp_sync_batch(

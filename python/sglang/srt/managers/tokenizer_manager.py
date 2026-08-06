@@ -71,6 +71,7 @@ from sglang.srt.managers.io_struct import (
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
     FaultToleranceCommandReqOutput,
+    FaultToleranceDPCShutdownReqInput,
     FaultToleranceRankFaultOutput,
     FreezeGCReq,
     GenerateReqInput,
@@ -423,6 +424,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
+        self._zmq_context = context
+        self._dpc_control_endpoints: Dict[int, str] = {}
+        self._dpc_control_sockets: Dict[int, zmq.asyncio.Socket] = {}
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
@@ -478,7 +482,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.fault_tolerance = FaultToleranceManager(
             server_args=self.server_args,
             send_to_scheduler=self._async_dispatch_to_scheduler,
+            send_to_dpc=self._async_send_to_dpc,
         )
+
+    async def _async_send_to_dpc(
+        self, nodes: List[int], obj: FaultToleranceDPCShutdownReqInput
+    ) -> None:
+        for node in nodes:
+            await async_sock_send(self._dpc_control_sockets[node], obj)
+
+    def observe_watchdog_heartbeat(self, heartbeat: WatchdogHeartbeatOutput) -> None:
+        self.fault_tolerance.observe_watchdog_heartbeat(heartbeat)
+        endpoint = heartbeat.control_endpoint
+        if (
+            not endpoint
+            or self._dpc_control_endpoints.get(heartbeat.node_rank) == endpoint
+        ):
+            return
+        old = self._dpc_control_sockets.get(heartbeat.node_rank)
+        self._dpc_control_endpoints[heartbeat.node_rank] = endpoint
+        self._dpc_control_sockets[heartbeat.node_rank] = get_zmq_socket(
+            self._zmq_context, zmq.PUSH, endpoint, False
+        )
+        if old is not None:
+            old.close(linger=0)
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
@@ -657,7 +684,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     (ProcessActiveRanksOutput, self.update_process_active_ranks),
                     (
                         WatchdogHeartbeatOutput,
-                        self.fault_tolerance.observe_watchdog_heartbeat,
+                        self.observe_watchdog_heartbeat,
                     ),
                 ]
             )

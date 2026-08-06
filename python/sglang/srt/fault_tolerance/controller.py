@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 
 class RankState(str, Enum):
     HEALTHY = "healthy"
-    PAUSED = "paused"
+    UNHEALTHY = "unhealthy"
     DISABLED = "disabled"
     DEAD = "dead"
 
@@ -26,9 +26,10 @@ def _dp_attention_gate(server_args) -> bool:
 
 _FT_SUPPORT_GATES = [
     (lambda a: getattr(a, "dp_size", 1) > 1, "ft_requires_dp_gt1"),
+    (lambda a: getattr(a, "enable_dp_attention", False), "ft_requires_dp_attention"),
+    (lambda a: getattr(a, "enable_eplb", False), "ft_requires_eplb"),
     (
-        lambda a: getattr(a, "max_ep_size", None)
-        in (None, getattr(a, "dp_size", 1)),
+        lambda a: getattr(a, "max_ep_size", None) in (None, getattr(a, "dp_size", 1)),
         "ft_unsupported_with_runtime_ep_scale",
     ),
     (
@@ -62,153 +63,132 @@ def is_ft_supported_config(server_args) -> Tuple[bool, str]:
 
 
 class FaultToleranceState:
-    def __init__(
-        self,
-        *,
-        dp_size: int,
-        strategy: str,
-    ):
+    def __init__(self, *, dp_size: int, strategy: str, global_rank_count: int):
         self.dp_size = dp_size
         self.strategy = strategy
-        self.process_active_ranks = [True] * dp_size
-        self.mooncake_active_ranks = [True] * dp_size
+        self.global_rank_count = global_rank_count
+        self.ranks_per_dp = global_rank_count // dp_size
+        self.expected_dp_mask = [True] * dp_size
+        self.process_alive_mask = [True] * global_rank_count
         self.disabled_dp_ranks: set[int] = set()
-        self.paused_dp_ranks: set[int] = set()
+        self.unhealthy_dp_ranks: set[int] = set()
         self.ft_operation_in_progress = False
-        self._last_published_effective_active_mask = [True] * dp_size
 
-    def _rank_state(self, rank: int, runtime_active: List[bool]) -> RankState:
-        if not runtime_active[rank]:
+    def global_ranks_for_dp(self, dp_rank: int) -> range:
+        start = dp_rank * self.ranks_per_dp
+        return range(start, start + self.ranks_per_dp)
+
+    def global_ranks_for_dps(self, dp_ranks: Iterable[int]) -> List[int]:
+        return [
+            rank
+            for dp_rank in sorted(set(dp_ranks))
+            for rank in self.global_ranks_for_dp(dp_rank)
+        ]
+
+    def expand_dp_mask(self, mask: List[bool]) -> List[bool]:
+        return [
+            mask[rank // self.ranks_per_dp] for rank in range(self.global_rank_count)
+        ]
+
+    def project_global_mask(self, mask: List[bool]) -> List[bool]:
+        return [
+            all(
+                rank < len(mask) and mask[rank] for rank in self.global_ranks_for_dp(dp)
+            )
+            for dp in range(self.dp_size)
+        ]
+
+    def process_alive_dp_mask(self) -> List[bool]:
+        return self.project_global_mask(self.process_alive_mask)
+
+    def expected_dp_ranks(self) -> List[int]:
+        return [rank for rank, expected in enumerate(self.expected_dp_mask) if expected]
+
+    def _rank_state(self, rank: int) -> RankState:
+        if not self.process_alive_dp_mask()[rank]:
             return RankState.DEAD
-        if rank in self.paused_dp_ranks:
-            return RankState.PAUSED
-        if rank in self.disabled_dp_ranks:
-            return RankState.DISABLED
+        if not self.expected_dp_mask[rank]:
+            return (
+                RankState.DISABLED if rank in self.disabled_dp_ranks else RankState.DEAD
+            )
+        if rank in self.unhealthy_dp_ranks:
+            return RankState.UNHEALTHY
         return RankState.HEALTHY
 
     def status_response(self) -> Dict[str, Any]:
-        runtime_active = self.runtime_active_mask()
         return {
             "ranks": [
-                {"rank": rank, "state": self._rank_state(rank, runtime_active).value}
+                {"rank": rank, "state": self._rank_state(rank).value}
                 for rank in range(self.dp_size)
             ]
         }
 
-    def has_paused_rank(self) -> bool:
-        return bool(self.paused_dp_ranks)
-
-    def should_reject_admission(self) -> bool:
-        if not any(self.effective_active_mask()):
-            return True
-        return self.strategy == "pause" and (
-            self.ft_operation_in_progress or self.has_paused_rank()
+    def has_incident(self) -> bool:
+        alive = self.process_alive_dp_mask()
+        return bool(self.unhealthy_dp_ranks) or any(
+            expected and not alive[rank]
+            for rank, expected in enumerate(self.expected_dp_mask)
         )
 
-    def runtime_active_mask(self) -> List[bool]:
-        return [
-            self.process_active_ranks[rank] and self.mooncake_active_ranks[rank]
-            for rank in range(self.dp_size)
-        ]
-
-    def effective_active_mask(self) -> List[bool]:
-        return [
-            is_active and rank not in self.disabled_dp_ranks
-            for rank, is_active in enumerate(self.runtime_active_mask())
-        ]
-
-    def pause_targets(self) -> List[int]:
-        runtime_active = self.runtime_active_mask()
-        return [rank for rank in range(self.dp_size) if runtime_active[rank]]
-
-    def resume_targets(self) -> List[int]:
-        runtime_active = self.runtime_active_mask()
-        return sorted(rank for rank in self.paused_dp_ranks if runtime_active[rank])
-
-    def is_rank_routable(self, rank: int) -> bool:
-        return 0 <= rank < self.dp_size and self.effective_active_mask()[rank]
-
-    def _normalize_mask(self, mask: List[bool]) -> List[bool]:
-        return [rank < len(mask) and bool(mask[rank]) for rank in range(self.dp_size)]
-
-    def _falling_edge(self, old_effective: List[bool]) -> bool:
-        return any(
-            old and not new
-            for old, new in zip(old_effective, self.effective_active_mask())
+    def should_reject_admission(self, route_mask: List[bool]) -> bool:
+        return (
+            not any(route_mask)
+            or self.ft_operation_in_progress
+            or (self.strategy == "pause" and self.has_incident())
         )
-
-    def _try_begin_pause(self) -> List[int]:
-        if self.ft_operation_in_progress or self.has_paused_rank():
-            return []
-        targets = self.pause_targets()
-        if not targets:
-            return []
-        self.ft_operation_in_progress = True
-        return targets
-
-    def _begin_availability_pause(self, old_effective: List[bool]) -> List[int]:
-        if self.strategy != "pause" or not self._falling_edge(old_effective):
-            return []
-        return self._try_begin_pause()
-
-    def _update_availability(self, mutate) -> List[int]:
-        old_effective = self.effective_active_mask()
-        mutate()
-        return self._begin_availability_pause(old_effective)
 
     def observe_process_active_ranks(
         self, ranks: Iterable[int], *, active: bool
-    ) -> List[int]:
-        def _mutate():
-            for rank in ranks:
-                if 0 <= rank < self.dp_size:
-                    self.process_active_ranks[rank] = active
-
-        return self._update_availability(_mutate)
-
-    def observe_mooncake_active_ranks(self, new_mask: List[bool]) -> List[int]:
-        def _mutate():
-            self.mooncake_active_ranks = self._normalize_mask(new_mask)
-
-        return self._update_availability(_mutate)
-
-    def get_unpublished_effective_active_mask(self) -> Optional[List[bool]]:
-        effective_active = self.effective_active_mask()
-        if effective_active == self._last_published_effective_active_mask:
-            return None
-        return effective_active
-
-    def mark_effective_active_mask_published(
-        self, effective_active: List[bool]
     ) -> None:
-        self._last_published_effective_active_mask = list(effective_active)
+        affected = set()
+        for rank in ranks:
+            if 0 <= rank < self.global_rank_count:
+                self.process_alive_mask[rank] = active
+                affected.add(rank // self.ranks_per_dp)
+        if not active:
+            self.disabled_dp_ranks.difference_update(affected)
 
-    def begin_exception_pause(self) -> List[int]:
-        # 异常止血：无策略门（continue 在 manager 的 handle_rank_fault 拦截）。
-        return self._try_begin_pause()
-
-    def finish_pause(self, paused_ranks: Iterable[int]) -> None:
-        self.paused_dp_ranks = {
-            rank for rank in paused_ranks if 0 <= rank < self.dp_size
-        }
-        self.ft_operation_in_progress = False
-
-    def commit_recover(
-        self,
-        resumed_ranks: Iterable[int],
-        *,
-        clear_paused: bool = False,
-    ) -> Dict[str, Any]:
-        committed_resumed_ranks = sorted(self.paused_dp_ranks & set(resumed_ranks))
-        if clear_paused:
-            self.paused_dp_ranks.clear()
-        self.ft_operation_in_progress = False
-        body = self.status_response()
-        body.update(
-            {
-                "success": True,
-                "message": "fault_tolerance_apply_committed",
-                "resumed_ranks": committed_resumed_ranks,
-            }
+    def observe_native_active_ranks(self, mask: List[bool]) -> List[bool]:
+        native = self.project_global_mask(mask)
+        alive = self.process_alive_dp_mask()
+        self.disabled_dp_ranks.update(
+            rank
+            for rank in range(self.dp_size)
+            if not self.expected_dp_mask[rank] and alive[rank] and native[rank]
         )
+        return native
+
+    def observe_rank_fault(self, rank: int) -> None:
+        if self.strategy == "pause" and 0 <= rank < self.dp_size:
+            self.unhealthy_dp_ranks.add(rank)
+
+    def finish_retry(self) -> Dict[str, Any]:
+        self.unhealthy_dp_ranks.clear()
+        self.ft_operation_in_progress = False
+        return self._success("fault_tolerance_retry_committed")
+
+    def finish_scale_down(self, ranks: Iterable[int]) -> Dict[str, Any]:
+        removed = sorted(set(ranks))
+        for rank in removed:
+            self.expected_dp_mask[rank] = False
+            self.disabled_dp_ranks.discard(rank)
+        self.unhealthy_dp_ranks.clear()
+        self.ft_operation_in_progress = False
+        body = self._success("fault_tolerance_scale_down_committed")
+        body["removed_ranks"] = removed
+        return body
+
+    def finish_recover(self, ranks: Iterable[int]) -> Dict[str, Any]:
+        recovered = sorted(set(ranks))
+        for rank in recovered:
+            self.expected_dp_mask[rank] = True
+            self.disabled_dp_ranks.discard(rank)
+        self.ft_operation_in_progress = False
+        body = self._success("fault_tolerance_recover_committed")
+        body["recovered_ranks"] = recovered
+        return body
+
+    def _success(self, message: str) -> Dict[str, Any]:
+        body = self.status_response()
+        body.update({"success": True, "message": message})
         return body

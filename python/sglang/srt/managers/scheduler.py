@@ -181,11 +181,7 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_components.dp_attn import (
-    FT_ACTION_NONE,
-    FT_ACTION_PAUSE_READY,
-    SchedulerDPAttnAdapter,
-)
+from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -1022,7 +1018,6 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
-        self._ft_pending_pause: Optional[FaultToleranceCommandReqInput] = None
         self._ft_pause_deadline: Optional[float] = None
 
     def init_chunked_prefill(self):
@@ -1552,18 +1547,24 @@ class Scheduler(
                 return
             except Exception as exc:
                 recovered = self._ft_discard_inflight_window(exc)
+                should_continue = (
+                    self.server_args.fault_tolerance_on_error_strategy == "continue"
+                    and recovered
+                )
+                if not should_continue:
+                    self._engine_paused = True
+                    self._ft_pause_deadline = (
+                        time.monotonic()
+                        + self.server_args.fault_tolerance_pause_timeout
+                    )
                 self.ipc_channels.send_to_tokenizer.send_output(
                     FaultToleranceRankFaultOutput(
                         rank=self.ps.dp_rank,
                         message=str(exc),
                     )
                 )
-                if (
-                    self.server_args.fault_tolerance_on_error_strategy == "continue"
-                    and recovered
-                ):
+                if should_continue:
                     continue
-                self._engine_paused = True
 
     def _ft_discard_inflight_window(self, exc: Exception) -> bool:
         window_batches = [
@@ -1658,8 +1659,6 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
-            self._complete_ft_pause()
-
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1702,8 +1701,6 @@ class Scheduler(
         while True:
             if self.gracefully_exit:
                 break
-
-            self._complete_ft_pause()
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -1924,12 +1921,6 @@ class Scheduler(
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
-            get_ft_action=lambda: (
-                FT_ACTION_PAUSE_READY
-                if self._ft_pending_pause is not None
-                else FT_ACTION_NONE
-            ),
-            update_ft_pause=self._update_ft_pause_from_mlp_sync,
         )
 
     def init_pool_stats_observer(self) -> None:
@@ -4492,17 +4483,26 @@ class Scheduler(
         if rank not in recv_req.target_ranks:
             return None
 
-        if recv_req.command == "pause":
-            self._ft_pending_pause = recv_req
-            return None
-        if recv_req.command == "resume":
-            self._engine_paused = False
-            self._ft_pause_deadline = None
+        if recv_req.command == "retry":
+            from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+            state = ElasticEPStateManager.instance()
+            state.active_ranks.copy_(state.last_active_ranks)
+            state.active_ranks_cpu.copy_(state.last_active_ranks.detach().cpu())
+            message = "retried"
+        elif recv_req.command == "scale_down":
+            self.tp_worker.model_runner.apply_fault_tolerance_scale_down(
+                recv_req.active_mask
+            )
+            message = "scaled down"
         else:
             logger.warning(
                 "FT scheduler received unknown command: %s", recv_req.command
             )
             return None
+
+        self._engine_paused = False
+        self._ft_pause_deadline = None
 
         if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:
             return None
@@ -4510,39 +4510,8 @@ class Scheduler(
             request_id=recv_req.request_id,
             rank=rank,
             success=True,
-            message="resumed",
+            message=message,
         )
-
-    def _update_ft_pause_from_mlp_sync(self, global_ft_actions) -> None:
-        pending = self._ft_pending_pause
-        if pending is None or self._engine_paused or global_ft_actions is None:
-            return
-        if all(
-            global_ft_actions[rank] == FT_ACTION_PAUSE_READY
-            for rank in pending.target_ranks
-        ):
-            self._engine_paused = True
-
-    def _complete_ft_pause(self) -> None:
-        pending = self._ft_pending_pause
-        if pending is None or not self._engine_paused:
-            return
-
-        self._ft_pending_pause = None
-        if self._ft_pause_deadline is None:
-            self._ft_pause_deadline = (
-                time.monotonic()
-                + self.server_args.fault_tolerance_pause_timeout
-            )
-        if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:
-            return
-        output = FaultToleranceCommandReqOutput(
-            request_id=pending.request_id,
-            rank=self.ps.dp_rank,
-            success=True,
-            message="paused",
-        )
-        self.ipc_channels.send_to_tokenizer.send_output(output, pending)
 
     def _check_ft_pause_deadline(self) -> None:
         deadline = self._ft_pause_deadline
