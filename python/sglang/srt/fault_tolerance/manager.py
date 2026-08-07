@@ -158,8 +158,23 @@ class FaultToleranceManager:
         requested = set(ranks)
         if not requested or any(st.expected_dp_mask[rank] for rank in requested):
             return 400, ft_failure("recover_requires_disabled_ranks")
-        if not requested.issubset(st.disabled_dp_ranks):
+        if st.unhealthy_dp_ranks:
+            return 400, ft_failure("recover_blocked_by_unhealthy_rank")
+        disabled = {
+            rank
+            for rank, is_disabled in enumerate(st.disabled_dp_mask())
+            if is_disabled
+        }
+        if not requested.issubset(disabled):
+            # A requested DP is not rejoined / still expected.
             return 400, ft_failure("recover_requires_disabled_ranks")
+        if any(
+            member in st.pending_recovery
+            for rank in requested
+            for member in st.global_ranks_for_dp(rank)
+        ):
+            # Processes rejoined but the data plane has not finished recovering.
+            return 400, ft_failure("recover_requires_recovered_ranks")
 
         st.ft_operation_in_progress = True
         for rank in requested:
@@ -186,11 +201,27 @@ class FaultToleranceManager:
         native = self.state.observe_native_active_ranks(ranks.status)
         if self.state.strategy != "continue":
             return None
-        alive = self.state.process_alive_dp_mask()
+        st = self.state
+        # Under "continue" a recovered DP rejoins without an explicit recover:
+        # once its processes and data plane are both back, re-admit it.
+        if not st.ft_operation_in_progress:
+            alive = st.process_alive_dp_mask()
+            for rank in range(st.dp_size):
+                if (
+                    not st.expected_dp_mask[rank]
+                    and alive[rank]
+                    and native[rank]
+                    and not any(
+                        member in st.pending_recovery
+                        for member in st.global_ranks_for_dp(rank)
+                    )
+                ):
+                    st.expected_dp_mask[rank] = True
+        alive = st.process_alive_dp_mask()
         return self._route_update(
             [
                 expected and alive[rank] and native[rank]
-                for rank, expected in enumerate(self.state.expected_dp_mask)
+                for rank, expected in enumerate(st.expected_dp_mask)
             ]
         )
 

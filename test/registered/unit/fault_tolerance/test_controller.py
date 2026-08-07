@@ -79,19 +79,22 @@ class TestFaultToleranceState(unittest.TestCase):
         )
         self.assertTrue(state.has_incident())
 
-    def test_rejoin_needs_native_ready_before_disabled(self):
+    def test_rejoin_process_ready_is_disabled_regardless_of_pending(self):
         state = make_state()
         state.expected_dp_mask[1] = False
         state.observe_process_active_ranks([1], active=False)
         state.observe_process_active_ranks([1], active=True)
-        self.assertEqual(state.status_response()["ranks"][1]["state"], "dead")
+        # Processes rejoined -> disabled, even though the data plane is still pending.
+        self.assertEqual(state.status_response()["ranks"][1]["state"], "disabled")
+        self.assertEqual(state.pending_recovery, {1})
 
         state.observe_native_active_ranks([True, True])
+        self.assertEqual(state.pending_recovery, set())
         self.assertEqual(state.status_response()["ranks"][1]["state"], "disabled")
 
         state.observe_process_active_ranks([1], active=False)
         self.assertEqual(state.status_response()["ranks"][1]["state"], "dead")
-        self.assertNotIn(1, state.disabled_dp_ranks)
+        self.assertEqual(state.disabled_dp_mask(), [False, False])
 
     def test_excluded_dead_dp_does_not_create_new_incident(self):
         state = make_state()
@@ -104,10 +107,21 @@ class TestFaultToleranceState(unittest.TestCase):
         state = make_state()
         self.assertFalse(state.should_reject_admission([True, True]))
         state.observe_rank_fault(0)
+        self.assertTrue(state.cluster_paused)
         self.assertTrue(state.should_reject_admission([True, True]))
         state.finish_retry()
+        self.assertFalse(state.cluster_paused)
         state.ft_operation_in_progress = True
         self.assertTrue(state.should_reject_admission([True, True]))
+
+    def test_continue_admission_is_not_paused_by_faults(self):
+        state = make_state(strategy="continue")
+        state.observe_process_active_ranks([1], active=False)
+        state.observe_rank_fault(0)
+        # continue never pauses admission; faults only drop requests / update status.
+        self.assertFalse(state.should_reject_admission([True, True]))
+        self.assertEqual(state.unhealthy_dp_ranks, set())
+        self.assertEqual(state.status_response()["ranks"][1]["state"], "dead")
 
 
 if __name__ == "__main__":

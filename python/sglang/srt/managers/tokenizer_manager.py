@@ -722,7 +722,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.fault_tolerance is not None
             and self.fault_tolerance.should_reject_admission()
         ):
-            raise RuntimeError("fault_tolerance_paused")
+            raise fastapi.HTTPException(
+                status_code=503,
+                detail=ft_failure("fault_tolerance_paused"),
+            )
 
         self._init_req_state(obj, request)
         try:

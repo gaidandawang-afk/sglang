@@ -70,9 +70,10 @@ class FaultToleranceState:
         self.ranks_per_dp = global_rank_count // dp_size
         self.expected_dp_mask = [True] * dp_size
         self.process_alive_mask = [True] * global_rank_count
-        self.disabled_dp_ranks: set[int] = set()
+        self.pending_recovery: set[int] = set()
         self.unhealthy_dp_ranks: set[int] = set()
         self.ft_operation_in_progress = False
+        self.cluster_paused = False
 
     def global_ranks_for_dp(self, dp_rank: int) -> range:
         start = dp_rank * self.ranks_per_dp
@@ -104,13 +105,20 @@ class FaultToleranceState:
     def expected_dp_ranks(self) -> List[int]:
         return [rank for rank, expected in enumerate(self.expected_dp_mask) if expected]
 
+    def disabled_dp_mask(self) -> List[bool]:
+        # A non-expected DP is "disabled" once its processes have rejoined; it
+        # no longer participates until an explicit recover re-admits it.
+        alive = self.process_alive_dp_mask()
+        return [
+            not expected and alive[rank]
+            for rank, expected in enumerate(self.expected_dp_mask)
+        ]
+
     def _rank_state(self, rank: int) -> RankState:
         if not self.process_alive_dp_mask()[rank]:
             return RankState.DEAD
         if not self.expected_dp_mask[rank]:
-            return (
-                RankState.DISABLED if rank in self.disabled_dp_ranks else RankState.DEAD
-            )
+            return RankState.DISABLED
         if rank in self.unhealthy_dp_ranks:
             return RankState.UNHEALTHY
         return RankState.HEALTHY
@@ -134,46 +142,48 @@ class FaultToleranceState:
         return (
             not any(route_mask)
             or self.ft_operation_in_progress
-            or (self.strategy == "pause" and self.has_incident())
+            or (self.strategy == "pause" and self.cluster_paused)
         )
 
     def observe_process_active_ranks(
         self, ranks: Iterable[int], *, active: bool
     ) -> None:
-        affected = set()
         for rank in ranks:
             if 0 <= rank < self.global_rank_count:
                 self.process_alive_mask[rank] = active
-                affected.add(rank // self.ranks_per_dp)
         if not active:
-            self.disabled_dp_ranks.difference_update(affected)
+            self.pending_recovery.update(
+                rank for rank in ranks if 0 <= rank < self.global_rank_count
+            )
+            self.cluster_paused = True
 
     def observe_native_active_ranks(self, mask: List[bool]) -> List[bool]:
-        native = self.project_global_mask(mask)
-        alive = self.process_alive_dp_mask()
-        self.disabled_dp_ranks.update(
-            rank
-            for rank in range(self.dp_size)
-            if not self.expected_dp_mask[rank] and alive[rank] and native[rank]
-        )
-        return native
+        # fn2: a native-active bit only rises after try_recover_ranks succeeded
+        # and the rank rejoined the data plane, so it is the precise signal to
+        # retire a pending-recovery rank.
+        for rank, active in enumerate(mask):
+            if active and rank < self.global_rank_count:
+                self.pending_recovery.discard(rank)
+        return self.project_global_mask(mask)
 
     def observe_rank_fault(self, rank: int) -> None:
         if self.strategy == "pause" and 0 <= rank < self.dp_size:
             self.unhealthy_dp_ranks.add(rank)
+            self.cluster_paused = True
 
     def finish_retry(self) -> Dict[str, Any]:
         self.unhealthy_dp_ranks.clear()
         self.ft_operation_in_progress = False
+        self.cluster_paused = False
         return self._success("fault_tolerance_retry_committed")
 
     def finish_scale_down(self, ranks: Iterable[int]) -> Dict[str, Any]:
         removed = sorted(set(ranks))
         for rank in removed:
             self.expected_dp_mask[rank] = False
-            self.disabled_dp_ranks.discard(rank)
         self.unhealthy_dp_ranks.clear()
         self.ft_operation_in_progress = False
+        self.cluster_paused = False
         body = self._success("fault_tolerance_scale_down_committed")
         body["removed_ranks"] = removed
         return body
@@ -182,7 +192,6 @@ class FaultToleranceState:
         recovered = sorted(set(ranks))
         for rank in recovered:
             self.expected_dp_mask[rank] = True
-            self.disabled_dp_ranks.discard(rank)
         self.ft_operation_in_progress = False
         body = self._success("fault_tolerance_recover_committed")
         body["recovered_ranks"] = recovered

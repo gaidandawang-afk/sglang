@@ -118,8 +118,12 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
 
     async def test_recover_only_commits_expected_and_route(self):
         manager = make_manager()
-        manager.state.expected_dp_mask[1] = False
-        manager.state.disabled_dp_ranks.add(1)
+        # Full lifecycle: scale-down kills the DP, it rejoins (process-up) and
+        # the data plane recovers (native-active) -> disabled, hence recoverable.
+        manager.state.finish_scale_down([1])
+        manager.state.observe_process_active_ranks([1], active=False)
+        manager.state.observe_process_active_ranks([1], active=True)
+        manager.state.observe_native_active_ranks([True, True])
         manager._send_command_collect = AsyncMock()
 
         async def publish(mask, timeout):
@@ -135,6 +139,35 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["ranks"][1]["state"], "healthy")
         manager._send_command_collect.assert_not_awaited()
 
+    async def test_recover_rejected_while_data_plane_pending(self):
+        manager = make_manager()
+        manager.state.finish_scale_down([1])
+        # Process rejoined but native recovery has not completed -> still pending.
+        manager.state.observe_process_active_ranks([1], active=False)
+        manager.state.observe_process_active_ranks([1], active=True)
+
+        status, response = await manager.apply(
+            {"instruction": "recover", "params": {"ranks": [1]}}
+        )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(response["message"], "recover_requires_recovered_ranks")
+
+    async def test_recover_blocked_by_unhealthy_rank(self):
+        manager = make_manager()
+        manager.state.finish_scale_down([1])
+        manager.state.observe_process_active_ranks([1], active=False)
+        manager.state.observe_process_active_ranks([1], active=True)
+        manager.state.observe_native_active_ranks([True, True])
+        manager.state.observe_rank_fault(0)
+
+        status, response = await manager.apply(
+            {"instruction": "recover", "params": {"ranks": [1]}}
+        )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(response["message"], "recover_blocked_by_unhealthy_rank")
+
     async def test_process_up_alone_does_not_enable_rejoined_dp(self):
         manager = make_manager()
         manager.state.expected_dp_mask[1] = False
@@ -144,7 +177,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager.observe_process_active_ranks(
             ProcessActiveRanksOutput(ranks=[1], active=True)
         )
-        self.assertEqual(manager.status()[1]["ranks"][1]["state"], "dead")
+        self.assertEqual(manager.status()[1]["ranks"][1]["state"], "disabled")
 
         self.assertIsNone(
             manager.observe_active_ranks(ActiveRanksOutput(status=[True, True]))
@@ -154,13 +187,38 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
     async def test_continue_route_intersects_native_process_and_expected(self):
         manager = make_manager(dp_size=2, ranks_per_dp=2, strategy="continue")
         manager.state.expected_dp_mask[1] = False
-        manager.state.observe_process_active_ranks([1], active=False)
+        # DP1 (global ranks 2,3) fully down and not yet native-recovered.
+        manager.state.observe_process_active_ranks([2, 3], active=False)
+
+        update = manager.observe_active_ranks(
+            ActiveRanksOutput(status=[True, True, False, False])
+        )
+
+        # route = expected & process_alive & native; DP1 cannot auto-recover yet.
+        self.assertEqual(manager.state.expected_dp_mask, [True, False])
+        self.assertEqual(update.status, [True, False])
+
+    async def test_continue_native_recovery_auto_recovers_disabled_dp(self):
+        manager = make_manager(dp_size=2, ranks_per_dp=2, strategy="continue")
+        # Scale-down DP1 then kill it; it stays disabled until it rejoins and its
+        # data plane recovers, at which point "continue" re-admits it automatically.
+        manager.state.finish_scale_down([1])
+        manager.state.observe_process_active_ranks([2, 3], active=False)
+        manager.state.observe_process_active_ranks([2, 3], active=True)
+        self.assertEqual(manager.state.expected_dp_mask, [True, False])
+        self.assertEqual(manager.state.pending_recovery, {2, 3})
 
         update = manager.observe_active_ranks(
             ActiveRanksOutput(status=[True, True, True, True])
         )
 
-        self.assertEqual(update.status, [False, False])
+        # fn2 cleared pending and auto-recovered DP1 without an explicit recover.
+        self.assertEqual(manager.state.pending_recovery, set())
+        self.assertEqual(manager.state.expected_dp_mask, [True, True])
+        # The route was already all-true, so no new publish is emitted; recovery
+        # shows up purely as the DP returning to HEALTHY.
+        self.assertIsNone(update)
+        self.assertEqual(manager.status()[1]["ranks"][1]["state"], "healthy")
 
     async def test_watchdog_lease_expiry_marks_global_processes_down(self):
         manager = make_manager(dp_size=2, ranks_per_dp=2, strategy="continue")
