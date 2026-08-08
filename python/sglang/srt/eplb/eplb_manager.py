@@ -89,7 +89,7 @@ class EPLBManager:
 
             yield from self.rebalance()
 
-    def rebalance(self):
+    def rebalance(self, *, force: bool = False):
         if self._rebalance_disabled_reason is not None:
             if not self._rebalance_disabled_logged:
                 logger.debug(
@@ -101,7 +101,22 @@ class EPLBManager:
 
         logger.info("[EPLBManager] rebalance start")
 
-        enable_timing = self._rebalance_layers_per_chunk is None
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        elastic_ep_state = ElasticEPStateManager.instance()
+        recovering_from_rank_fault = (
+            elastic_ep_state is not None
+            and elastic_ep_state.active_ranks_cpu is not None
+            and not bool(elastic_ep_state.active_ranks_cpu.all().item())
+        )
+        enable_timing = (
+            self._rebalance_layers_per_chunk is None
+            and not recovering_from_rank_fault
+        )
+        if recovering_from_rank_fault:
+            logger.info(
+                "[EPLBManager] skip device-wide timing synchronization during rank-fault recovery"
+            )
 
         if enable_timing:
             torch.get_device_module().synchronize()
@@ -116,7 +131,9 @@ class EPLBManager:
         ]
 
         # Check whether rebalancing is needed
-        if not self._check_rebalance_needed(average_utilization_rate_over_window):
+        if not force and not self._check_rebalance_needed(
+            average_utilization_rate_over_window
+        ):
             return
 
         expert_location_metadata = ExpertLocationMetadata.init_by_eplb(

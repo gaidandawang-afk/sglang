@@ -1518,6 +1518,25 @@ class ContinueGenerationReqInput(BaseReq, kw_only=True):
     torch_empty_cache: bool = True
 
 
+class FaultToleranceCommandReqInput(BaseReq, kw_only=True):
+    request_id: str
+    command: Literal["retry", "scale_down"]
+    target_ranks: List[int]
+    active_mask: Optional[List[bool]] = None
+
+
+class FaultToleranceCommandReqOutput(BaseReq, kw_only=True):
+    request_id: str
+    rank: int
+    success: bool
+    message: str = ""
+
+
+class FaultToleranceRankFaultOutput(BaseReq, kw_only=True):
+    rank: int
+    message: str = ""
+
+
 class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
     """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
 
@@ -1807,6 +1826,28 @@ class AbortReq(BaseReq, kw_only=True):
 
 class ActiveRanksOutput(BaseReq, kw_only=True):
     status: List[bool]
+    request_id: Optional[str] = None
+
+
+class ProcessActiveRanksOutput(BaseReq, kw_only=True):
+    ranks: List[int]
+    active: bool
+
+
+class WatchdogHeartbeatOutput(BaseReq, kw_only=True):
+    node_rank: int
+    ranks: List[int]
+    control_endpoint: Optional[str] = None
+
+
+class FaultToleranceDPCShutdownReqInput(BaseReq, kw_only=True):
+    target_dp_ranks: List[int]
+
+
+class ActiveRanksUpdateReqOutput(BaseReq, kw_only=True):
+    request_id: str
+    success: bool
+    message: str = ""
 
 
 class ElasticScaleUpdateReq(BaseReq, kw_only=True):
