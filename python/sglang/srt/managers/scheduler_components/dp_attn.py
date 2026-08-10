@@ -36,6 +36,29 @@ if TYPE_CHECKING:
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
+
+def _get_npu_ft_active_ranks() -> Optional[torch.Tensor]:
+    """Return the sparse original-rank mask when MC2 has scaled down."""
+
+    from sglang.srt.runtime_context import get_server_args
+
+    server_args = get_server_args()
+    if (
+        not server_args.enable_fault_tolerance
+        or server_args.elastic_ep_backend != "mc2"
+    ):
+        return None
+
+    from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+    state = ElasticEPStateManager.instance()
+    if state is None or state.active_ranks_cpu is None:
+        return None
+    if bool(state.active_ranks_cpu.all().item()):
+        return None
+    return state.active_ranks_cpu
+
+
 def _resolve_elastic_world_dp_size(
     dp_size: int,
     *,
@@ -139,7 +162,23 @@ class MLPSyncBatchInfo:
             self.dp_size, self.tp_size * self.cp_size, info_width
         ).contiguous()
 
-        if use_all_reduce:
+        npu_ft_active_ranks = _get_npu_ft_active_ranks()
+        if npu_ft_active_ranks is not None:
+            if self.tp_size != 1 or self.cp_size != 1:
+                raise RuntimeError(
+                    "NPU MC2 metadata rendezvous requires attention TP=CP=1"
+                )
+            from sglang.srt.fault_tolerance.npu_metadata import (
+                get_npu_ft_metadata_group,
+            )
+
+            survivor_process_groups = get_npu_ft_metadata_group()
+            gathered = survivor_process_groups.all_gather_tensor(local_info_tensor)
+            for original_rank, rank_info in gathered.items():
+                global_info_tensor[original_rank, 0].copy_(
+                    rank_info.to(device=global_info_tensor.device)
+                )
+        elif use_all_reduce:
             # Admission can expose different WORLD sizes; use fixed global slots.
             global_info_tensor.zero_()
             flat_info = global_info_tensor.view(-1, info_width)

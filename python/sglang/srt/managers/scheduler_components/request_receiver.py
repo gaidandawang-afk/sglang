@@ -18,6 +18,7 @@ from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    FaultToleranceCommandReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
@@ -172,28 +173,53 @@ class SchedulerRequestReceiver:
                 or self.server_args.is_ep_scale_joiner
                 or self.server_args.enable_fault_tolerance
             )
-            if _local_ctrl:
-                if self.ps.attn_tp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_tp_group.rank,
-                        self.attn_tp_cpu_group,
-                        src=self.attn_tp_group.ranks[0],
-                    )
-                if self.ps.attn_cp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_cp_group.rank,
-                        self.attn_cp_cpu_group,
-                        src=self.attn_cp_group.ranks[0],
-                    )
-            elif self.ps.tp_size != 1:
-                control_reqs = broadcast_pyobj(
-                    control_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
+            use_rebuilt_npu_ft_control_group = False
+            if (
+                self.server_args.enable_fault_tolerance
+                and self.server_args.elastic_ep_backend == "mc2"
+                and control_reqs
+                and not any(
+                    isinstance(req, FaultToleranceCommandReqInput)
+                    for req in control_reqs
                 )
+            ):
+                from sglang.srt.fault_tolerance.npu_metadata import (
+                    get_npu_ft_metadata_group,
+                )
+
+                survivor_process_groups = get_npu_ft_metadata_group()
+                if survivor_process_groups.is_rebuilt:
+                    # DPC fan-out ensures every survivor enters this operation.
+                    # Rank-fault commands bypass it because those commands are
+                    # responsible for replacing a possibly poisoned generation.
+                    control_reqs = survivor_process_groups.broadcast_control(
+                        control_reqs
+                    )
+                    use_rebuilt_npu_ft_control_group = True
+
+            if not use_rebuilt_npu_ft_control_group:
+                if _local_ctrl:
+                    if self.ps.attn_tp_size != 1:
+                        control_reqs = broadcast_pyobj(
+                            control_reqs,
+                            self.attn_tp_group.rank,
+                            self.attn_tp_cpu_group,
+                            src=self.attn_tp_group.ranks[0],
+                        )
+                    if self.ps.attn_cp_size != 1:
+                        control_reqs = broadcast_pyobj(
+                            control_reqs,
+                            self.attn_cp_group.rank,
+                            self.attn_cp_cpu_group,
+                            src=self.attn_cp_group.ranks[0],
+                        )
+                elif self.ps.tp_size != 1:
+                    control_reqs = broadcast_pyobj(
+                        control_reqs,
+                        self.tp_group.rank,
+                        self.tp_cpu_group,
+                        src=self.tp_group.ranks[0],
+                    )
             recv_reqs = work_reqs + control_reqs
         elif self.ps.tp_size != 1:
             recv_reqs = broadcast_pyobj(

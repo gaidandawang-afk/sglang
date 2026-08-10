@@ -38,14 +38,9 @@ _FT_SUPPORT_GATES = [
     ),
     (lambda a: getattr(a, "pp_size", 1) == 1, "ft_requires_pp1"),
     (
-        lambda a: getattr(a, "elastic_ep_backend", None) == "mooncake",
-        "ft_requires_mooncake_active_rank_backend",
-    ),
-    (
         lambda a: getattr(a, "disaggregation_mode", "null") == "null",
         "ft_unsupported_with_pd",
     ),
-    (lambda a: getattr(a, "device", None) != "npu", "ft_unsupported_with_npu"),
     (
         lambda a: getattr(a, "tokenizer_worker_num", 1) <= 1,
         "ft_unsupported_with_multi_tokenizer",
@@ -54,11 +49,57 @@ _FT_SUPPORT_GATES = [
     (_dp_attention_gate, "ft_requires_tp_divisible_by_dp_and_attn_cp"),
 ]
 
+_NPU_FT_SUPPORT_GATES = [
+    (
+        lambda a: getattr(a, "elastic_ep_backend", None) == "mc2",
+        "ft_npu_requires_mc2_active_rank_backend",
+    ),
+    (lambda a: getattr(a, "nnodes", 1) == 1, "ft_npu_requires_single_node"),
+    (
+        lambda a: getattr(a, "moe_a2a_backend", None) == "deepep",
+        "ft_npu_requires_deepep",
+    ),
+    (
+        lambda a: getattr(a, "deepep_mode", None) == "low_latency",
+        "ft_npu_requires_deepep_low_latency",
+    ),
+    (
+        lambda a: getattr(a, "fault_tolerance_on_error_strategy", "pause")
+        == "pause",
+        "ft_npu_requires_pause_strategy",
+    ),
+    (
+        lambda a: getattr(a, "enable_dp_lm_head", False),
+        "ft_npu_requires_dp_lm_head",
+    ),
+    (
+        lambda a: getattr(a, "attn_cp_size", 1) == 1,
+        "ft_npu_requires_attn_cp1",
+    ),
+    (
+        lambda a: getattr(a, "moe_dp_size", 1) == 1,
+        "ft_npu_requires_moe_dp1",
+    ),
+    (
+        lambda a: getattr(a, "ep_size", 1)
+        == getattr(a, "tp_size", 1)
+        == getattr(a, "dp_size", 1),
+        "ft_npu_requires_tp_dp_ep_equal",
+    ),
+]
+
 
 def is_ft_supported_config(server_args) -> Tuple[bool, str]:
     for supported, error in _FT_SUPPORT_GATES:
         if not supported(server_args):
             return False, error
+
+    if getattr(server_args, "device", None) == "npu":
+        for supported, error in _NPU_FT_SUPPORT_GATES:
+            if not supported(server_args):
+                return False, error
+    elif getattr(server_args, "elastic_ep_backend", None) != "mooncake":
+        return False, "ft_requires_mooncake_active_rank_backend"
     return True, ""
 
 

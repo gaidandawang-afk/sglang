@@ -1095,6 +1095,28 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
+    @classmethod
+    def generate_weight_name_filter(
+        cls, logical_experts_map: Dict[int, List[int]]
+    ):
+        """Select only missing routed-expert checkpoint tensors for FT reload."""
+
+        import re
+
+        pattern = re.compile(r"layers\.(\d+)\.mlp\.experts\.(\d+)\.")
+
+        def weight_name_filter(name: str) -> bool:
+            match = pattern.search(name)
+            if match is None:
+                return False
+            layer_id, expert_id = (int(value) for value in match.groups())
+            return (
+                layer_id in logical_experts_map
+                and expert_id in logical_experts_map[layer_id]
+            )
+
+        return weight_name_filter
+
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):

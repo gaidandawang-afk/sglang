@@ -647,6 +647,22 @@ class Scheduler(
             enable_scripted_runtime=envs.SGLANG_TEST_SCRIPTED_RUNTIME.get(),
         )
 
+        if (
+            is_rank_zero
+            and self.server_args.enable_fault_tolerance
+            and self.server_args.elastic_ep_backend == "mc2"
+        ):
+            from sglang.srt.fault_tolerance.npu_metadata import (
+                init_npu_ft_metadata_group,
+            )
+
+            init_npu_ft_metadata_group(
+                port_args.fault_tolerance_metadata_ipc_name,
+                original_rank=self.ps.dp_rank,
+                original_world_size=self.server_args.dp_size,
+                timeout_sec=self.server_args.fault_tolerance_timeout,
+            )
+
         self.load_snapshot_writer = None
         if not is_rank_zero:
             return

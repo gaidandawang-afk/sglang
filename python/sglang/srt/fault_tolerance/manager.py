@@ -154,6 +154,8 @@ class FaultToleranceManager:
         return 200, st.finish_scale_down(requested)
 
     async def _apply_recover(self, ranks: List[int], timeout: int) -> tuple[int, dict]:
+        if getattr(self.server_args, "elastic_ep_backend", None) == "mc2":
+            return 400, ft_failure("recover_unsupported_with_npu_mc2")
         st = self.state
         requested = set(ranks)
         if not requested or any(st.expected_dp_mask[rank] for rank in requested):

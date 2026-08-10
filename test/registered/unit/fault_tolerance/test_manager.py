@@ -12,15 +12,21 @@ from sglang.srt.managers.io_struct import (
     ProcessActiveRanksOutput,
     WatchdogHeartbeatOutput,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def make_manager(*, dp_size=2, ranks_per_dp=1, strategy="pause"):
+def make_manager(
+    *, dp_size=2, ranks_per_dp=1, strategy="pause", elastic_ep_backend=None
+):
     manager = FaultToleranceManager(
         server_args=SimpleNamespace(
             dp_size=dp_size,
             tp_size=dp_size * ranks_per_dp,
             fault_tolerance_on_error_strategy=strategy,
             fault_tolerance_timeout=1,
+            elastic_ep_backend=elastic_ep_backend,
         ),
         send_to_scheduler=AsyncMock(),
         send_to_dpc=AsyncMock(),
@@ -134,6 +140,18 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(response["ranks"][1]["state"], "healthy")
         manager._send_command_collect.assert_not_awaited()
+
+    async def test_npu_mc2_rejects_recover_without_graph_recapture(self):
+        manager = make_manager(elastic_ep_backend="mc2")
+        manager.state.expected_dp_mask[1] = False
+        manager.state.disabled_dp_ranks.add(1)
+
+        status, response = await manager.apply(
+            {"instruction": "recover", "params": {"ranks": [1]}}
+        )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(response["message"], "recover_unsupported_with_npu_mc2")
 
     async def test_process_up_alone_does_not_enable_rejoined_dp(self):
         manager = make_manager()

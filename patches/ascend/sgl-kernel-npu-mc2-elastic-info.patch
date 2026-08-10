@@ -1,0 +1,389 @@
+diff --git a/csrc/deepep/deep_ep.cpp b/csrc/deepep/deep_ep.cpp
+index 2565971..10823fb 100644
+--- a/csrc/deepep/deep_ep.cpp
++++ b/csrc/deepep/deep_ep.cpp
+@@ -810,7 +810,8 @@ std::tuple<at::Tensor, std::optional<at::Tensor>, at::Tensor, at::Tensor, at::Te
+ Buffer::low_latency_dispatch(const at::Tensor &x, const at::Tensor &topk_idx,
+                              const std::optional<at::Tensor> &cumulative_local_expert_recv_stats,
+                              int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts, bool use_fp8,
+-                             bool round_scale, bool use_ue8m0, bool async, bool return_recv_hook)
++                             bool round_scale, bool use_ue8m0, bool async, bool return_recv_hook,
++                             const std::optional<at::Tensor> &elastic_info)
+ {
+     EP_HOST_ASSERT(low_latency_mode);
+     EP_HOST_ASSERT(num_max_dispatch_tokens_per_rank >= x.size(0));
+@@ -898,6 +899,7 @@ Buffer::low_latency_dispatch(const at::Tensor &x, const at::Tensor &topk_idx,
+                  topk_idx,                // expertIds
+                  scales,                  // scalesOptional
+                  active_mask,             // xActiveMaskOptional
++                 elastic_info,            // elasticInfoOptional
+                  hcom_ep_name,            // groupEp
+                  num_ranks,               // epWorldSize
+                  rank,                    // epRankId
+@@ -928,7 +930,7 @@ std::tuple<at::Tensor, std::optional<EventHandle>, std::optional<std::function<v
+     const at::Tensor &x, const at::Tensor &topk_idx, const at::Tensor &topk_weights, const at::Tensor &src_info,
+     const at::Tensor &layout_range, int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts,
+     const at::Tensor &packed_recv_count, bool zero_copy, bool async, bool return_recv_hook,
+-    const std::optional<at::Tensor> &out)
++    const std::optional<at::Tensor> &out, const std::optional<at::Tensor> &elastic_info)
+ {
+     // Tensor checks
+     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous() and x.scalar_type() == at::kBFloat16);
+@@ -992,7 +994,7 @@ std::tuple<at::Tensor, std::optional<EventHandle>, std::optional<std::function<v
+     }
+     EXEC_NPU_CMD(aclnnMoeLowLatencyCombineV2, expand_x, expert_ids, expand_idx, ep_send_counts, expert_scales,
+                  tp_send_counts, x_active_mask, activation_scale, weight_scale, group_list, expand_scales,
+-                 shared_expert_x, hcom_ep_name, num_ranks, rank, num_experts, hcom_tp_name, tp_world_size, tp_rankId,
++                 shared_expert_x, elastic_info, hcom_ep_name, num_ranks, rank, num_experts, hcom_tp_name, tp_world_size, tp_rankId,
+                  expert_shared_type, shared_expert_num, shared_expert_rank_num, global_bs, out_dtype, comm_quant_mode,
+                  group_list_type, comm_alg, combined_x, combine_send_cost_stats_out);
+ 
+diff --git a/csrc/deepep/deep_ep.hpp b/csrc/deepep/deep_ep.hpp
+index 30d94a9..c2274ec 100644
+--- a/csrc/deepep/deep_ep.hpp
++++ b/csrc/deepep/deep_ep.hpp
+@@ -114,13 +114,14 @@ public:
+     low_latency_dispatch(const at::Tensor &x, const at::Tensor &topk_idx,
+                          const std::optional<at::Tensor> &cumulative_local_expert_recv_stats,
+                          int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts, bool use_fp8, bool round_scale,
+-                         bool use_ue8m0, bool async, bool return_recv_hook);
++                         bool use_ue8m0, bool async, bool return_recv_hook,
++                         const std::optional<at::Tensor> &elastic_info);
+ 
+     std::tuple<at::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>> low_latency_combine(
+         const at::Tensor &x, const at::Tensor &topk_idx, const at::Tensor &topk_weights, const at::Tensor &src_info,
+         const at::Tensor &layout_range, int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts,
+         const at::Tensor &packed_recv_count, bool zero_copy, bool async, bool return_recv_hook,
+-        const std::optional<at::Tensor> &out);
++        const std::optional<at::Tensor> &out, const std::optional<at::Tensor> &elastic_info);
+ 
+     std::vector<at::Tensor> fused_deep_moe(const at::Tensor &x, const at::Tensor &expertIds,
+                                            const at::Tensor &gmm1PermutedWeight,
+diff --git a/csrc/deepep/ops/op_host/op_api/aclnn_moe_distribute_combine_v2.cpp b/csrc/deepep/ops/op_host/op_api/aclnn_moe_distribute_combine_v2.cpp
+index 1cb5fa6..ec37a50 100644
+--- a/csrc/deepep/ops/op_host/op_api/aclnn_moe_distribute_combine_v2.cpp
++++ b/csrc/deepep/ops/op_host/op_api/aclnn_moe_distribute_combine_v2.cpp
+@@ -38,7 +38,8 @@ aclnnStatus aclnnMoeLowLatencyCombineV2GetWorkspaceSize(
+     const aclTensor *epSendCounts, const aclTensor *expertScales, const aclTensor *tpSendCountsOptional,
+     const aclTensor *xActiveMaskOptional, const aclTensor *activationScaleOptional,
+     const aclTensor *weightScaleOptional, const aclTensor *groupListOptional, const aclTensor *expandScalesOptional,
+-    const aclTensor *sharedExpertXOptional, char *groupEp, int64_t epWorldSize, int64_t epRankId, int64_t moeExpertNum,
++    const aclTensor *sharedExpertXOptional, const aclTensor *elasticInfoOptional, char *groupEp, int64_t epWorldSize,
++    int64_t epRankId, int64_t moeExpertNum,
+     char *groupTp, int64_t tpWorldSize, int64_t tpRankId, int64_t expertShardType, int64_t sharedExpertNum,
+     int64_t sharedExpertRankNum, int64_t globalBs, int64_t outDtype, int64_t commQuantMode, int64_t groupListType,
+     char *commAlg, const aclTensor *xOut, const aclTensor *sendCostStats, uint64_t *workspaceSize,
+@@ -47,7 +48,7 @@ aclnnStatus aclnnMoeLowLatencyCombineV2GetWorkspaceSize(
+     aclnnStatus getWorkspaceSizesRes = aclnnInnerMoeLowLatencyCombineV2GetWorkspaceSize(
+         expandX, expertIds, assistInfoForCombine, epSendCounts, expertScales, tpSendCountsOptional, xActiveMaskOptional,
+         activationScaleOptional, weightScaleOptional, groupListOptional, expandScalesOptional, sharedExpertXOptional,
+-        nullptr, nullptr, nullptr, nullptr, nullptr, groupEp, epWorldSize, epRankId, moeExpertNum, groupTp, tpWorldSize,
++        elasticInfoOptional, nullptr, nullptr, nullptr, nullptr, groupEp, epWorldSize, epRankId, moeExpertNum, groupTp, tpWorldSize,
+         tpRankId, expertShardType, sharedExpertNum, sharedExpertRankNum, globalBs, outDtype, commQuantMode,
+         groupListType, commAlg, 0, 0, 0, xOut, sendCostStats, workspaceSize, executor);
+ 
+diff --git a/csrc/deepep/ops/op_host/op_api/aclnn_moe_distribute_combine_v2.h b/csrc/deepep/ops/op_host/op_api/aclnn_moe_distribute_combine_v2.h
+index 096da92..9123b94 100644
+--- a/csrc/deepep/ops/op_host/op_api/aclnn_moe_distribute_combine_v2.h
++++ b/csrc/deepep/ops/op_host/op_api/aclnn_moe_distribute_combine_v2.h
+@@ -55,7 +55,8 @@ __attribute__((visibility("default"))) aclnnStatus aclnnMoeLowLatencyCombineV2Ge
+     const aclTensor *epSendCounts, const aclTensor *expertScales, const aclTensor *tpSendCountsOptional,
+     const aclTensor *xActiveMaskOptional, const aclTensor *activationScaleOptional,
+     const aclTensor *weightScaleOptional, const aclTensor *groupListOptional, const aclTensor *expandScalesOptional,
+-    const aclTensor *sharedExpertXOptional, char *groupEp, int64_t epWorldSize, int64_t epRankId, int64_t moeExpertNum,
++    const aclTensor *sharedExpertXOptional, const aclTensor *elasticInfoOptional, char *groupEp, int64_t epWorldSize,
++    int64_t epRankId, int64_t moeExpertNum,
+     char *groupTp, int64_t tpWorldSize, int64_t tpRankId, int64_t expertShardType, int64_t sharedExpertNum,
+     int64_t sharedExpertRankNum, int64_t globalBs, int64_t outDtype, int64_t commQuantMode, int64_t groupListType,
+     char *commAlg, const aclTensor *xOut, const aclTensor *sendCostStats, uint64_t *workspaceSize,
+diff --git a/csrc/deepep/ops/op_host/op_api/aclnn_moe_distribute_dispatch_v2.cpp b/csrc/deepep/ops/op_host/op_api/aclnn_moe_distribute_dispatch_v2.cpp
+index 380f4eb..2d9c84e 100644
+--- a/csrc/deepep/ops/op_host/op_api/aclnn_moe_distribute_dispatch_v2.cpp
++++ b/csrc/deepep/ops/op_host/op_api/aclnn_moe_distribute_dispatch_v2.cpp
+@@ -31,7 +31,8 @@ extern "C" void __attribute__((weak)) NnopbaseSetHcclServerType(void *executor,
+ 
+ aclnnStatus aclnnMoeLowLatencyDispatchV2GetWorkspaceSize(
+     const aclTensor *x, const aclTensor *expertIds, const aclTensor *scalesOptional,
+-    const aclTensor *xActiveMaskOptional, char *groupEp, int64_t epWorldSize, int64_t epRankId, int64_t moeExpertNum,
++    const aclTensor *xActiveMaskOptional, const aclTensor *elasticInfoOptional, char *groupEp, int64_t epWorldSize,
++    int64_t epRankId, int64_t moeExpertNum,
+     char *groupTp, int64_t tpWorldSize, int64_t tpRankId, int64_t expertShardType, int64_t sharedExpertNum,
+     int64_t sharedExpertRankNum, int64_t quantMode, int64_t globalBs, int64_t expertTokenNumsType, char *commAlg,
+     const aclTensor *expandXOut, const aclTensor *dynamicScalesOut, const aclTensor *assistInfoForCombineOut,
+@@ -39,7 +40,7 @@ aclnnStatus aclnnMoeLowLatencyDispatchV2GetWorkspaceSize(
+     uint64_t *workspaceSize, aclOpExecutor **executor)
+ {
+     aclnnStatus getWorkspaceSizesRes = aclnnInnerMoeLowLatencyDispatchV2GetWorkspaceSize(
+-        x, expertIds, scalesOptional, xActiveMaskOptional, nullptr, groupEp, epWorldSize, epRankId, moeExpertNum,
++        x, expertIds, scalesOptional, xActiveMaskOptional, elasticInfoOptional, groupEp, epWorldSize, epRankId, moeExpertNum,
+         groupTp, tpWorldSize, tpRankId, expertShardType, sharedExpertNum, sharedExpertRankNum, quantMode, globalBs,
+         expertTokenNumsType, commAlg, 0, 0, 0, expandXOut, dynamicScalesOut, assistInfoForCombineOut,
+         expertTokenNumsOut, epRecvCountsOut, tpRecvCountsOut, workspaceSize, executor);
+diff --git a/csrc/deepep/ops/op_host/op_api/aclnn_moe_distribute_dispatch_v2.h b/csrc/deepep/ops/op_host/op_api/aclnn_moe_distribute_dispatch_v2.h
+index 93d5115..b6263eb 100644
+--- a/csrc/deepep/ops/op_host/op_api/aclnn_moe_distribute_dispatch_v2.h
++++ b/csrc/deepep/ops/op_host/op_api/aclnn_moe_distribute_dispatch_v2.h
+@@ -50,7 +50,8 @@ extern "C" {
+  */
+ __attribute__((visibility("default"))) aclnnStatus aclnnMoeLowLatencyDispatchV2GetWorkspaceSize(
+     const aclTensor *x, const aclTensor *expertIds, const aclTensor *scalesOptional,
+-    const aclTensor *xActiveMaskOptional, char *groupEp, int64_t epWorldSize, int64_t epRankId, int64_t moeExpertNum,
++    const aclTensor *xActiveMaskOptional, const aclTensor *elasticInfoOptional, char *groupEp, int64_t epWorldSize,
++    int64_t epRankId, int64_t moeExpertNum,
+     char *groupTp, int64_t tpWorldSize, int64_t tpRankId, int64_t expertShardType, int64_t sharedExpertNum,
+     int64_t sharedExpertRankNum, int64_t quantMode, int64_t globalBs, int64_t expertTokenNumsType, char *commAlg,
+     const aclTensor *expandXOut, const aclTensor *dynamicScalesOut, const aclTensor *assistInfoForCombineOut,
+diff --git a/csrc/deepep/ops2/op_host/op_api/aclnn_moe_distribute_combine_v2.cpp b/csrc/deepep/ops2/op_host/op_api/aclnn_moe_distribute_combine_v2.cpp
+index fb4f848..36842c6 100644
+--- a/csrc/deepep/ops2/op_host/op_api/aclnn_moe_distribute_combine_v2.cpp
++++ b/csrc/deepep/ops2/op_host/op_api/aclnn_moe_distribute_combine_v2.cpp
+@@ -38,7 +38,8 @@ aclnnStatus aclnnMoeLowLatencyCombineV2GetWorkspaceSize(
+     const aclTensor *epSendCounts, const aclTensor *expertScales, const aclTensor *tpSendCountsOptional,
+     const aclTensor *xActiveMaskOptional, const aclTensor *activationScaleOptional,
+     const aclTensor *weightScaleOptional, const aclTensor *groupListOptional, const aclTensor *expandScalesOptional,
+-    const aclTensor *sharedExpertXOptional, char *groupEp, int64_t epWorldSize, int64_t epRankId, int64_t moeExpertNum,
++    const aclTensor *sharedExpertXOptional, const aclTensor *elasticInfoOptional, char *groupEp, int64_t epWorldSize,
++    int64_t epRankId, int64_t moeExpertNum,
+     char *groupTp, int64_t tpWorldSize, int64_t tpRankId, int64_t expertShardType, int64_t sharedExpertNum,
+     int64_t sharedExpertRankNum, int64_t globalBs, int64_t outDtype, int64_t commQuantMode, int64_t groupListType,
+     char *commAlg, aclTensor *xOut, const aclTensor *sendCostStats, uint64_t *workspaceSize, aclOpExecutor **executor)
+@@ -46,7 +47,7 @@ aclnnStatus aclnnMoeLowLatencyCombineV2GetWorkspaceSize(
+     return aclnnInnerMoeLowLatencyCombineV2GetWorkspaceSize(
+         expandX, expertIds, assistInfoForCombine, epSendCounts, expertScales, tpSendCountsOptional, xActiveMaskOptional,
+         activationScaleOptional, weightScaleOptional, groupListOptional, expandScalesOptional, sharedExpertXOptional,
+-        nullptr, nullptr, nullptr, nullptr, nullptr, groupEp, epWorldSize, epRankId, moeExpertNum, groupTp, tpWorldSize,
++        elasticInfoOptional, nullptr, nullptr, nullptr, nullptr, groupEp, epWorldSize, epRankId, moeExpertNum, groupTp, tpWorldSize,
+         tpRankId, expertShardType, sharedExpertNum, sharedExpertRankNum, globalBs, outDtype, commQuantMode,
+         groupListType, commAlg, 0, 0, 0, xOut, sendCostStats, workspaceSize, executor);
+ }
+diff --git a/csrc/deepep/ops2/op_host/op_api/aclnn_moe_distribute_combine_v2.h b/csrc/deepep/ops2/op_host/op_api/aclnn_moe_distribute_combine_v2.h
+index 4b622bc..c9d45ad 100644
+--- a/csrc/deepep/ops2/op_host/op_api/aclnn_moe_distribute_combine_v2.h
++++ b/csrc/deepep/ops2/op_host/op_api/aclnn_moe_distribute_combine_v2.h
+@@ -70,7 +70,8 @@ __attribute__((visibility("default"))) aclnnStatus aclnnMoeLowLatencyCombineV2Ge
+     const aclTensor *epSendCounts, const aclTensor *expertScales, const aclTensor *tpSendCountsOptional,
+     const aclTensor *xActiveMaskOptional, const aclTensor *activationScaleOptional,
+     const aclTensor *weightScaleOptional, const aclTensor *groupListOptional, const aclTensor *expandScalesOptional,
+-    const aclTensor *sharedExpertXOptional, char *groupEp, int64_t epWorldSize, int64_t epRankId, int64_t moeExpertNum,
++    const aclTensor *sharedExpertXOptional, const aclTensor *elasticInfoOptional, char *groupEp, int64_t epWorldSize,
++    int64_t epRankId, int64_t moeExpertNum,
+     char *groupTp, int64_t tpWorldSize, int64_t tpRankId, int64_t expertShardType, int64_t sharedExpertNum,
+     int64_t sharedExpertRankNum, int64_t globalBs, int64_t outDtype, int64_t commQuantMode, int64_t groupListType,
+     char *commAlg, aclTensor *xOut, const aclTensor *sendCostStats, uint64_t *workspaceSize, aclOpExecutor **executor);
+diff --git a/csrc/deepep/ops2/op_host/op_api/aclnn_moe_distribute_dispatch_v2.cpp b/csrc/deepep/ops2/op_host/op_api/aclnn_moe_distribute_dispatch_v2.cpp
+index 3a4d4e2..c8045de 100644
+--- a/csrc/deepep/ops2/op_host/op_api/aclnn_moe_distribute_dispatch_v2.cpp
++++ b/csrc/deepep/ops2/op_host/op_api/aclnn_moe_distribute_dispatch_v2.cpp
+@@ -35,7 +35,8 @@ extern "C" void __attribute__((weak)) NnopbaseSetHcclServerType(void *executor,
+ 
+ aclnnStatus aclnnMoeLowLatencyDispatchV2GetWorkspaceSize(
+     const aclTensor *x, const aclTensor *expertIds, const aclTensor *scalesOptional,
+-    const aclTensor *xActiveMaskOptional, char *groupEp, int64_t epWorldSize, int64_t epRankId, int64_t moeExpertNum,
++    const aclTensor *xActiveMaskOptional, const aclTensor *elasticInfoOptional, char *groupEp, int64_t epWorldSize,
++    int64_t epRankId, int64_t moeExpertNum,
+     char *groupTp, int64_t tpWorldSize, int64_t tpRankId, int64_t expertShardType, int64_t sharedExpertNum,
+     int64_t sharedExpertRankNum, int64_t quantMode, int64_t globalBs, int64_t expertTokenNumsType, char *commAlg,
+     aclTensor *expandXOut, aclTensor *dynamicScalesOut, aclTensor *assistInfoForCombineOut,
+@@ -43,7 +44,7 @@ aclnnStatus aclnnMoeLowLatencyDispatchV2GetWorkspaceSize(
+     aclOpExecutor **executor)
+ {
+     return aclnnInnerMoeLowLatencyDispatchV2GetWorkspaceSize(
+-        x, expertIds, scalesOptional, xActiveMaskOptional, nullptr, groupEp, epWorldSize, epRankId, moeExpertNum, "",
++        x, expertIds, scalesOptional, xActiveMaskOptional, elasticInfoOptional, groupEp, epWorldSize, epRankId, moeExpertNum, "",
+         tpWorldSize, tpRankId, expertShardType, sharedExpertNum, sharedExpertRankNum, quantMode, globalBs,
+         expertTokenNumsType, commAlg, 0, 0, 0, expandXOut, dynamicScalesOut, assistInfoForCombineOut,
+         expertTokenNumsOut, epRecvCountsOut, tpRecvCountsOut, workspaceSize, executor);
+diff --git a/csrc/deepep/ops2/op_host/op_api/aclnn_moe_distribute_dispatch_v2.h b/csrc/deepep/ops2/op_host/op_api/aclnn_moe_distribute_dispatch_v2.h
+index 7131541..98b16a7 100644
+--- a/csrc/deepep/ops2/op_host/op_api/aclnn_moe_distribute_dispatch_v2.h
++++ b/csrc/deepep/ops2/op_host/op_api/aclnn_moe_distribute_dispatch_v2.h
+@@ -65,7 +65,8 @@ extern "C" {
+  */
+ __attribute__((visibility("default"))) aclnnStatus aclnnMoeLowLatencyDispatchV2GetWorkspaceSize(
+     const aclTensor *x, const aclTensor *expertIds, const aclTensor *scalesOptional,
+-    const aclTensor *xActiveMaskOptional, char *groupEp, int64_t epWorldSize, int64_t epRankId, int64_t moeExpertNum,
++    const aclTensor *xActiveMaskOptional, const aclTensor *elasticInfoOptional, char *groupEp, int64_t epWorldSize,
++    int64_t epRankId, int64_t moeExpertNum,
+     char *groupTp, int64_t tpWorldSize, int64_t tpRankId, int64_t expertShardType, int64_t sharedExpertNum,
+     int64_t sharedExpertRankNum, int64_t quantMode, int64_t globalBs, int64_t expertTokenNumsType, char *commAlg,
+     aclTensor *expandXOut, aclTensor *dynamicScalesOut, aclTensor *assistInfoForCombineOut,
+diff --git a/python/deep_ep/deep_ep/buffer.py b/python/deep_ep/deep_ep/buffer.py
+index d355c9c..bacbb8d 100644
+--- a/python/deep_ep/deep_ep/buffer.py
++++ b/python/deep_ep/deep_ep/buffer.py
+@@ -661,6 +661,7 @@ class Buffer:
+         async_finish: bool = False,
+         return_recv_hook: bool = False,
+         topk_weights: Optional[torch.Tensor] = None,
++        elastic_info: Optional[torch.Tensor] = None,
+     ) -> Tuple[
+         Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable
+     ]:
+@@ -719,6 +720,7 @@ class Buffer:
+             async_finish=async_finish,
+             return_recv_hook=return_recv_hook,
+             topk_weights=topk_weights,
++            elastic_info=elastic_info,
+         )
+ 
+     @log_parameters(["topk_idx"])
+@@ -732,6 +734,7 @@ class Buffer:
+         async_finish: bool = False,
+         return_recv_hook: bool = False,
+         out: Optional[torch.Tensor] = None,
++        elastic_info: Optional[torch.Tensor] = None,
+     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
+         """
+         A low-latency implementation for combine.
+@@ -768,6 +771,7 @@ class Buffer:
+             async_finish=async_finish,
+             return_recv_hook=return_recv_hook,
+             out=out,
++            elastic_info=elastic_info,
+         )
+ 
+     def fused_deep_moe(
+diff --git a/python/deep_ep/deep_ep/ep_strategy.py b/python/deep_ep/deep_ep/ep_strategy.py
+index 62090c4..fb37ca8 100644
+--- a/python/deep_ep/deep_ep/ep_strategy.py
++++ b/python/deep_ep/deep_ep/ep_strategy.py
+@@ -185,6 +185,7 @@ class LowLatencyEPCommStrategy(EPCommStrategy):
+         async_finish: bool,
+         return_recv_hook: bool,
+         topk_weights: Optional[torch.Tensor],
++        elastic_info: Optional[torch.Tensor],
+     ) -> Tuple[
+         Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
+         torch.Tensor,
+@@ -206,6 +207,7 @@ class LowLatencyEPCommStrategy(EPCommStrategy):
+         async_finish: bool,
+         return_recv_hook: bool,
+         out: Optional[torch.Tensor],
++        elastic_info: Optional[torch.Tensor],
+     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
+         """LowLatency combine"""
+         pass
+diff --git a/python/deep_ep/deep_ep/strategies/low_latency_strategy.py b/python/deep_ep/deep_ep/strategies/low_latency_strategy.py
+index 80d44d3..00498df 100644
+--- a/python/deep_ep/deep_ep/strategies/low_latency_strategy.py
++++ b/python/deep_ep/deep_ep/strategies/low_latency_strategy.py
+@@ -45,6 +45,7 @@ class DefaultLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+         async_finish: bool = False,
+         return_recv_hook: bool = False,
+         topk_weights: Optional[torch.Tensor] = None,
++        elastic_info: Optional[torch.Tensor] = None,
+     ) -> Tuple[
+         Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
+         torch.Tensor,
+@@ -73,6 +74,7 @@ class DefaultLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+             use_ue8m0,
+             async_finish,
+             return_recv_hook,
++            elastic_info,
+         )
+ 
+         handle = (
+@@ -114,6 +116,7 @@ class DefaultLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+         async_finish: bool = False,
+         return_recv_hook: bool = False,
+         out: Optional[torch.Tensor] = None,
++        elastic_info: Optional[torch.Tensor] = None,
+     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
+         topk_ids = topk_idx.int()
+ 
+@@ -140,6 +143,7 @@ class DefaultLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+             async_finish,
+             return_recv_hook,
+             out,
++            elastic_info,
+         )
+ 
+         tensors_to_record = (
+@@ -195,6 +199,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+         async_finish: bool = False,
+         return_recv_hook: bool = False,
+         topk_weights: Optional[torch.Tensor] = None,
++        elastic_info: Optional[torch.Tensor] = None,
+     ) -> Tuple[
+         Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
+         torch.Tensor,
+@@ -253,6 +258,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+             topk_weights=weight_padding,
+             x_active_mask=x_active_mask,
+             num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
++            elastic_info=elastic_info,
+         )
+ 
+         handle = (
+@@ -289,6 +295,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+         async_finish: bool = False,
+         return_recv_hook: bool = False,
+         out: Optional[torch.Tensor] = None,
++        elastic_info: Optional[torch.Tensor] = None,
+     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
+ 
+         topk_ids = topk_idx.int()
+@@ -317,6 +324,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+             expand_scales=expand_scales,
+             x_active_mask=x_active_mask,
+             num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
++            elastic_info=elastic_info,
+         )
+ 
+         event = EventOverlap(EventHandle())
+@@ -339,6 +347,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+         shared_expert_num=0,
+         shared_expert_rank_num=0,
+         num_max_dispatch_tokens_per_rank=0,
++        elastic_info=None,
+     ):
+ 
+         shared_expert_rank_num = int(os.getenv("MOE_SHARED_EXPERT_RANK_NUM", 0))
+@@ -365,6 +374,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+             moe_expert_num=num_experts,
+             scales=x_smooth_scale,
+             x_active_mask=x_active_mask,
++            elastic_info=elastic_info,
+             expert_scales=topk_weights,
+             performance_info=None,
+             expert_shard_type=expert_shard_type,
+@@ -402,6 +412,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+         shared_expert_num=0,
+         shared_expert_rank_num=0,
+         num_max_dispatch_tokens_per_rank=0,
++        elastic_info=None,
+     ):
+ 
+         shared_expert_rank_num = int(os.getenv("MOE_SHARED_EXPERT_RANK_NUM", 0))
+@@ -424,6 +435,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+             x_active_mask=x_active_mask,
+             expand_scales=expand_scales,
+             shared_expert_x=shared_expert_x,
++            elastic_info=elastic_info,
+             performance_info=None,
+             expert_shard_type=expert_shared_type,
+             shared_expert_num=shared_expert_num,
+@@ -464,7 +476,11 @@ class AllToAllLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+         async_finish=False,
+         return_recv_hook=False,
+         topk_weights: Optional[torch.Tensor] = None,
++        elastic_info: Optional[torch.Tensor] = None,
+     ):
++        if elastic_info is not None:
++            raise RuntimeError("MC2 elastic_info requires the default or ops strategy")
++
+         group = buffer.group
+         group_size = buffer.group_size
+         num_local_experts = num_experts // group_size
+@@ -562,7 +578,11 @@ class AllToAllLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+         async_finish=False,
+         return_recv_hook=False,
+         out=None,
++        elastic_info: Optional[torch.Tensor] = None,
+     ):
++        if elastic_info is not None:
++            raise RuntimeError("MC2 elastic_info requires the default or ops strategy")
++
+         expanded_row_idx = handle[0]
+         expert_capacity = handle[1]
+         hidden = handle[2]
