@@ -6,8 +6,8 @@ index 2565971..10823fb 100644
  Buffer::low_latency_dispatch(const at::Tensor &x, const at::Tensor &topk_idx,
                               const std::optional<at::Tensor> &cumulative_local_expert_recv_stats,
                               int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts, bool use_fp8,
--                             bool round_scale, bool use_ue8m0, bool async, bool return_recv_hook)
-+                             bool round_scale, bool use_ue8m0, bool async, bool return_recv_hook,
+-                             bool round_scale, bool use_ue8m0, bool use_mxfp4, bool async, bool return_recv_hook)
++                             bool round_scale, bool use_ue8m0, bool use_mxfp4, bool async, bool return_recv_hook,
 +                             const std::optional<at::Tensor> &elastic_info)
  {
      EP_HOST_ASSERT(low_latency_mode);
@@ -46,8 +46,8 @@ index 30d94a9..c2274ec 100644
      low_latency_dispatch(const at::Tensor &x, const at::Tensor &topk_idx,
                           const std::optional<at::Tensor> &cumulative_local_expert_recv_stats,
                           int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts, bool use_fp8, bool round_scale,
--                         bool use_ue8m0, bool async, bool return_recv_hook);
-+                         bool use_ue8m0, bool async, bool return_recv_hook,
+-                         bool use_ue8m0, bool use_mxfp4, bool async, bool return_recv_hook);
++                         bool use_ue8m0, bool use_mxfp4, bool async, bool return_recv_hook,
 +                         const std::optional<at::Tensor> &elastic_info);
  
      std::tuple<at::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>> low_latency_combine(
@@ -275,8 +275,9 @@ index 80d44d3..00498df 100644
      ) -> Tuple[
          Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
          torch.Tensor,
-@@ -73,6 +74,7 @@ class DefaultLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+@@ -75,7 +76,8 @@ class DefaultLowLatencyCommStrategy(LowLatencyEPCommStrategy):
              use_ue8m0,
+             use_mxfp4,
              async_finish,
              return_recv_hook,
 +            elastic_info,
