@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Callable, List
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch.cuda
 from torch import nn
@@ -89,7 +89,12 @@ class EPLBManager:
 
             yield from self.rebalance()
 
-    def rebalance(self, *, force: bool = False):
+    def rebalance(
+        self,
+        *,
+        force: bool = False,
+        logical_count_override: Optional[torch.Tensor] = None,
+    ):
         if self._rebalance_disabled_reason is not None:
             if not self._rebalance_disabled_logged:
                 logger.debug(
@@ -107,13 +112,17 @@ class EPLBManager:
             torch.get_device_module().synchronize()
             time_start = time.time()
 
-        dump_record_output = get_global_expert_distribution_recorder().dump_record(
-            output_mode="object"
-        )
-        logical_count = dump_record_output["logical_count"]
-        average_utilization_rate_over_window = dump_record_output[
-            "average_utilization_rate_over_window"
-        ]
+        if logical_count_override is None:
+            dump_record_output = get_global_expert_distribution_recorder().dump_record(
+                output_mode="object"
+            )
+            logical_count = dump_record_output["logical_count"]
+            average_utilization_rate_over_window = dump_record_output[
+                "average_utilization_rate_over_window"
+            ]
+        else:
+            logical_count = logical_count_override
+            average_utilization_rate_over_window = None
 
         # Check whether rebalancing is needed
         if not force and not self._check_rebalance_needed(
@@ -140,6 +149,16 @@ class EPLBManager:
         for chunk_layer_ids in update_layer_ids_chunks:
             if len(update_layer_ids_chunks) > 1:
                 yield
+            survivor_process_groups = None
+            if (
+                recovering_from_rank_fault
+                and self._server_args.elastic_ep_backend == "mc2"
+            ):
+                from sglang.srt.fault_tolerance.npu_metadata import (
+                    get_npu_ft_metadata_group,
+                )
+
+                survivor_process_groups = get_npu_ft_metadata_group()
             update_expert_location_with_recovery(
                 expert_location_updater=self._get_expert_location_updater(),
                 model=self._get_model(),
@@ -153,6 +172,7 @@ class EPLBManager:
                 init_lplb_solvers_callable=lambda: init_lplb_solvers(
                     model_config=self._model_config
                 ),
+                survivor_process_groups=survivor_process_groups,
             )
 
         self._log_rebalance_layout_after_update(update_layer_ids=all_update_layer_ids)
@@ -246,6 +266,7 @@ def update_expert_location_with_recovery(
     update_weights_from_disk_callable,
     ep_dispatch_algorithm: str,
     init_lplb_solvers_callable,
+    survivor_process_groups=None,
 ):
     p2p_missing_logical_experts = expert_location_updater.update(
         model.routed_experts_weights_of_layer,
@@ -253,6 +274,7 @@ def update_expert_location_with_recovery(
         update_layer_ids=update_layer_ids,
         nnodes=nnodes,
         rank=tp_rank,
+        survivor_process_groups=survivor_process_groups,
     )
 
     if len(p2p_missing_logical_experts) > 0:
@@ -275,11 +297,20 @@ def update_expert_location_with_recovery(
             expert_backup_client.update_weights(weight_name_filter)
         else:
             # Load the missing weights from disk
-            update_weights_from_disk_callable(
+            update_result = update_weights_from_disk_callable(
                 get_server_args().model_path,
                 get_server_args().load_format,
                 weight_name_filter=weight_name_filter,
             )
+            if (
+                survivor_process_groups is not None
+                and isinstance(update_result, tuple)
+                and not update_result[0]
+            ):
+                raise RuntimeError(
+                    "NPU FT failed to reload missing experts from disk: "
+                    f"{update_result[1]}"
+                )
 
     # Re-init LPLB solvers after expert location update
     if ep_dispatch_algorithm == "lp":

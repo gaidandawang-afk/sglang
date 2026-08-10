@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -335,6 +336,19 @@ class ModelRunner:
                 f"Context: {self.device=} {ps.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {ps.tp_rank=} {ps.tp_size=}"
             )
             raise
+
+        # TorchNPU device recovery must run on the same Python thread that
+        # selected and initialized the device.  The Scheduler event loop and
+        # fault-tolerance command handler normally stay on this thread; retain
+        # its identity so a future refactor cannot silently move recovery into
+        # a watchdog/control thread.
+        self._npu_ft_device_owner_thread_id = (
+            threading.get_ident()
+            if _is_npu
+            and server_args.enable_fault_tolerance
+            and server_args.elastic_ep_backend == "mc2"
+            else None
+        )
 
         # Initialize MooncakeTransferEngine BEFORE init_torch_distributed so
         # that the shared TE can be passed to the Mooncake PG backend (avoids
@@ -660,7 +674,33 @@ class ModelRunner:
 
     def maybe_init_elastic_ep(self):
         if self.server_args.elastic_ep_backend:
-            ElasticEPStateManager.init(self.server_args)
+            state = ElasticEPStateManager.init(self.server_args)
+            if (
+                _is_npu
+                and self.server_args.enable_fault_tolerance
+                and self.server_args.elastic_ep_backend == "mc2"
+            ):
+                expert_location = get_global_expert_location_metadata()
+                if expert_location is None:
+                    raise RuntimeError(
+                        "NPU MC2 fault tolerance requires expert location metadata"
+                    )
+                elastic_info = state.init_npu_mc2_elastic_info(
+                    num_physical_experts=expert_location.num_physical_experts
+                )
+                one_rank_down_mask = [True] * state.original_ep_size
+                one_rank_down_mask[-1] = False
+                state.npu_mc2_elastic_info.validate_logical_expert_capacity(
+                    one_rank_down_mask,
+                    num_logical_experts=expert_location.num_logical_experts,
+                )
+                logger.info(
+                    "[NPU FT] initialized fixed MC2 elastic_info: "
+                    "rank=%d data_ptr=%d values=%s",
+                    self.ps.dp_rank,
+                    elastic_info.data_ptr(),
+                    elastic_info.detach().cpu().tolist(),
+                )
 
     def init_token_oracle(self):
         self._token_oracle_manager = install_token_oracle_from_env(
@@ -1908,17 +1948,122 @@ class ModelRunner:
             )
         return output
 
+    def _stop_and_restart_npu_device_for_fault_tolerance(self) -> None:
+        owner_thread_id = self._npu_ft_device_owner_thread_id
+        current_thread_id = threading.get_ident()
+        if owner_thread_id is None or current_thread_id != owner_thread_id:
+            raise RuntimeError(
+                "NPU FT device recovery must run on the ModelRunner device "
+                "owner thread: "
+                f"owner_thread_id={owner_thread_id}, "
+                f"current_thread_id={current_thread_id}"
+            )
+
+        import torch_npu
+
+        stop_device = getattr(torch_npu.npu, "stop_device", None)
+        restart_device = getattr(torch_npu.npu, "restart_device", None)
+        if not callable(stop_device) or not callable(restart_device):
+            raise RuntimeError(
+                "NPU MC2 fault tolerance requires torch_npu.npu.stop_device "
+                "and torch_npu.npu.restart_device"
+            )
+
+        device_id = self.gpu_id
+        logger.info(
+            "[NPU FT] stopping survivor device before communication-domain "
+            "rebuild: rank=%d device_id=%d thread_id=%d",
+            self.ps.dp_rank,
+            device_id,
+            current_thread_id,
+        )
+        stop_result = stop_device(device_id)
+        if stop_result not in (None, 0):
+            raise RuntimeError(
+                "NPU FT stop_device failed: "
+                f"device_id={device_id}, result={stop_result}"
+            )
+
+        # Deliberately use the default recovery mode.  Passing
+        # rebuild_all_resource(s)=True on newer TorchNPU releases rebuilds
+        # streams and can mark existing tensors unsafe, which is incompatible
+        # with replaying the already captured graph and its fixed buffers.
+        restart_device(device_id)
+        logger.info(
+            "[NPU FT] restarted survivor device without rebuilding graph "
+            "resources: rank=%d device_id=%d thread_id=%d",
+            self.ps.dp_rank,
+            device_id,
+            current_thread_id,
+        )
+
     def apply_fault_tolerance_scale_down(self, active_mask: list[bool]) -> None:
         state = ElasticEPStateManager.instance()
+        if self.server_args.elastic_ep_backend == "mc2":
+            # Abort unfinished work left behind by the failed rank and restore
+            # this survivor's device/HCCL watchdog state before constructing
+            # any fresh graph-external process group.  This method is invoked
+            # synchronously by Scheduler.handle_fault_tolerance_command on the
+            # ModelRunner device-owner thread.
+            self._stop_and_restart_npu_device_for_fault_tolerance()
+
         mask = torch.as_tensor(
             active_mask,
             dtype=state.active_ranks.dtype,
             device=state.active_ranks.device,
         )
+        if self.server_args.elastic_ep_backend == "mc2":
+            expert_location = get_global_expert_location_metadata()
+            state.npu_mc2_elastic_info.validate_logical_expert_capacity(
+                mask,
+                num_logical_experts=expert_location.num_logical_experts,
+            )
+
+            # Rebuild every graph-external communication domain before any
+            # survivor collective or expert movement.  MC2 itself deliberately
+            # keeps the graph-captured original-rank window and is updated only
+            # after the expert layout has converged.
+            from sglang.srt.fault_tolerance.npu_metadata import (
+                get_npu_ft_metadata_group,
+            )
+
+            survivor_process_groups = get_npu_ft_metadata_group()
+            survivor_process_groups.rebuild(
+                active_ranks=active_mask,
+                device=self.device,
+            )
+        else:
+            survivor_process_groups = None
         state.active_ranks.copy_(mask)
         state.active_ranks_cpu.copy_(mask.detach().cpu())
-        for _ in self.eplb_manager.rebalance(force=True):
+
+        logical_count_override = None
+        if self.server_args.elastic_ep_backend == "mc2":
+            local_logical_count = (
+                get_global_expert_distribution_recorder().dump_local_logical_count()
+            )
+            logical_count_override = survivor_process_groups.all_reduce_sum_tensor(
+                local_logical_count
+            )
+
+        for _ in self.eplb_manager.rebalance(
+            force=True, logical_count_override=logical_count_override
+        ):
             pass
+        if self.server_args.elastic_ep_backend == "mc2":
+            # EPLB must finish first: the next captured MC2 replay must observe
+            # matching expert placement and rank mappings. This updates tensor
+            # contents only; the graph-captured address remains unchanged.
+            state.update_npu_mc2_elastic_info()
+            elastic_info = state.npu_mc2_elastic_info.tensor
+            logger.info(
+                "[NPU FT] committed MC2 scale-down state in place: "
+                "rank=%d active_mask=%s data_ptr=%d values=%s",
+                self.ps.dp_rank,
+                state.active_ranks_cpu.tolist(),
+                elastic_info.data_ptr(),
+                elastic_info.detach().cpu().tolist(),
+            )
         state.snapshot_active_to_last()
 
     def update_model_fields(

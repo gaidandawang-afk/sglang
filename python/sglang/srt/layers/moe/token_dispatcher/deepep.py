@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -68,6 +69,43 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 logger = logging.getLogger(__name__)
 
 
+def _npu_mc2_elastic_info_kwargs() -> dict:
+    """Return MC2 metadata only for the NPU FT backend.
+
+    Keeping this optional preserves the existing GPU and non-FT NPU call
+    signatures. The tensor itself is allocated before graph capture and is
+    updated in-place after a scale-down.
+    """
+
+    if not _is_npu:
+        return {}
+
+    from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+    from sglang.srt.runtime_context import get_server_args
+
+    server_args = get_server_args()
+    if (
+        not server_args.enable_fault_tolerance
+        or server_args.elastic_ep_backend != "mc2"
+    ):
+        return {}
+    state = ElasticEPStateManager.instance()
+    if state is None or state.npu_mc2_elastic_info is None:
+        raise RuntimeError(
+            "NPU MC2 fault tolerance requires fixed elastic_info before DeepEP"
+        )
+    for method_name in ("low_latency_dispatch", "low_latency_combine"):
+        parameters = inspect.signature(getattr(Buffer, method_name)).parameters
+        if "elastic_info" not in parameters:
+            raise RuntimeError(
+                "NPU MC2 fault tolerance requires a DeepEP build with the "
+                f"elastic_info {method_name} parameter; apply "
+                "patches/ascend/sgl-kernel-npu-mc2-elastic-info.patch and "
+                "rebuild sgl-kernel-npu"
+            )
+    return {"elastic_info": state.npu_mc2_elastic_info.tensor}
+
+
 def _is_mnnvl_fabric_supported() -> bool:
     if not is_flashinfer_available():
         return False
@@ -83,6 +121,20 @@ def _deepep_precompile_tp_barrier() -> None:
     # To avoid this, we use torch.distributed's barrier during the compile stage.
     # We apply this barrier only in the compile stage to prevent extra all-reduce overhead at runtime.
     if envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
+        if _is_npu:
+            from sglang.srt.runtime_context import get_resources
+
+            survivor_process_groups = get_resources().buffers.get(
+                "npu_ft_survivor_process_groups"
+            )
+            if (
+                survivor_process_groups is not None
+                and survivor_process_groups.is_rebuilt
+            ):
+                dist.barrier(
+                    group=survivor_process_groups.scheduler_device_group
+                )
+                return
         get_tp_group().barrier()
 
 
@@ -754,6 +806,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self.num_experts,
                 use_fp8=self.use_fp8,
                 **(dict(topk_weights=topk_weights) if _is_npu else dict()),
+                **_npu_mc2_elastic_info_kwargs(),
                 **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
                 **(
                     dict(x_global_scale=input_global_scale)
@@ -834,6 +887,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 handle=self.handle,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
+                **_npu_mc2_elastic_info_kwargs(),
                 **overlap_args_dict,
             )
 

@@ -46,6 +46,7 @@ class ExpertLocationUpdater:
         update_layer_ids: List[int],
         nnodes: int,
         rank: int,
+        survivor_process_groups=None,
     ):
         """
         Update experts' physical location after EPLB.
@@ -67,6 +68,7 @@ class ExpertLocationUpdater:
             update_layer_ids=update_layer_ids,
             nnodes=nnodes,
             rank=rank,
+            survivor_process_groups=survivor_process_groups,
         )
         old_expert_location_metadata.update(
             new_expert_location_metadata,
@@ -91,6 +93,7 @@ def _update_expert_weights_with_canary(
     update_layer_ids: List[int],
     nnodes: int,
     rank: int,
+    survivor_process_groups=None,
 ):
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
 
@@ -118,6 +121,7 @@ def _update_expert_weights_with_canary(
         update_layer_ids=update_layer_ids,
         nnodes=nnodes,
         rank=rank,
+        survivor_process_groups=survivor_process_groups,
     )
 
     for layer_id in update_layer_ids:
@@ -140,6 +144,7 @@ def _update_expert_weights_raw(
     update_layer_ids: List[int],
     nnodes: int,
     rank: int,
+    survivor_process_groups=None,
 ):
     log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
 
@@ -169,10 +174,13 @@ def _update_expert_weights_raw(
             rank=rank,
             world_size=world_size,
             missing_logical_experts_info=missing_logical_experts_info,
+            survivor_process_groups=survivor_process_groups,
             log_metrics=log_metrics,
         )
         if len(missing_logical_experts_info) > 0:
-            missing_logical_experts_by_layers[layer_id] = missing_logical_experts_info
+            missing_logical_experts_by_layers[layer_id] = list(
+                dict.fromkeys(missing_logical_experts_info)
+            )
     return missing_logical_experts_by_layers
 
 
@@ -190,6 +198,7 @@ def update_expert_weights_single_layer(
     rank: int,
     world_size: Optional[int] = None,
     missing_logical_experts_info: Optional[List[int]] = None,
+    survivor_process_groups=None,
     debug: bool = False,
     log_metrics: bool = False,
 ):
@@ -217,6 +226,28 @@ def update_expert_weights_single_layer(
 
     num_physical_experts = len(old_physical_to_logical_map)
     num_tensors = len(routed_experts_weights)
+    if world_size is None:
+        world_size = num_physical_experts // num_local_physical_experts
+
+    if survivor_process_groups is None:
+        active_rank_mask = [True] * world_size
+        p2p_group = None
+
+        def _to_peer_rank(original_rank: int) -> int:
+            return original_rank
+
+    else:
+        active_rank_mask = [
+            original_rank in survivor_process_groups.active_original_ranks
+            for original_rank in range(world_size)
+        ]
+        p2p_group = survivor_process_groups.eplb_device_group
+
+        def _to_peer_rank(original_rank: int) -> int:
+            return survivor_process_groups.group_rank(original_rank)
+
+    def _rank_is_active(original_rank: int) -> bool:
+        return active_rank_mask[original_rank]
 
     self_node_id = rank // num_gpu_per_node
 
@@ -302,6 +333,20 @@ def update_expert_weights_single_layer(
             _compute_comm_info(logical_expert_id=logical_expert_id)
         )
 
+        # No surviving rank has this logical expert.  Only this case reaches
+        # the DRAM/disk recovery loader; local reuse and survivor P2P were both
+        # exhausted first.
+        if not same_node_mapping.chunk_values and not cross_node_mapping.chunk_values:
+            if missing_logical_experts_info is None:
+                raise RuntimeError("missing expert recovery requires tracking")
+            missing_logical_experts_info.append(logical_expert_id)
+            if debug:
+                output_logs.append(
+                    "handle_recv_of_dst_expert_location "
+                    f"{dst_expert_location=} case=reload-no-survivor-copy"
+                )
+            return
+
         # case 4: same-node
         if rank in need_comm_self_node_dst_ranks:
             chosen_src_rank = same_node_mapping.chunk_value_from_element_value(
@@ -353,7 +398,8 @@ def update_expert_weights_single_layer(
                     P2POp(
                         op=torch.distributed.irecv,
                         tensor=_get_tensor(temp_buffers, i, dst_expert_location),
-                        peer=src_rank,
+                        peer=_to_peer_rank(src_rank),
+                        group=p2p_group,
                     )
                     for i in range(num_tensors)
                 ],
@@ -403,7 +449,8 @@ def update_expert_weights_single_layer(
                         tensor=_get_tensor(
                             routed_experts_weights, i, src_expert_location
                         ),
-                        peer=dst_rank,
+                        peer=_to_peer_rank(dst_rank),
+                        group=p2p_group,
                     )
                     for dst_rank in all_dst_ranks
                     for i in range(num_tensors)
@@ -417,6 +464,7 @@ def update_expert_weights_single_layer(
                 x // num_local_physical_experts
                 for x in range(num_physical_experts)
                 if old_physical_to_logical_map[x] == logical_expert_id
+                and _rank_is_active(x // num_local_physical_experts)
             ]
         )
         all_src_nodes = [x // num_gpu_per_node for x in all_src_ranks]
@@ -429,6 +477,7 @@ def update_expert_weights_single_layer(
                 x // num_local_physical_experts
                 for x in range(num_physical_experts)
                 if new_physical_to_logical_map[x] == logical_expert_id
+                and _rank_is_active(x // num_local_physical_experts)
                 and x // num_local_physical_experts not in all_src_ranks
             ]
         )
@@ -456,6 +505,10 @@ def update_expert_weights_single_layer(
         return same_node_mapping, cross_node_mapping, need_comm_self_node_dst_ranks
 
     def _filter_p2p_ops(p2p_op_infos):
+        if survivor_process_groups is not None:
+            # Source/destination discovery already uses survivor membership and
+            # every peer is expressed in the rebuilt group's compact namespace.
+            return
         elastic_ep_state = ElasticEPStateManager.instance()
         if elastic_ep_state is not None and missing_logical_experts_info is not None:
             # Filter out inactive P2P ops and record missing expert IDs in missing_logical_experts_info

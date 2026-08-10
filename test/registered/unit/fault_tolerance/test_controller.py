@@ -5,6 +5,10 @@ from sglang.srt.fault_tolerance.controller import (
     FaultToleranceState,
     is_ft_supported_config,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def make_state(*, dp_size=2, ranks_per_dp=1, strategy="pause"):
@@ -15,7 +19,7 @@ def make_state(*, dp_size=2, ranks_per_dp=1, strategy="pause"):
     )
 
 
-class TestFaultToleranceState(unittest.TestCase):
+class TestFaultToleranceState(CustomTestCase):
     def test_single_dp_is_rejected(self):
         args = SimpleNamespace(
             pp_size=1,
@@ -162,6 +166,58 @@ class TestFaultToleranceState(unittest.TestCase):
         self.assertFalse(state.should_reject_admission([True, True]))
         self.assertEqual(state.unhealthy_dp_ranks, set())
         self.assertEqual(state.status_response()["ranks"][1]["state"], "dead")
+
+
+class TestNpuFaultToleranceConfig(CustomTestCase):
+    def _make_args(self, **overrides):
+        values = dict(
+            pp_size=1,
+            elastic_ep_backend="mc2",
+            disaggregation_mode="null",
+            device="npu",
+            tokenizer_worker_num=1,
+            use_ray=False,
+            enable_dp_attention=True,
+            enable_dp_lm_head=True,
+            enable_eplb=True,
+            eplb_algorithm="elasticity_aware",
+            moe_a2a_backend="deepep",
+            deepep_mode="low_latency",
+            fault_tolerance_on_error_strategy="pause",
+            nnodes=1,
+            tp_size=4,
+            dp_size=4,
+            ep_size=4,
+            moe_dp_size=1,
+            attn_cp_size=1,
+            max_ep_size=None,
+            ep_join_mode=None,
+        )
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_target_ascend_mc2_topology_is_supported(self):
+        self.assertEqual(is_ft_supported_config(self._make_args()), (True, ""))
+
+    def test_npu_requires_mc2_active_rank_backend(self):
+        self.assertEqual(
+            is_ft_supported_config(
+                self._make_args(elastic_ep_backend="mooncake")
+            ),
+            (False, "ft_npu_requires_mc2_active_rank_backend"),
+        )
+
+    def test_npu_requires_graph_internal_low_latency_deepep(self):
+        self.assertEqual(
+            is_ft_supported_config(self._make_args(deepep_mode="normal")),
+            (False, "ft_npu_requires_deepep_low_latency"),
+        )
+
+    def test_npu_requires_original_tp_dp_ep_namespace_to_match(self):
+        self.assertEqual(
+            is_ft_supported_config(self._make_args(ep_size=2)),
+            (False, "ft_npu_requires_tp_dp_ep_equal"),
+        )
 
 
 if __name__ == "__main__":

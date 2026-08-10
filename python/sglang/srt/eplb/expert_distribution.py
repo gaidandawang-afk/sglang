@@ -48,6 +48,17 @@ logger = logging.getLogger(__name__)
 _OutputMode = Literal["file", "object"]
 
 
+def _get_rebuilt_npu_ft_process_groups():
+    """Return the current survivor groups without creating runtime state."""
+
+    from sglang.srt.runtime_context import get_resources
+
+    groups = get_resources().buffers.get("npu_ft_survivor_process_groups")
+    if groups is None or not groups.is_rebuilt:
+        return None
+    return groups
+
+
 @dataclass
 class ExpertDistributionMetrics:
     eplb_balancedness: torch.Tensor
@@ -119,6 +130,11 @@ class ExpertDistributionRecorder(ABC):
         self._on_not_implemented()
 
     def dump_record(self, output_mode: _OutputMode = "file"):
+        self._on_not_implemented()
+
+    def dump_local_logical_count(self) -> torch.Tensor:
+        """Return this rank's buffered logical counts without a collective."""
+
         self._on_not_implemented()
 
     @property
@@ -278,6 +294,17 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         output = self._accumulator.dump(output_mode=output_mode)
         self._reset()
         return output
+
+    def dump_local_logical_count(self) -> torch.Tensor:
+        """Drain a local count snapshot for survivor-only FT aggregation."""
+
+        if not isinstance(self._accumulator, _StatAccumulator):
+            raise RuntimeError(
+                "fault-tolerance expert aggregation requires stat recorder mode"
+            )
+        logical_count = self._accumulator.get_local_logical_count().sum(dim=0)
+        self._reset()
+        return logical_count
 
     @property
     def recording(self):
@@ -904,21 +931,32 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         super().reset()
         self._global_physical_count_of_buffered_step.reset()
 
-    def dump(self, output_mode: _OutputMode):
-        logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
+    def get_local_logical_count(self) -> torch.Tensor:
+        return _convert_global_physical_count_to_logical_count(
             self._global_physical_count_of_buffered_step.get_all(),
             num_layers=self._expert_location_metadata.num_layers,
             num_logical_experts=self._expert_location_metadata.num_logical_experts,
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
 
+    def dump(self, output_mode: _OutputMode):
+        logical_count_of_buffered_step = self.get_local_logical_count()
+
         if self._first_dump:
             self._first_dump = False
             torch.get_device_module().empty_cache()
 
-        torch.distributed.all_reduce(
-            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
-        )
+        survivor_process_groups = _get_rebuilt_npu_ft_process_groups()
+        if survivor_process_groups is not None:
+            logical_count_of_buffered_step = (
+                survivor_process_groups.all_reduce_sum_tensor(
+                    logical_count_of_buffered_step
+                )
+            )
+        else:
+            torch.distributed.all_reduce(
+                logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+            )
 
         output = dict(
             rank=self._rank,
@@ -926,8 +964,13 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
         )
 
+        output_root = (
+            survivor_process_groups.active_original_ranks[0]
+            if survivor_process_groups is not None
+            else 0
+        )
         if output_mode == "file":
-            if self._rank == 0:
+            if self._rank == output_root:
                 _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
         elif output_mode == "object":
             return output
@@ -940,7 +983,13 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         ):
             return None
 
-        if self._rank == 0:
+        survivor_process_groups = _get_rebuilt_npu_ft_process_groups()
+        output_root = (
+            survivor_process_groups.active_original_ranks[0]
+            if survivor_process_groups is not None
+            else 0
+        )
+        if self._rank == output_root:
             utilization_mean_rates = self._history.mean()
             window_index = self.window_sizes[-1]
             average_utilization_rate_over_window = (
@@ -952,11 +1001,30 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device="cuda",
+                device=(
+                    self._server_args.device
+                    if survivor_process_groups is not None
+                    else "cuda"
+                ),
             )
         else:
-            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
-        torch.distributed.broadcast(avg_rate_tensor, src=0)
+            avg_rate_tensor = torch.empty(
+                1,
+                dtype=torch.float32,
+                device=(
+                    self._server_args.device
+                    if survivor_process_groups is not None
+                    else "cuda"
+                ),
+            )
+        if survivor_process_groups is not None:
+            torch.distributed.broadcast(
+                avg_rate_tensor,
+                src=0,
+                group=survivor_process_groups.eplb_device_group,
+            )
+        else:
+            torch.distributed.broadcast(avg_rate_tensor, src=0)
         return avg_rate_tensor.item()
 
 

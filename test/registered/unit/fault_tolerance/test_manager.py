@@ -12,15 +12,21 @@ from sglang.srt.managers.io_struct import (
     ProcessActiveRanksOutput,
     WatchdogHeartbeatOutput,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def make_manager(*, dp_size=2, ranks_per_dp=1, strategy="pause"):
+def make_manager(
+    *, dp_size=2, ranks_per_dp=1, strategy="pause", elastic_ep_backend=None
+):
     manager = FaultToleranceManager(
         server_args=SimpleNamespace(
             dp_size=dp_size,
             tp_size=dp_size * ranks_per_dp,
             fault_tolerance_on_error_strategy=strategy,
             fault_tolerance_timeout=1,
+            elastic_ep_backend=elastic_ep_backend,
         ),
         send_to_scheduler=AsyncMock(),
         send_to_dpc=AsyncMock(),
