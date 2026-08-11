@@ -129,6 +129,37 @@ class TestNpuExpertRecovery(CustomTestCase):
                 active_ranks=[True, True, True, False],
             )
 
+    def test_fault_layout_balances_missing_experts_across_survivors(self):
+        old_metadata = _make_expert_location_metadata(
+            [[0, 1, 2, 3, 0, 1, 2, 3]]
+        )
+        server_args = SimpleNamespace(ep_dispatch_algorithm="dynamic")
+
+        recovered = ExpertLocationMetadata.init_for_fault_recovery(
+            server_args,
+            old_metadata,
+            active_ranks=[True, False, True, False],
+        )
+
+        changed = (
+            recovered.physical_to_logical_map_cpu
+            != old_metadata.physical_to_logical_map_cpu
+        )
+        changed_per_original_rank = changed.view(1, 4, 2).sum(dim=(0, 2))
+        self.assertEqual(changed_per_original_rank.tolist(), [1, 0, 1, 0])
+        active_locations = recovered.logical_to_all_physical_map_cpu[
+            recovered.logical_to_all_physical_map_cpu >= 0
+        ]
+        self.assertTrue(
+            torch.all(
+                (active_locations < 2)
+                | ((active_locations >= 4) & (active_locations < 6))
+            ).item()
+        )
+        self.assertTrue(
+            (recovered.logical_to_all_physical_map_num_valid == 1).all().item()
+        )
+
     def test_periodic_eplb_stats_use_rebuilt_survivor_group(self):
         accumulator = expert_distribution._StatAccumulator.__new__(
             expert_distribution._StatAccumulator

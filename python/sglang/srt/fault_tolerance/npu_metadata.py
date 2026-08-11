@@ -259,18 +259,53 @@ class NpuFTSurvivorProcessGroups:
                 f"{list(self.active_original_ranks)}"
             ) from exc
 
-    def all_gather_tensor(self, local_tensor: torch.Tensor) -> dict[int, torch.Tensor]:
-        """Gather device tensors and return them in original-rank namespace."""
+    def all_gather_tensor(
+        self,
+        local_tensor: torch.Tensor,
+        *,
+        timeout_sec: float | None = None,
+    ) -> dict[int, torch.Tensor]:
+        """Gather device tensors and return them in original-rank namespace.
+
+        ``timeout_sec`` is used by the Scheduler's MLP-sync path.  A rebuilt
+        survivor group becomes the stale group after the next rank failure,
+        so that collective must return to the FT control loop without waiting
+        for ProcessGroupHCCL's much longer watchdog timeout.
+        """
 
         self._require_rebuilt()
+        if timeout_sec is not None and timeout_sec <= 0:
+            raise ValueError("all-gather timeout must be positive")
         local_tensor = local_tensor.to(device=self.device).contiguous()
         if self.world_size == 1:
             tensors = [local_tensor.clone()]
         else:
             tensors = [torch.empty_like(local_tensor) for _ in range(self.world_size)]
-            dist.all_gather(
-                tensors, local_tensor, group=self.scheduler_device_group
-            )
+            if timeout_sec is None:
+                dist.all_gather(
+                    tensors, local_tensor, group=self.scheduler_device_group
+                )
+            else:
+                work = dist.all_gather(
+                    tensors,
+                    local_tensor,
+                    group=self.scheduler_device_group,
+                    async_op=True,
+                )
+                try:
+                    completed = work.wait(
+                        timeout=timedelta(seconds=timeout_sec)
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "NPU MC2 survivor MLP-sync collective failed; "
+                        "returning to the FT control loop"
+                    ) from exc
+                if completed is False:
+                    raise TimeoutError(
+                        "NPU MC2 survivor MLP-sync collective timed out after "
+                        f"{timeout_sec:g}s; returning to the FT control loop"
+                    )
         return dict(zip(self.active_original_ranks, tensors, strict=True))
 
     def all_gather_cpu_tensor(

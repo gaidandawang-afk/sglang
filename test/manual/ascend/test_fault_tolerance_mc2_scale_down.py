@@ -1,8 +1,9 @@
 """Manual Ascend MC2 scale-down validation.
 
-Run this only against a disposable four-rank server. The script deliberately
-sends SIGKILL to the Scheduler PID supplied with --victim-pid unless an
-existing incident is selected instead.
+Run this only against a disposable server. The script deliberately sends
+SIGKILL to the Scheduler PID supplied with --victim-pid unless an existing
+incident is selected instead. It also supports another scale-down after one or
+more ranks have already been removed.
 """
 
 from __future__ import annotations
@@ -147,7 +148,9 @@ def _response_text(response: Any) -> Any:
     return None
 
 
-def _parse_mc2_log(path: Path, original_world_size: int, victim_rank: int) -> dict:
+def _parse_mc2_log(
+    path: Path, original_world_size: int, expected_survivors: list[int]
+) -> dict:
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     prewarmed_original_ranks = sorted(
         {
@@ -206,28 +209,51 @@ def _parse_mc2_log(path: Path, original_world_size: int, victim_rank: int) -> di
                 f"{initial['data_ptr']} != {update['data_ptr']}"
             )
 
-    updated = updates[-1]
+    expected_survivors = sorted(expected_survivors)
+    effective_ep_size = len(expected_survivors)
+    matching_updates = [
+        item
+        for item in updates
+        if len(item["values"]) == 4 + 2 * original_world_size
+        and item["values"][1] == effective_ep_size
+        and item["values"][4 + original_world_size :][
+            :effective_ep_size
+        ]
+        == expected_survivors
+    ]
+    if not matching_updates:
+        raise AssertionError(
+            "server log has no MC2 update for expected survivors: "
+            f"{expected_survivors}"
+        )
+    updated = matching_updates[-1]
     values = updated["values"]
     expected_size = 4 + 2 * original_world_size
     if len(values) != expected_size:
         raise AssertionError(
             f"elastic_info length {len(values)} != expected {expected_size}"
         )
-    if values[1] != original_world_size - 1:
+    if values[1] != effective_ep_size:
         raise AssertionError(f"unexpected effective EP size: {values[1]}")
     original_to_effective = values[4 : 4 + original_world_size]
     effective_to_original = values[4 + original_world_size :]
-    if original_to_effective[victim_rank] != -1:
-        raise AssertionError("victim rank was not masked in elastic_info")
-    expected_survivors = [
-        rank for rank in range(original_world_size) if rank != victim_rank
-    ]
-    if effective_to_original[: original_world_size - 1] != expected_survivors:
+    for original_rank in range(original_world_size):
+        expected_effective_rank = (
+            expected_survivors.index(original_rank)
+            if original_rank in expected_survivors
+            else -1
+        )
+        if original_to_effective[original_rank] != expected_effective_rank:
+            raise AssertionError(
+                "original-to-effective mapping mismatch: "
+                f"{original_to_effective} vs survivors {expected_survivors}"
+            )
+    if effective_to_original[:effective_ep_size] != expected_survivors:
         raise AssertionError(
             "effective-to-original mapping mismatch: "
             f"{effective_to_original} vs {expected_survivors}"
         )
-    if effective_to_original[-1] != -1:
+    if any(value != -1 for value in effective_to_original[effective_ep_size:]):
         raise AssertionError("fixed-width reverse mapping is not padded with -1")
 
     process_group_updates = []
@@ -248,11 +274,18 @@ def _parse_mc2_log(path: Path, original_world_size: int, victim_rank: int) -> di
                 "line_index": line_index,
             }
         )
-    expected_survivors = [
-        rank for rank in range(original_world_size) if rank != victim_rank
+    if not process_group_updates:
+        raise AssertionError("server log has no process-group rebuild logs")
+    latest_generation = max(
+        item["generation"] for item in process_group_updates
+    )
+    latest_generation_updates = [
+        item
+        for item in process_group_updates
+        if item["generation"] == latest_generation
     ]
     latest_process_group_by_rank = {
-        item["rank"]: item for item in process_group_updates
+        item["rank"]: item for item in latest_generation_updates
     }
     if sorted(latest_process_group_by_rank) != expected_survivors:
         raise AssertionError(
@@ -287,15 +320,15 @@ def _parse_mc2_log(path: Path, original_world_size: int, victim_rank: int) -> di
                 "line_index": line_index,
             }
 
-    if sorted(device_stops) != expected_survivors:
+    if any(rank not in device_stops for rank in expected_survivors):
         raise AssertionError(
             "missing survivor stop_device logs: "
-            f"got={sorted(device_stops)} expected={expected_survivors}"
+            f"got={sorted(device_stops)} expected_at_least={expected_survivors}"
         )
-    if sorted(device_restarts) != expected_survivors:
+    if any(rank not in device_restarts for rank in expected_survivors):
         raise AssertionError(
             "missing survivor restart_device logs: "
-            f"got={sorted(device_restarts)} expected={expected_survivors}"
+            f"got={sorted(device_restarts)} expected_at_least={expected_survivors}"
         )
     latest_update_by_rank = {item["rank"]: item for item in updates}
     for original_rank in expected_survivors:
@@ -377,10 +410,26 @@ def main() -> None:
         f"{base_url}/fault_tolerance/status",
         timeout=5,
     )
-    if _rank_states(initial_status) != {
-        rank: "healthy" for rank in range(args.original_world_size)
-    }:
-        raise AssertionError(f"server is not initially healthy: {initial_status}")
+    initial_states = _rank_states(initial_status)
+    expected_rank_ids = set(range(args.original_world_size))
+    if set(initial_states) != expected_rank_ids:
+        raise AssertionError(
+            f"unexpected initial rank namespace: {initial_status}"
+        )
+    if initial_states[args.victim_rank] != "healthy":
+        raise AssertionError(
+            f"victim rank {args.victim_rank} is not initially healthy: "
+            f"{initial_status}"
+        )
+    initially_healthy_ranks = sorted(
+        rank for rank, state in initial_states.items() if state == "healthy"
+    )
+    if len(initially_healthy_ranks) <= 1:
+        raise AssertionError(
+            "scale-down must leave at least one initially healthy survivor"
+        )
+
+    print(f"initial FT status: {initial_status}", flush=True)
 
     baseline = _generate(
         session,
@@ -392,6 +441,10 @@ def main() -> None:
 
     if args.victim_pid is not None:
         _validate_victim_pid_rank(args.victim_pid, args.victim_rank)
+        print(
+            f"sending SIGKILL to rank {args.victim_rank} pid {args.victim_pid}",
+            flush=True,
+        )
         os.kill(args.victim_pid, signal.SIGKILL)
 
     incident = _wait_for_incident(
@@ -400,6 +453,11 @@ def main() -> None:
         victim_rank=args.victim_rank,
         deadline=time.monotonic() + args.timeout,
     )
+    print(
+        f"observed rank {args.victim_rank} incident; applying scale-down",
+        flush=True,
+    )
+    apply_start = time.monotonic()
     scale_down = _http_json(
         session,
         "POST",
@@ -415,6 +473,10 @@ def main() -> None:
     )
     if not scale_down.get("success"):
         raise AssertionError(f"scale-down was not committed: {scale_down}")
+    print(
+        f"scale-down committed in {time.monotonic() - apply_start:.1f}s",
+        flush=True,
+    )
 
     final_status = _http_json(
         session,
@@ -423,10 +485,8 @@ def main() -> None:
         timeout=5,
     )
     final_states = _rank_states(final_status)
-    expected_final = {
-        rank: ("dead" if rank == args.victim_rank else "healthy")
-        for rank in range(args.original_world_size)
-    }
+    expected_final = dict(initial_states)
+    expected_final[args.victim_rank] = "dead"
     if final_states != expected_final:
         raise AssertionError(
             f"unexpected final FT state: {final_states} != {expected_final}"
@@ -454,10 +514,15 @@ def main() -> None:
 
     mc2_log_check = None
     if args.server_log is not None:
+        expected_survivors = [
+            rank
+            for rank in initially_healthy_ranks
+            if rank != args.victim_rank
+        ]
         mc2_log_check = _parse_mc2_log(
             args.server_log,
             args.original_world_size,
-            args.victim_rank,
+            expected_survivors,
         )
 
     report = {

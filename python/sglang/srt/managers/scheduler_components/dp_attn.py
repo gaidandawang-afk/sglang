@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
-_NPU_MC2_FT_ORIGINAL_COLLECTIVE_TIMEOUT_SEC = 5.0
+_NPU_MC2_FT_MLP_SYNC_COLLECTIVE_TIMEOUT_SEC = 5.0
 
 
 def _is_npu_mc2_ft_enabled() -> bool:
@@ -95,7 +95,7 @@ def _all_gather_original_mlp_sync_group(
     try:
         completed = work.wait(
             timeout=timedelta(
-                seconds=_NPU_MC2_FT_ORIGINAL_COLLECTIVE_TIMEOUT_SEC
+                seconds=_NPU_MC2_FT_MLP_SYNC_COLLECTIVE_TIMEOUT_SEC
             )
         )
     except Exception as exc:
@@ -106,7 +106,7 @@ def _all_gather_original_mlp_sync_group(
     if completed is False:
         raise TimeoutError(
             "NPU MC2 original MLP-sync collective timed out after "
-            f"{_NPU_MC2_FT_ORIGINAL_COLLECTIVE_TIMEOUT_SEC:g}s; "
+            f"{_NPU_MC2_FT_MLP_SYNC_COLLECTIVE_TIMEOUT_SEC:g}s; "
             "returning to the FT control loop"
         )
 
@@ -225,7 +225,10 @@ class MLPSyncBatchInfo:
             )
 
             survivor_process_groups = get_npu_ft_metadata_group()
-            gathered = survivor_process_groups.all_gather_tensor(local_info_tensor)
+            gathered = survivor_process_groups.all_gather_tensor(
+                local_info_tensor,
+                timeout_sec=_NPU_MC2_FT_MLP_SYNC_COLLECTIVE_TIMEOUT_SEC,
+            )
             for original_rank, rank_info in gathered.items():
                 global_info_tensor[original_rank, 0].copy_(
                     rank_info.to(device=global_info_tensor.device)

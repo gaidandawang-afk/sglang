@@ -324,6 +324,17 @@ def update_expert_location_with_recovery(
     )
 
     if len(p2p_missing_logical_experts) > 0:
+        missing_expert_layer_pairs = sum(
+            len(expert_ids)
+            for expert_ids in p2p_missing_logical_experts.values()
+        )
+        unique_missing_experts = sorted(
+            {
+                expert_id
+                for expert_ids in p2p_missing_logical_experts.values()
+                for expert_id in expert_ids
+            }
+        )
         # Load the missing expert weights from disk
         if callable(getattr(model, "generate_weight_name_filter", None)):
             # Filter and load only missing expert weights
@@ -338,6 +349,21 @@ def update_expert_location_with_recovery(
             )
             weight_name_filter = None
 
+        reload_source = (
+            "dram"
+            if expert_backup_client is not None and expert_backup_client.use_backup
+            else "disk"
+        )
+        reload_start = time.monotonic()
+        logger.info(
+            "[NPU FT] missing-expert reload begin: rank=%d source=%s "
+            "layers=%d expert_layer_pairs=%d unique_experts=%d",
+            tp_rank,
+            reload_source,
+            len(p2p_missing_logical_experts),
+            missing_expert_layer_pairs,
+            len(unique_missing_experts),
+        )
         if expert_backup_client is not None and expert_backup_client.use_backup:
             # Load the missing weights from the DRAM backup
             expert_backup_client.update_weights(weight_name_filter)
@@ -357,6 +383,15 @@ def update_expert_location_with_recovery(
                     "NPU FT failed to reload missing experts from disk: "
                     f"{update_result[1]}"
                 )
+        logger.info(
+            "[NPU FT] missing-expert reload end: rank=%d source=%s "
+            "layers=%d expert_layer_pairs=%d elapsed=%.3fs",
+            tp_rank,
+            reload_source,
+            len(p2p_missing_logical_experts),
+            missing_expert_layer_pairs,
+            time.monotonic() - reload_start,
+        )
 
     # Re-init LPLB solvers after expert location update
     if ep_dispatch_algorithm == "lp":
