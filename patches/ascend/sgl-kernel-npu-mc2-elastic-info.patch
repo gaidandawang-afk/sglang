@@ -300,7 +300,24 @@ index 80d44d3..00498df 100644
          )
  
          tensors_to_record = (
-@@ -195,6 +199,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+@@ -184,6 +188,16 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+     def get_supported_modes(self) -> List[str]:
+         return ["low_latency"]
+ 
++    def _comm_alg_for_elastic_info(
++        self, elastic_info: Optional[torch.Tensor]
++    ) -> str:
++        # The dynamic scale-down tiling path is not implemented for hierarchy.
++        # Keep the existing ops default for non-elastic users, but make the
++        # dispatch/combine pair use the elastic-compatible fullmesh template.
++        if elastic_info is not None and self.comm_alg == "hierarchy":
++            return "fullmesh_v1"
++        return self.comm_alg
++
+     def low_latency_dispatch(
+         self,
+         x: torch.Tensor,
+@@ -198,6 +212,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
          async_finish: bool = False,
          return_recv_hook: bool = False,
          topk_weights: Optional[torch.Tensor] = None,
@@ -308,7 +325,29 @@ index 80d44d3..00498df 100644
      ) -> Tuple[
          Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
          torch.Tensor,
-@@ -253,6 +258,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+@@ -206,6 +221,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+         Callable,
+     ]:
+ 
++        comm_alg = self._comm_alg_for_elastic_info(elastic_info)
+         topk_ids = topk_idx.int()
+         x_active_mask = torch.zeros(
+             num_max_dispatch_tokens_per_rank,
+@@ -214,7 +230,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+         )
+         x_active_mask[: x.size(0)] = True
+         padding_size = num_max_dispatch_tokens_per_rank - x.size(0)
+-        if self.comm_alg == "hierarchy":
++        if comm_alg == "hierarchy":
+             assert (
+                 topk_weights is not None
+             ), "When comm_alg='hierarchy', topk_weights can not be None"
+@@ -252,10 +268,11 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+             topk_idx=topk_padding,
+             num_experts=num_experts,
+             quant_mode=3 if use_ue8m0 else 2 if use_fp8 else 0,
+-            comm_alg=self.comm_alg,
++            comm_alg=comm_alg,
              topk_weights=weight_padding,
              x_active_mask=x_active_mask,
              num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
@@ -316,15 +355,23 @@ index 80d44d3..00498df 100644
          )
  
          handle = (
-@@ -289,6 +295,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+@@ -289,8 +309,10 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
          async_finish: bool = False,
          return_recv_hook: bool = False,
          out: Optional[torch.Tensor] = None,
 +        elastic_info: Optional[torch.Tensor] = None,
      ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
  
++        comm_alg = self._comm_alg_for_elastic_info(elastic_info)
          topk_ids = topk_idx.int()
-@@ -317,6 +324,7 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+         src_num = topk_idx.size(0)
+         (
+@@ -316,10 +335,11 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
+             assist_info_for_combine=src_info,
+             ep_send_counts=layout_range,
+             num_experts=num_experts,
+-            comm_alg=self.comm_alg,
++            comm_alg=comm_alg,
              expand_scales=expand_scales,
              x_active_mask=x_active_mask,
              num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
