@@ -13,6 +13,16 @@ passes the optional tensor through both the default C++ strategy and the
 For this EP=4 test, select `DEEP_USE_MODE=default`: on the torch-npu 2.10/CANN
 9.0 stack, the `ops` path reaches `aclnnMoeDistributeDispatchV4`, whose tiling
 requires `epWorldSize` to be a multiple of 16 and rejects EP=4.
+For an original `EP=16` topology, `DEEP_USE_MODE=ops` is supported. When
+`elastic_info` is present, the patch makes the ops dispatch/combine pair use
+`fullmesh_v1` instead of its normal `hierarchy` default because the dynamic
+scale-down tiling path rejects `elasticInfo` with hierarchical communication.
+Calls without `elastic_info` retain the original strategy default.
+If the earlier combined MC2 patch is already present in a kernel checkout,
+apply `patches/ascend/sgl-kernel-npu-mc2-ops-elastic-fullmesh.patch` on top.
+Fresh checkouts only need the combined
+`patches/ascend/sgl-kernel-npu-mc2-elastic-info.patch`, which already includes
+the same correction.
 It is rebased and `git apply --check`-validated against the `2026.7.2` source
 tag (`7a396def6d0d7ce85e940549a366351ce1d7821b`), including that version's
 `use_mxfp4` DeepEP argument. Regenerate the patch rather than applying it with
