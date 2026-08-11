@@ -31,11 +31,12 @@ class ExpertLocationDispatchInfo:
     # (num_logical_experts,)
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
     num_physical_experts: int
-    # MC2 consumes expert IDs in the immutable original-rank namespace and
-    # applies the original-to-survivor mapping from elastic_info internally.
-    # This tensor is populated before graph capture and updated in-place after
-    # scale-down.
+    # EPLB storage IDs use the immutable original-rank namespace, while MC2's
+    # effective expert space is compact across survivor ranks. These fields
+    # are populated before graph capture and updated in-place after scale-down.
     npu_mc2_elastic_info: Optional[torch.Tensor] = None
+    npu_mc2_original_ep_size: int = 0
+    npu_mc2_num_local_physical_experts: int = 0
 
     @classmethod
     def init_new(cls, layer_id: int):
@@ -48,6 +49,8 @@ class ExpertLocationDispatchInfo:
             return None
 
         npu_mc2_elastic_info = None
+        npu_mc2_original_ep_size = 0
+        npu_mc2_num_local_physical_experts = 0
         if (
             server_args.device == "npu"
             and server_args.enable_fault_tolerance
@@ -62,6 +65,19 @@ class ExpertLocationDispatchInfo:
                     "before expert dispatch"
                 )
             npu_mc2_elastic_info = state.npu_mc2_elastic_info.tensor
+            npu_mc2_original_ep_size = state.original_ep_size
+            (
+                npu_mc2_num_local_physical_experts,
+                remainder,
+            ) = divmod(
+                expert_location_metadata.num_physical_experts,
+                npu_mc2_original_ep_size,
+            )
+            if remainder != 0:
+                raise RuntimeError(
+                    "NPU MC2 expert storage must be divisible by the original "
+                    "EP size"
+                )
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
@@ -81,6 +97,8 @@ class ExpertLocationDispatchInfo:
             ],
             num_physical_experts=expert_location_metadata.num_physical_experts,
             npu_mc2_elastic_info=npu_mc2_elastic_info,
+            npu_mc2_original_ep_size=npu_mc2_original_ep_size,
+            npu_mc2_num_local_physical_experts=npu_mc2_num_local_physical_experts,
         )
 
 
@@ -120,9 +138,15 @@ def topk_ids_logical_to_physical(
     else:
         raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
 
-    # Do not compact MC2 expert IDs here. The operator contract requires all
-    # normal inputs to remain in the original EP namespace during dynamic
-    # scale-down; MC2 applies both rank tables from elastic_info internally.
+    if info.npu_mc2_elastic_info is not None:
+        from sglang.srt.elastic_ep.npu_mc2 import compact_mc2_physical_expert_ids
+
+        physical_topk_ids = compact_mc2_physical_expert_ids(
+            physical_topk_ids,
+            elastic_info=info.npu_mc2_elastic_info,
+            original_ep_size=info.npu_mc2_original_ep_size,
+            num_local_physical_experts=info.npu_mc2_num_local_physical_experts,
+        )
     return physical_topk_ids
 
 

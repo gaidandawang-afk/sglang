@@ -17,6 +17,61 @@ MC2_ELASTIC_INFO_HEADER_SIZE = 4
 MC2_ELASTIC_INFO_RANK_TABLE_COUNT = 2
 
 
+def compact_mc2_physical_expert_ids(
+    physical_expert_ids: torch.Tensor,
+    *,
+    elastic_info: torch.Tensor,
+    original_ep_size: int,
+    num_local_physical_experts: int,
+) -> torch.Tensor:
+    """Translate original storage IDs into MC2's compact survivor namespace.
+
+    EPLB keeps physical expert IDs in the immutable original-rank namespace so
+    weight slots on surviving ranks do not move when a rank disappears. MC2's
+    effective expert space is contiguous across survivor ranks, so translate
+    the rank component while retaining the expert's local slot.
+
+    ``-1`` is preserved for padded/invalid expert IDs. An ID belonging to an
+    inactive original rank also maps to ``-1``; a converged EPLB dispatch map
+    must never select such an ID.
+    """
+
+    if original_ep_size <= 0:
+        raise ValueError("original_ep_size must be positive")
+    if num_local_physical_experts <= 0:
+        raise ValueError("num_local_physical_experts must be positive")
+    expected_elastic_info_size = (
+        MC2_ELASTIC_INFO_HEADER_SIZE
+        + MC2_ELASTIC_INFO_RANK_TABLE_COUNT * original_ep_size
+    )
+    if elastic_info.numel() < expected_elastic_info_size:
+        raise ValueError(
+            "elastic_info is too small for the original EP rank tables: "
+            f"expected at least {expected_elastic_info_size}, "
+            f"got {elastic_info.numel()}"
+        )
+
+    valid = (physical_expert_ids >= 0) & (
+        physical_expert_ids < original_ep_size * num_local_physical_experts
+    )
+    safe_physical_ids = physical_expert_ids.masked_fill(~valid, 0)
+    original_rank = torch.div(
+        safe_physical_ids,
+        num_local_physical_experts,
+        rounding_mode="floor",
+    )
+    local_expert_id = safe_physical_ids % num_local_physical_experts
+    original_to_effective = elastic_info[
+        MC2_ELASTIC_INFO_HEADER_SIZE : MC2_ELASTIC_INFO_HEADER_SIZE + original_ep_size
+    ]
+    effective_rank = original_to_effective[original_rank.long()].to(
+        physical_expert_ids.dtype
+    )
+    compact_ids = effective_rank * num_local_physical_experts + local_expert_id
+    routable = valid & (effective_rank >= 0)
+    return compact_ids.masked_fill(~routable, -1)
+
+
 def build_mc2_elastic_info_values(
     active_ranks: Sequence[bool] | torch.Tensor,
     *,
