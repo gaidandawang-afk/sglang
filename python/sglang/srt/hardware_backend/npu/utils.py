@@ -212,9 +212,11 @@ def copy_npu_formatted_tensor_(
     movement and FT reload already provide a source with the destination's
     physical format, so copy the formatted bytes directly instead.
 
-    Callers must guarantee matching shape, dtype, device and NPU format.
-    Keeping this as a small, explicit primitive also makes it harder to use a
-    raw copy accidentally for ordinary logical tensors.
+    ``copy_memory_`` itself rejects padded tensors whose storage offset is not
+    zero.  Build short-lived offset-zero aliases and repoint their storage to
+    the exact source/destination sub-block with ``npu_change_data_ptr``.  The
+    parent tensors remain alive for the synchronous copy, and their storage
+    and graph-captured data pointers are never replaced.
     """
 
     if destination.device.type != "npu" or source.device.type != "npu":
@@ -229,7 +231,68 @@ def copy_npu_formatted_tensor_(
             f"destination={destination.shape}/{destination.dtype}/{destination.device} "
             f"source={source.shape}/{source.dtype}/{source.device}"
         )
-    return torch.ops.npu.copy_memory_(destination, source, False)
+    import torch_npu
+
+    destination_format = torch_npu.get_npu_format(destination)
+    source_format = torch_npu.get_npu_format(source)
+    if destination_format != source_format:
+        raise ValueError(
+            "formatted NPU copy requires matching formats: "
+            f"destination={destination_format} source={source_format}"
+        )
+
+    def make_offset_zero_alias(tensor: torch.Tensor) -> torch.Tensor:
+        tensor_format = torch_npu.get_npu_format(tensor)
+        alias = torch_npu.empty_with_format(
+            tuple(tensor.shape),
+            dtype=tensor.dtype,
+            device=tensor.device,
+            acl_format=tensor_format,
+        )
+        if alias.storage_offset() != 0:
+            raise RuntimeError(
+                "failed to allocate an offset-zero NPU formatted alias"
+            )
+        if torch_npu.get_npu_format(alias) != tensor_format:
+            raise RuntimeError(
+                "NPU formatted alias did not preserve the source format"
+            )
+
+        torch_npu.npu_change_data_ptr(
+            alias,
+            tensor,
+            int(tensor.storage_offset()),
+        )
+        if alias.storage_offset() != 0 or alias.data_ptr() != tensor.data_ptr():
+            raise RuntimeError(
+                "NPU formatted alias does not point at the requested tensor block: "
+                f"alias_offset={alias.storage_offset()} "
+                f"alias_ptr={alias.data_ptr()} tensor_ptr={tensor.data_ptr()}"
+            )
+        return alias
+
+    destination_alias = make_offset_zero_alias(destination)
+    source_alias = make_offset_zero_alias(source)
+    destination_storage_size = torch_npu.get_storage_size(destination_alias)
+    source_storage_size = torch_npu.get_storage_size(source_alias)
+    if destination_storage_size != source_storage_size:
+        raise ValueError(
+            "formatted NPU copy requires matching physical storage sizes: "
+            f"destination={destination_storage_size} source={source_storage_size}"
+        )
+
+    return torch.ops.npu.copy_memory_(destination_alias, source_alias, False)
+
+
+def is_npu_internal_format_tensor(tensor: torch.Tensor) -> bool:
+    if tensor.device.type != "npu":
+        return False
+
+    import torch_npu
+
+    return torch_npu.get_npu_format(tensor) != int(
+        NPUACLFormat.ACL_FORMAT_ND
+    )
 
 
 def get_indexer_weight_stream():

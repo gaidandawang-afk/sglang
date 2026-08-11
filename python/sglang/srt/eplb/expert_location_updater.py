@@ -250,11 +250,21 @@ def _copy_expert_tensor_(
     if destination_tensor.device.type == "npu":
         from sglang.srt.hardware_backend.npu.utils import (
             copy_npu_formatted_tensor_,
+            is_npu_internal_format_tensor,
         )
 
-        copy_npu_formatted_tensor_(destination_tensor, source_tensor)
-    else:
-        destination_tensor.copy_(source_tensor)
+        supports_offset_zero_alias = destination_tensor.dtype in (
+            torch.float16,
+            torch.float32,
+            torch.bfloat16,
+        )
+        if supports_offset_zero_alias and is_npu_internal_format_tensor(
+            destination_tensor
+        ):
+            copy_npu_formatted_tensor_(destination_tensor, source_tensor)
+            return
+
+    destination_tensor.copy_(source_tensor)
 
 
 def _needs_npu_p2p_staging(tensor: torch.Tensor) -> bool:
