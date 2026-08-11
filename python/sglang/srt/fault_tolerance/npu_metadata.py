@@ -259,37 +259,50 @@ class NpuFTSurvivorProcessGroups:
                 f"{list(self.active_original_ranks)}"
             ) from exc
 
-    def all_gather_tensor(
-        self,
-        local_tensor: torch.Tensor,
-        *,
-        timeout_sec: float | None = None,
-    ) -> dict[int, torch.Tensor]:
-        """Gather device tensors and return them in original-rank namespace.
-
-        ``timeout_sec`` is used by the Scheduler's MLP-sync path.  A rebuilt
-        survivor group becomes the stale group after the next rank failure,
-        so that collective must return to the FT control loop without waiting
-        for ProcessGroupHCCL's much longer watchdog timeout.
-        """
+    def all_gather_tensor(self, local_tensor: torch.Tensor) -> dict[int, torch.Tensor]:
+        """Gather device tensors and return them in original-rank namespace."""
 
         self._require_rebuilt()
-        if timeout_sec is not None and timeout_sec <= 0:
-            raise ValueError("all-gather timeout must be positive")
         local_tensor = local_tensor.to(device=self.device).contiguous()
         if self.world_size == 1:
             tensors = [local_tensor.clone()]
         else:
             tensors = [torch.empty_like(local_tensor) for _ in range(self.world_size)]
+            dist.all_gather(
+                tensors, local_tensor, group=self.scheduler_device_group
+            )
+        return dict(zip(self.active_original_ranks, tensors, strict=True))
+
+    def all_gather_cpu_tensor(
+        self,
+        local_tensor: torch.Tensor,
+        *,
+        timeout_sec: float | None = None,
+    ) -> dict[int, torch.Tensor]:
+        """Gather CPU tensors over the rebuilt survivor Gloo group.
+
+        The Scheduler passes a short timeout for steady-state MLP-sync.  Gloo
+        waits on the host and can therefore return control after a later
+        survivor failure.  Do not replace this path with an async HCCL wait:
+        TorchNPU WorkHCCL.wait() may only make the current NPU stream wait and
+        report success before the collective has completed.
+        """
+
+        self._require_rebuilt()
+        if timeout_sec is not None and timeout_sec <= 0:
+            raise ValueError("all-gather timeout must be positive")
+        local_tensor = local_tensor.detach().to(device="cpu").contiguous()
+        if self.world_size == 1:
+            tensors = [local_tensor.clone()]
+        else:
+            tensors = [torch.empty_like(local_tensor) for _ in range(self.world_size)]
             if timeout_sec is None:
-                dist.all_gather(
-                    tensors, local_tensor, group=self.scheduler_device_group
-                )
+                dist.all_gather(tensors, local_tensor, group=self.cpu_group)
             else:
                 work = dist.all_gather(
                     tensors,
                     local_tensor,
-                    group=self.scheduler_device_group,
+                    group=self.cpu_group,
                     async_op=True,
                 )
                 try:
@@ -298,28 +311,14 @@ class NpuFTSurvivorProcessGroups:
                     )
                 except Exception as exc:
                     raise RuntimeError(
-                        "NPU MC2 survivor MLP-sync collective failed; "
+                        "NPU MC2 survivor MLP-sync Gloo collective failed; "
                         "returning to the FT control loop"
                     ) from exc
                 if completed is False:
                     raise TimeoutError(
-                        "NPU MC2 survivor MLP-sync collective timed out after "
+                        "NPU MC2 survivor MLP-sync Gloo collective timed out after "
                         f"{timeout_sec:g}s; returning to the FT control loop"
                     )
-        return dict(zip(self.active_original_ranks, tensors, strict=True))
-
-    def all_gather_cpu_tensor(
-        self, local_tensor: torch.Tensor
-    ) -> dict[int, torch.Tensor]:
-        """Gather CPU tensors over the rebuilt survivor Gloo group."""
-
-        self._require_rebuilt()
-        local_tensor = local_tensor.detach().to(device="cpu").contiguous()
-        if self.world_size == 1:
-            tensors = [local_tensor.clone()]
-        else:
-            tensors = [torch.empty_like(local_tensor) for _ in range(self.world_size)]
-            dist.all_gather(tensors, local_tensor, group=self.cpu_group)
         return dict(zip(self.active_original_ranks, tensors, strict=True))
 
     def all_reduce_sum_tensor(self, local_tensor: torch.Tensor) -> torch.Tensor:

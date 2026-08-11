@@ -169,7 +169,7 @@ class TestNpuFTSurvivorProcessGroups(CustomTestCase):
         )
         self.assertEqual(reduced.item(), 10)
 
-    def test_rebuilt_mlp_sync_gather_has_bounded_wait(self):
+    def test_rebuilt_mlp_sync_gloo_gather_has_bounded_wait(self):
         groups = NpuFTSurvivorProcessGroups(
             store=object(),
             original_rank=2,
@@ -193,12 +193,12 @@ class TestNpuFTSurvivorProcessGroups(CustomTestCase):
                 TimeoutError, "returning to the FT control loop"
             ),
         ):
-            groups.all_gather_tensor(torch.tensor([2]), timeout_sec=5)
+            groups.all_gather_cpu_tensor(torch.tensor([2]), timeout_sec=5)
 
         all_gather.assert_called_once_with(
             [ANY, ANY, ANY],
             ANY,
-            group="scheduler-hccl-pg",
+            group="gloo-pg",
             async_op=True,
         )
         work.wait.assert_called_once_with(timeout=timedelta(seconds=5))
@@ -351,7 +351,7 @@ class TestNpuFTSurvivorProcessGroups(CustomTestCase):
 
     def test_mlp_sync_maps_survivors_back_to_fixed_original_slots(self):
         class _GatherGroup:
-            def all_gather_tensor(self, local_tensor, *, timeout_sec=None):
+            def all_gather_cpu_tensor(self, local_tensor, *, timeout_sec=None):
                 self.local_tensor = local_tensor
                 self.timeout_sec = timeout_sec
                 return {
