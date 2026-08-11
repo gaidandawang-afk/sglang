@@ -1104,16 +1104,34 @@ class Qwen3MoeForCausalLM(nn.Module):
         import re
 
         pattern = re.compile(r"layers\.(\d+)\.mlp\.experts\.(\d+)\.")
+        reload_stats = {
+            "expected_pairs": {
+                (int(layer_id), int(expert_id))
+                for layer_id, expert_ids in logical_experts_map.items()
+                for expert_id in expert_ids
+            },
+            "selected_pairs": set(),
+            "selected_weight_names": 0,
+        }
 
         def weight_name_filter(name: str) -> bool:
             match = pattern.search(name)
             if match is None:
                 return False
             layer_id, expert_id = (int(value) for value in match.groups())
-            return (
+            selected = (
                 layer_id in logical_experts_map
                 and expert_id in logical_experts_map[layer_id]
             )
+            if selected:
+                reload_stats["selected_pairs"].add((layer_id, expert_id))
+                reload_stats["selected_weight_names"] += 1
+            return selected
+
+        # The recovery caller checks this after the lazy checkpoint iterator
+        # has been consumed. This turns a filter/checkpoint naming mismatch
+        # into a failed scale-down instead of silently committing empty slots.
+        weight_name_filter._sglang_ft_reload_stats = reload_stats
 
         return weight_name_filter
 

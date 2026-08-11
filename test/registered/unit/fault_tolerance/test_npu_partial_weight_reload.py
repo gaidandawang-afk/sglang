@@ -11,6 +11,7 @@ WEIGHT_UPDATER_PATH = (
     REPO_ROOT
     / "python/sglang/srt/model_executor/model_runner_components/weight_updater.py"
 )
+QWEN3_MOE_PATH = REPO_ROOT / "python/sglang/srt/models/qwen3_moe.py"
 
 
 def load_functions(names):
@@ -30,6 +31,25 @@ def load_functions(names):
     module = ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[]))
     exec(compile(module, str(WEIGHT_UPDATER_PATH), "exec"), namespace)
     return {name: namespace[name] for name in names}
+
+
+def load_class_method(path, class_name, method_name):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    method = next(
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == method_name
+    )
+    method.decorator_list = []
+    namespace = {"Dict": dict, "List": list}
+    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
+    exec(compile(module, str(path), "exec"), namespace)
+    return namespace[method_name]
 
 
 class TestNpuPartialWeightReload(unittest.TestCase):
@@ -100,6 +120,29 @@ class TestNpuPartialWeightReload(unittest.TestCase):
             model, weights, target_device
         )
         model.load_weights.assert_not_called()
+
+    def test_qwen_filter_reports_checkpoint_pair_coverage(self):
+        generate_filter = load_class_method(
+            QWEN3_MOE_PATH,
+            "Qwen3MoeForCausalLM",
+            "generate_weight_name_filter",
+        )
+        weight_filter = generate_filter(None, {2: [64, 65]})
+
+        self.assertTrue(
+            weight_filter("model.layers.2.mlp.experts.64.gate_proj.weight")
+        )
+        self.assertTrue(
+            weight_filter("model.layers.2.mlp.experts.65.down_proj.weight")
+        )
+        self.assertFalse(
+            weight_filter("model.layers.3.mlp.experts.64.gate_proj.weight")
+        )
+
+        stats = weight_filter._sglang_ft_reload_stats
+        self.assertEqual(stats["expected_pairs"], {(2, 64), (2, 65)})
+        self.assertEqual(stats["selected_pairs"], {(2, 64), (2, 65)})
+        self.assertEqual(stats["selected_weight_names"], 2)
 
 
 if __name__ == "__main__":

@@ -383,6 +383,28 @@ def update_expert_location_with_recovery(
                     "NPU FT failed to reload missing experts from disk: "
                     f"{update_result[1]}"
                 )
+            reload_stats = getattr(
+                weight_name_filter, "_sglang_ft_reload_stats", None
+            )
+            if reload_stats is not None:
+                expected_pairs = reload_stats["expected_pairs"]
+                selected_pairs = reload_stats["selected_pairs"]
+                unmatched_pairs = sorted(expected_pairs - selected_pairs)
+                logger.info(
+                    "[NPU FT] missing-expert checkpoint coverage: rank=%d "
+                    "expected_pairs=%d selected_pairs=%d selected_tensors=%d",
+                    tp_rank,
+                    len(expected_pairs),
+                    len(selected_pairs),
+                    reload_stats["selected_weight_names"],
+                )
+                if unmatched_pairs:
+                    raise RuntimeError(
+                        "NPU FT checkpoint filter did not find every requested "
+                        "expert: "
+                        f"rank={tp_rank} unmatched_pairs={unmatched_pairs[:32]} "
+                        f"unmatched_count={len(unmatched_pairs)}"
+                    )
         logger.info(
             "[NPU FT] missing-expert reload end: rank=%d source=%s "
             "layers=%d expert_layer_pairs=%d elapsed=%.3fs",
