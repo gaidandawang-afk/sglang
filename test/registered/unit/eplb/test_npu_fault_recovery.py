@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.eplb import expert_distribution
+from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 from sglang.srt.eplb.expert_location_updater import (
     update_expert_weights_single_layer,
 )
@@ -30,7 +31,104 @@ class _CompletedWork:
         return None
 
 
+def _make_expert_location_metadata(physical_to_logical, ep_size=4):
+    physical_to_logical = torch.tensor(physical_to_logical, dtype=torch.int64)
+    num_layers, num_physical_experts = physical_to_logical.shape
+    num_logical_experts = int(physical_to_logical.max().item()) + 1
+    logical_to_all = torch.full(
+        (num_layers, num_logical_experts, num_physical_experts),
+        -1,
+        dtype=torch.int64,
+    )
+    counts = torch.zeros(
+        (num_layers, num_logical_experts),
+        dtype=torch.int64,
+    )
+    for layer_id in range(num_layers):
+        for physical_id in range(num_physical_experts):
+            logical_id = int(physical_to_logical[layer_id, physical_id].item())
+            offset = int(counts[layer_id, logical_id].item())
+            logical_to_all[layer_id, logical_id, offset] = physical_id
+            counts[layer_id, logical_id] += 1
+    return ExpertLocationMetadata(
+        physical_to_logical_map=physical_to_logical.clone(),
+        physical_to_logical_map_cpu=physical_to_logical.clone(),
+        logical_to_all_physical_map=logical_to_all.clone(),
+        logical_to_all_physical_map_cpu=logical_to_all.clone(),
+        logical_to_all_physical_map_num_valid=counts,
+        ep_size=ep_size,
+        logical_to_rank_dispatch_physical_map=None,
+    )
+
+
 class TestNpuExpertRecovery(CustomTestCase):
+    def test_fault_layout_preserves_survivor_slots_when_coverage_is_complete(self):
+        old_metadata = _make_expert_location_metadata(
+            [[0, 1, 2, 3, 0, 1, 2, 3]]
+        )
+        server_args = SimpleNamespace(ep_dispatch_algorithm="dynamic")
+
+        recovered = ExpertLocationMetadata.init_for_fault_recovery(
+            server_args,
+            old_metadata,
+            active_ranks=[True, True, True, False],
+        )
+
+        self.assertTrue(
+            torch.equal(
+                recovered.physical_to_logical_map_cpu,
+                old_metadata.physical_to_logical_map_cpu,
+            )
+        )
+        valid_locations = recovered.logical_to_all_physical_map_cpu[
+            recovered.logical_to_all_physical_map_cpu >= 0
+        ]
+        self.assertFalse((valid_locations >= 6).any().item())
+        self.assertTrue(
+            (recovered.logical_to_all_physical_map_num_valid >= 1).all().item()
+        )
+
+    def test_fault_layout_replaces_only_a_redundant_slot_for_missing_expert(self):
+        old_metadata = _make_expert_location_metadata(
+            [[0, 0, 1, 1, 2, 2, 3, 3]]
+        )
+        server_args = SimpleNamespace(ep_dispatch_algorithm="dynamic")
+
+        recovered = ExpertLocationMetadata.init_for_fault_recovery(
+            server_args,
+            old_metadata,
+            active_ranks=[True, True, True, False],
+        )
+
+        changed = (
+            recovered.physical_to_logical_map_cpu
+            != old_metadata.physical_to_logical_map_cpu
+        )
+        self.assertEqual(changed.sum().item(), 1)
+        self.assertEqual(recovered.physical_to_logical_map_cpu[0, 0].item(), 3)
+        self.assertEqual(
+            recovered.physical_to_logical_map_cpu[0, 6:].tolist(),
+            old_metadata.physical_to_logical_map_cpu[0, 6:].tolist(),
+        )
+        valid_locations = recovered.logical_to_all_physical_map_cpu[
+            recovered.logical_to_all_physical_map_cpu >= 0
+        ]
+        self.assertFalse((valid_locations >= 6).any().item())
+        self.assertTrue(
+            (recovered.logical_to_all_physical_map_num_valid >= 1).all().item()
+        )
+
+    def test_fault_layout_rejects_insufficient_survivor_capacity(self):
+        old_metadata = _make_expert_location_metadata([[0, 1, 2, 3]])
+        server_args = SimpleNamespace(ep_dispatch_algorithm="dynamic")
+
+        with self.assertRaisesRegex(RuntimeError, "insufficient survivor"):
+            ExpertLocationMetadata.init_for_fault_recovery(
+                server_args,
+                old_metadata,
+                active_ranks=[True, True, True, False],
+            )
+
     def test_periodic_eplb_stats_use_rebuilt_survivor_group(self):
         accumulator = expert_distribution._StatAccumulator.__new__(
             expert_distribution._StatAccumulator
