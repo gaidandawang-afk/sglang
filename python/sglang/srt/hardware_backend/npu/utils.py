@@ -200,6 +200,38 @@ def npu_format_cast(
     return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
 
 
+def copy_npu_formatted_tensor_(
+    destination: torch.Tensor, source: torch.Tensor
+) -> torch.Tensor:
+    """Copy equal-layout NPU tensors without reinterpreting an offset view.
+
+    ``Tensor.copy_`` performs a logical format conversion for NPU internal
+    formats.  That is normally desirable, but it cannot safely update one
+    leading-dimension slice of a larger FRACTAL_NZ tensor: the slice retains
+    the parent storage descriptor and a non-zero storage offset.  Expert
+    movement and FT reload already provide a source with the destination's
+    physical format, so copy the formatted bytes directly instead.
+
+    Callers must guarantee matching shape, dtype, device and NPU format.
+    Keeping this as a small, explicit primitive also makes it harder to use a
+    raw copy accidentally for ordinary logical tensors.
+    """
+
+    if destination.device.type != "npu" or source.device.type != "npu":
+        raise ValueError("formatted NPU copy requires two NPU tensors")
+    if (
+        destination.shape != source.shape
+        or destination.dtype != source.dtype
+        or destination.device != source.device
+    ):
+        raise ValueError(
+            "formatted NPU copy requires matching tensors: "
+            f"destination={destination.shape}/{destination.dtype}/{destination.device} "
+            f"source={source.shape}/{source.dtype}/{source.device}"
+        )
+    return torch.ops.npu.copy_memory_(destination, source, False)
+
+
 def get_indexer_weight_stream():
     global indexer_weight_stream
     if indexer_weight_stream is None:

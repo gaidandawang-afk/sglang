@@ -690,6 +690,11 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
 
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
         weight.data = npu_format_cast(weight)
+        # Online FT reload must preserve this storage because graph replay
+        # captures its address. The fused-MoE loader uses the marker to stage a
+        # complete expert in ND, format it, and raw-copy it into one physical
+        # expert slot instead of calling copy_ on a FRACTAL_NZ slice.
+        weight._sglang_npu_formatted_expert_weight = True
 
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")

@@ -1,4 +1,5 @@
 import ast
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +8,22 @@ from unittest.mock import Mock
 
 import torch
 
+if sys.platform == "darwin":
+    # Triton is unavailable on macOS. This file deliberately AST-loads only
+    # the CPU-testable functions, so retain a local runner fallback without
+    # importing the full sglang package. Linux CI uses the real test helpers.
+    CustomTestCase = unittest.TestCase
+
+    def register_cpu_ci(**_kwargs):
+        return None
+
+else:
+    from sglang.test.ci.ci_register import register_cpu_ci
+    from sglang.test.test_utils import CustomTestCase
+
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 WEIGHT_UPDATER_PATH = (
@@ -14,10 +31,14 @@ WEIGHT_UPDATER_PATH = (
     / "python/sglang/srt/model_executor/model_runner_components/weight_updater.py"
 )
 QWEN3_MOE_PATH = REPO_ROOT / "python/sglang/srt/models/qwen3_moe.py"
+FUSED_MOE_PATH = (
+    REPO_ROOT / "python/sglang/srt/layers/moe/fused_moe_triton/layer.py"
+)
+EXPERT_UPDATER_PATH = REPO_ROOT / "python/sglang/srt/eplb/expert_location_updater.py"
 
 
-def load_functions(names):
-    tree = ast.parse(WEIGHT_UPDATER_PATH.read_text(encoding="utf-8"))
+def load_functions(names, path=WEIGHT_UPDATER_PATH):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
     functions = [
         node
         for node in tree.body
@@ -28,10 +49,10 @@ def load_functions(names):
         "Callable": Callable,
         "DefaultModelLoader": object,
         "Optional": Optional,
-        "torch": SimpleNamespace(device=object),
+        "torch": torch,
     }
     module = ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[]))
-    exec(compile(module, str(WEIGHT_UPDATER_PATH), "exec"), namespace)
+    exec(compile(module, str(path), "exec"), namespace)
     return {name: namespace[name] for name in names}
 
 
@@ -54,7 +75,7 @@ def load_class_method(path, class_name, method_name):
     return namespace[method_name]
 
 
-class TestNpuPartialWeightReload(unittest.TestCase):
+class TestNpuPartialWeightReload(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         functions = load_functions(
@@ -69,11 +90,30 @@ class TestNpuPartialWeightReload(unittest.TestCase):
             ]
         )
         cls.load_weights = staticmethod(functions["_load_weights_for_disk_update"])
+        cls.copy_expert = staticmethod(
+            load_functions({"_copy_expert_tensor_"}, EXPERT_UPDATER_PATH)[
+                "_copy_expert_tensor_"
+            ]
+        )
         cls.validate_probe = staticmethod(
             load_class_method(
                 QWEN3_MOE_PATH,
                 "Qwen3MoeForCausalLM",
                 "validate_ft_reloaded_expert_probe",
+            )
+        )
+        cls.load_formatted_expert = staticmethod(
+            load_class_method(
+                FUSED_MOE_PATH,
+                "FusedMoE",
+                "_load_npu_formatted_expert_weight",
+            )
+        )
+        cls.finalize_formatted_expert = staticmethod(
+            load_class_method(
+                FUSED_MOE_PATH,
+                "FusedMoE",
+                "finalize_npu_formatted_expert_reload",
             )
         )
 
@@ -95,7 +135,9 @@ class TestNpuPartialWeightReload(unittest.TestCase):
 
     def test_filtered_npu_reload_calls_model_loader_without_full_postprocess(self):
         loader = SimpleNamespace(load_weights_and_postprocess=Mock())
-        model = SimpleNamespace(load_weights=Mock())
+        model = SimpleNamespace(
+            load_weights=Mock(), finalize_ft_filtered_weight_reload=Mock()
+        )
         weights = object()
 
         result = self.load_weights(
@@ -108,6 +150,7 @@ class TestNpuPartialWeightReload(unittest.TestCase):
 
         self.assertIs(result, model)
         model.load_weights.assert_called_once_with(weights)
+        model.finalize_ft_filtered_weight_reload.assert_called_once_with()
         loader.load_weights_and_postprocess.assert_not_called()
 
     def test_normal_reload_keeps_full_postprocess(self):
@@ -129,6 +172,14 @@ class TestNpuPartialWeightReload(unittest.TestCase):
             model, weights, target_device
         )
         model.load_weights.assert_not_called()
+
+    def test_expert_copy_keeps_normal_copy_path_off_npu(self):
+        source = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+        destination = torch.zeros_like(source)
+
+        self.copy_expert(destination, source)
+
+        self.assertTrue(torch.equal(destination, source))
 
     def test_qwen_filter_reports_checkpoint_pair_coverage(self):
         generate_filter = load_class_method(
@@ -216,6 +267,67 @@ class TestNpuPartialWeightReload(unittest.TestCase):
         reload_stats["source_probes"]["gate_proj"][0] += 1
         with self.assertRaisesRegex(RuntimeError, "incorrect physical slot"):
             self.validate_probe(model, reload_stats, tp_rank=2)
+
+    def test_formatted_w13_reload_commits_only_after_both_halves(self):
+        destination = torch.zeros((6, 4), dtype=torch.bfloat16)
+        gate = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+        up = gate + 20
+
+        def load_w13(*, expert_data, shard_id, loaded_weight, **_kwargs):
+            start = 0 if shard_id == "w1" else expert_data.shape[0] // 2
+            expert_data[start : start + loaded_weight.shape[0]].copy_(loaded_weight)
+
+        owner = SimpleNamespace(
+            _load_w13=load_w13,
+            _load_w2=Mock(),
+            _commit_npu_formatted_expert_reload=Mock(),
+        )
+        param = SimpleNamespace()
+        kwargs = {
+            "param": param,
+            "expert_data": destination,
+            "expert_id": 7,
+            "shard_dim": 0,
+            "tp_rank": 0,
+        }
+
+        self.load_formatted_expert(
+            owner, shard_id="w1", loaded_weight=gate, **kwargs
+        )
+        owner._commit_npu_formatted_expert_reload.assert_not_called()
+        self.load_formatted_expert(
+            owner, shard_id="w3", loaded_weight=up, **kwargs
+        )
+
+        owner._commit_npu_formatted_expert_reload.assert_called_once()
+        committed_destination, committed_staging = (
+            owner._commit_npu_formatted_expert_reload.call_args.args
+        )
+        self.assertIs(committed_destination, destination)
+        self.assertTrue(torch.equal(committed_staging[:3], gate))
+        self.assertTrue(torch.equal(committed_staging[3:], up))
+        self.assertEqual(owner._npu_formatted_expert_reload_pending, {})
+
+    def test_formatted_reload_rejects_incomplete_w13(self):
+        destination = torch.zeros((6, 4), dtype=torch.bfloat16)
+        owner = SimpleNamespace(
+            _load_w13=lambda **_kwargs: None,
+            _load_w2=Mock(),
+            _commit_npu_formatted_expert_reload=Mock(),
+        )
+        self.load_formatted_expert(
+            owner,
+            param=SimpleNamespace(),
+            expert_data=destination,
+            expert_id=3,
+            shard_dim=0,
+            shard_id="w1",
+            loaded_weight=torch.zeros((3, 4), dtype=torch.bfloat16),
+            tp_rank=0,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "Incomplete NPU formatted"):
+            self.finalize_formatted_expert(owner)
 
 
 if __name__ == "__main__":

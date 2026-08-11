@@ -1277,6 +1277,18 @@ class Qwen3MoeForCausalLM(nn.Module):
             "max_abs_diff": max_abs_diff,
         }
 
+    def finalize_ft_filtered_weight_reload(self) -> None:
+        """Reject a checkpoint reload that left an incomplete fused w13."""
+
+        for layer in self.model.layers:
+            mlp = getattr(layer, "mlp", None)
+            experts = getattr(mlp, "experts", None)
+            finalize = getattr(
+                experts, "finalize_npu_formatted_expert_reload", None
+            )
+            if callable(finalize):
+                finalize()
+
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
