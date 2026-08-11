@@ -23,7 +23,7 @@ from sglang.srt.runtime_context import get_server_args
 
 @dataclass
 class ExpertLocationDispatchInfo:
-    ep_dispatch_algorithm: Literal["static", "random"]
+    ep_dispatch_algorithm: Literal["static", "dynamic", "fake", "lp"]
     # (num_logical_experts,)
     partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     # (num_logical_experts, X)
@@ -31,15 +31,54 @@ class ExpertLocationDispatchInfo:
     # (num_logical_experts,)
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
     num_physical_experts: int
+    # NPU MC2 communicates in a compact survivor-rank expert namespace while
+    # EPLB keeps storage IDs in the immutable original-rank namespace.  These
+    # fields are populated before graph capture and the tensor is updated
+    # in-place after scale-down.
+    npu_mc2_elastic_info: Optional[torch.Tensor] = None
+    npu_mc2_original_ep_size: int = 0
+    npu_mc2_num_local_physical_experts: int = 0
 
     @classmethod
     def init_new(cls, layer_id: int):
-        ep_dispatch_algorithm = get_server_args().ep_dispatch_algorithm
+        server_args = get_server_args()
+        ep_dispatch_algorithm = server_args.ep_dispatch_algorithm
         expert_location_metadata = get_global_expert_location_metadata()
         assert expert_location_metadata is not None
 
         if ep_dispatch_algorithm is None:
             return None
+
+        npu_mc2_elastic_info = None
+        npu_mc2_original_ep_size = 0
+        npu_mc2_num_local_physical_experts = 0
+        if (
+            server_args.device == "npu"
+            and server_args.enable_fault_tolerance
+            and server_args.elastic_ep_backend == "mc2"
+        ):
+            from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+            state = ElasticEPStateManager.instance()
+            if state is None or state.npu_mc2_elastic_info is None:
+                raise RuntimeError(
+                    "NPU MC2 fault tolerance requires fixed elastic_info "
+                    "before expert dispatch"
+                )
+            npu_mc2_elastic_info = state.npu_mc2_elastic_info.tensor
+            npu_mc2_original_ep_size = state.original_ep_size
+            (
+                npu_mc2_num_local_physical_experts,
+                remainder,
+            ) = divmod(
+                expert_location_metadata.num_physical_experts,
+                npu_mc2_original_ep_size,
+            )
+            if remainder != 0:
+                raise RuntimeError(
+                    "NPU MC2 expert storage must be divisible by the original "
+                    "EP size"
+                )
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
@@ -58,6 +97,9 @@ class ExpertLocationDispatchInfo:
                 layer_id, :
             ],
             num_physical_experts=expert_location_metadata.num_physical_experts,
+            npu_mc2_elastic_info=npu_mc2_elastic_info,
+            npu_mc2_original_ep_size=npu_mc2_original_ep_size,
+            npu_mc2_num_local_physical_experts=npu_mc2_num_local_physical_experts,
         )
 
 
@@ -82,17 +124,31 @@ def topk_ids_logical_to_physical(
         return topk_ids
 
     if info.ep_dispatch_algorithm == "static":
-        return _topk_ids_logical_to_physical_static(topk_ids, info)
-    if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
-        return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
-    if info.ep_dispatch_algorithm == "lp":
+        physical_topk_ids = _topk_ids_logical_to_physical_static(topk_ids, info)
+    elif info.ep_dispatch_algorithm in ["dynamic", "fake"]:
+        physical_topk_ids = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+    elif info.ep_dispatch_algorithm == "lp":
         if log2phy_prob is None:
             raise RuntimeError(
                 "ep_dispatch_algorithm='lp' but log2phy_prob is None at dispatch "
                 f"time (topk_ids.shape={tuple(topk_ids.shape)})."
             )
-        return _topk_ids_logical_to_physical_probability(topk_ids, info, log2phy_prob)
-    raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
+        physical_topk_ids = _topk_ids_logical_to_physical_probability(
+            topk_ids, info, log2phy_prob
+        )
+    else:
+        raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
+
+    if info.npu_mc2_elastic_info is not None:
+        from sglang.srt.elastic_ep.npu_mc2 import compact_mc2_physical_expert_ids
+
+        physical_topk_ids = compact_mc2_physical_expert_ids(
+            physical_topk_ids,
+            elastic_info=info.npu_mc2_elastic_info,
+            original_ep_size=info.npu_mc2_original_ep_size,
+            num_local_physical_experts=info.npu_mc2_num_local_physical_experts,
+        )
+    return physical_topk_ids
 
 
 def _topk_ids_logical_to_physical_static(
