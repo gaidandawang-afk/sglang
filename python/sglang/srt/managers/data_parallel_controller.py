@@ -310,10 +310,19 @@ class DataParallelController:
 
     def shutdown_dp(self, obj: FaultToleranceDPCShutdownReqInput):
         targets = set(obj.target_dp_ranks)
+        logger.warning(
+            "FT DPC shutdown request targets only DP rank(s) %s",
+            sorted(targets),
+        )
         for proc, dp_rank in zip(
             self.scheduler_procs, self.scheduler_process_dp_ranks
         ):
             if dp_rank in targets and proc.is_alive():
+                logger.warning(
+                    "FT DPC killing requested scheduler DP rank %s (pid=%s)",
+                    dp_rank,
+                    proc.pid,
+                )
                 proc.kill()
 
     def _handle_scheduler_process_exit(self, index, proc, name):

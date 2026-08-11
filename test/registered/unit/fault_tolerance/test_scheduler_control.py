@@ -389,7 +389,8 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
     def test_shutdown_kills_every_local_member_of_target_dp(self):
         dpc, _ = self.make_dpc()
         dpc.scheduler_procs = [
-            SimpleNamespace(is_alive=lambda: True, kill=Mock()) for _ in range(3)
+            SimpleNamespace(pid=100 + rank, is_alive=lambda: True, kill=Mock())
+            for rank in range(3)
         ]
         request = FaultToleranceDPCShutdownReqInput(target_dp_ranks=[1])
 

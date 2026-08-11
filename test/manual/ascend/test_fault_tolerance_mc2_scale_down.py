@@ -41,6 +41,9 @@ DEVICE_RESTART_LOG_PATTERN = re.compile(
     r"\[NPU FT\] restarted survivor device without rebuilding graph "
     r"resources: rank=(?P<rank>\d+) device_id=(?P<device_id>\d+)"
 )
+SCHEDULER_PROCESS_TITLE_PATTERN = re.compile(
+    r"(?:^|\s)sglang::scheduler_DP(?P<dp_rank>\d+)(?:_|\s|$)"
+)
 
 
 def _http_json(
@@ -58,6 +61,36 @@ def _http_json(
 
 def _rank_states(status: dict[str, Any]) -> dict[int, str]:
     return {int(item["rank"]): str(item["state"]) for item in status["ranks"]}
+
+
+def _validate_victim_pid_rank(victim_pid: int, victim_rank: int) -> None:
+    """Reject a Linux Scheduler PID that belongs to a different DP rank."""
+
+    cmdline_path = Path(f"/proc/{victim_pid}/cmdline")
+    if not cmdline_path.exists():
+        return
+    try:
+        process_title = (
+            cmdline_path.read_bytes()
+            .replace(b"\0", b" ")
+            .decode(errors="replace")
+            .strip()
+        )
+    except OSError:
+        # Some hardened /proc mounts hide command lines. The server-side DPC
+        # target logs remain the fallback evidence in that environment.
+        return
+
+    match = SCHEDULER_PROCESS_TITLE_PATTERN.search(process_title)
+    if match is None:
+        return
+    pid_dp_rank = int(match.group("dp_rank"))
+    if pid_dp_rank != victim_rank:
+        raise ValueError(
+            f"--victim-pid {victim_pid} belongs to DP rank {pid_dp_rank}, "
+            f"but --victim-rank is {victim_rank}; refusing to inject two "
+            "different rank failures"
+        )
 
 
 def _wait_for_incident(
@@ -304,7 +337,7 @@ def main() -> None:
     fault.add_argument(
         "--victim-pid",
         type=int,
-        help="Scheduler PID to terminate with SIGKILL",
+        help="Scheduler PID for --victim-rank to terminate with SIGKILL",
     )
     fault.add_argument(
         "--wait-for-existing-incident",
@@ -358,6 +391,7 @@ def main() -> None:
     )
 
     if args.victim_pid is not None:
+        _validate_victim_pid_rank(args.victim_pid, args.victim_rank)
         os.kill(args.victim_pid, signal.SIGKILL)
 
     incident = _wait_for_incident(
