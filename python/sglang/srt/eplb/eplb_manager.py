@@ -390,6 +390,21 @@ def update_expert_location_with_recovery(
                         f"rank={tp_rank} unmatched_pairs={unmatched_pairs[:32]} "
                         f"unmatched_count={len(unmatched_pairs)}"
                     )
+                if envs.SGLANG_NPU_FT_VERIFY_EXPERT_RELOAD.get():
+                    validate_probe = getattr(
+                        model, "validate_ft_reloaded_expert_probe", None
+                    )
+                    if not callable(validate_probe):
+                        raise RuntimeError(
+                            "SGLANG_NPU_FT_VERIFY_EXPERT_RELOAD requires a "
+                            "model-specific expert content validator"
+                        )
+                    probe_result = validate_probe(reload_stats, tp_rank)
+                    logger.info(
+                        "[NPU FT] missing-expert content probe: rank=%d %s",
+                        tp_rank,
+                        probe_result,
+                    )
         logger.info(
             "[NPU FT] missing-expert reload end: rank=%d source=%s "
             "layers=%d expert_layer_pairs=%d elapsed=%.3fs",

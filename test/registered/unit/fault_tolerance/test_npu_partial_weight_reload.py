@@ -5,6 +5,8 @@ from types import SimpleNamespace
 from typing import Any, Callable, Optional
 from unittest.mock import Mock
 
+import torch
+
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 WEIGHT_UPDATER_PATH = (
@@ -46,7 +48,7 @@ def load_class_method(path, class_name, method_name):
         if isinstance(node, ast.FunctionDef) and node.name == method_name
     )
     method.decorator_list = []
-    namespace = {"Dict": dict, "List": list}
+    namespace = {"Dict": dict, "List": list, "torch": torch}
     module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
     exec(compile(module, str(path), "exec"), namespace)
     return namespace[method_name]
@@ -67,6 +69,13 @@ class TestNpuPartialWeightReload(unittest.TestCase):
             ]
         )
         cls.load_weights = staticmethod(functions["_load_weights_for_disk_update"])
+        cls.validate_probe = staticmethod(
+            load_class_method(
+                QWEN3_MOE_PATH,
+                "Qwen3MoeForCausalLM",
+                "validate_ft_reloaded_expert_probe",
+            )
+        )
 
     def test_only_filtered_unquantized_npu_reload_skips_postprocess(self):
         weight_filter = lambda _name: True
@@ -143,6 +152,70 @@ class TestNpuPartialWeightReload(unittest.TestCase):
         self.assertEqual(stats["expected_pairs"], {(2, 64), (2, 65)})
         self.assertEqual(stats["selected_pairs"], {(2, 64), (2, 65)})
         self.assertEqual(stats["selected_weight_names"], 2)
+        self.assertEqual(stats["probe_pair"], (2, 64))
+
+        observe_weight = weight_filter._sglang_ft_observe_weight
+        source_weight = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+        for component in ("gate_proj", "up_proj", "down_proj"):
+            observe_weight(
+                f"model.layers.2.mlp.experts.64.{component}.weight",
+                source_weight,
+            )
+        self.assertEqual(
+            set(stats["source_probes"]),
+            {"gate_proj", "up_proj", "down_proj"},
+        )
+        self.assertEqual(
+            stats["source_probes"]["gate_proj"],
+            [0.0, 1.0, 2.0, 3.0],
+        )
+
+    def test_qwen_probe_checks_original_rank_local_slot_contents(self):
+        gate = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+        up = gate + 20
+        down = gate + 40
+        w13 = torch.zeros((64, 6, 4), dtype=torch.bfloat16)
+        w2 = torch.zeros((64, 3, 4), dtype=torch.bfloat16)
+        w13[1, :3] = gate
+        w13[1, 3:] = up
+        w2[1] = down
+
+        experts = SimpleNamespace(
+            moe_tp_size=1,
+            _expert_storage_rank=2,
+            _num_local_routed=64,
+            quant_method=SimpleNamespace(load_up_proj_weight_first=False),
+            w13_weight=SimpleNamespace(data=w13),
+            w2_weight=SimpleNamespace(data=w2),
+        )
+        layers = [None, None, SimpleNamespace(mlp=SimpleNamespace(experts=experts))]
+        model = SimpleNamespace(model=SimpleNamespace(layers=layers))
+        metadata = SimpleNamespace(logical_to_all_physical=lambda *_args: [129])
+        self.validate_probe.__globals__["get_global_expert_location_metadata"] = (
+            lambda: metadata
+        )
+
+        def make_probe(weight):
+            return weight.reshape(-1)[:4].to(torch.float32).tolist()
+
+        reload_stats = {
+            "probe_pair": (2, 65),
+            "source_probes": {
+                "gate_proj": make_probe(gate),
+                "up_proj": make_probe(up),
+                "down_proj": make_probe(down),
+            },
+        }
+
+        result = self.validate_probe(model, reload_stats, tp_rank=2)
+
+        self.assertEqual(result["physical_expert_id"], 129)
+        self.assertEqual(result["local_slot"], 1)
+        self.assertEqual(result["max_abs_diff"], 0.0)
+
+        reload_stats["source_probes"]["gate_proj"][0] += 1
+        with self.assertRaisesRegex(RuntimeError, "incorrect physical slot"):
+            self.validate_probe(model, reload_stats, tp_rank=2)
 
 
 if __name__ == "__main__":
