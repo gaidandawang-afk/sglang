@@ -191,6 +191,78 @@ def create_temp_buffers(sample_tensors):
     return [torch.empty_like(tensor) for tensor in sample_tensors]
 
 
+def _needs_npu_p2p_staging(tensor: torch.Tensor) -> bool:
+    return tensor.device.type == "npu" and tensor.storage_offset() != 0
+
+
+def _stage_npu_p2p_ops(
+    p2p_ops: List[P2POp],
+) -> Tuple[List[P2POp], List[Tuple[torch.Tensor, torch.Tensor]]]:
+    """Give HCCL offset-zero buffers for internal-format tensor views.
+
+    Expert weights are stored with the local-expert dimension first, so
+    selecting any expert after index 0 usually returns a view with a non-zero
+    storage offset. HCCL rejects such views when their underlying NPU tensor
+    uses an internal format. Stage only those NPU views; CUDA/ROCm retain the
+    existing zero-copy behavior.
+    """
+
+    staged_ops = []
+    recv_copy_infos = []
+    staged_send_tensors = {}
+    for op in p2p_ops:
+        tensor = op.tensor
+        if not _needs_npu_p2p_staging(tensor):
+            staged_ops.append(op)
+            continue
+
+        if op.op == torch.distributed.irecv:
+            staged_tensor = torch.empty_like(tensor)
+            recv_copy_infos.append((staged_tensor, tensor))
+        elif op.op == torch.distributed.isend:
+            # A single expert tensor can be sent to multiple peers. Reuse one
+            # offset-zero clone instead of multiplying the memory peak by the
+            # destination fanout.
+            send_key = (
+                tensor.device,
+                tensor.data_ptr(),
+                tensor.storage_offset(),
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+                tensor.dtype,
+            )
+            staged_tensor = staged_send_tensors.get(send_key)
+            if staged_tensor is None:
+                staged_tensor = tensor.clone()
+                staged_send_tensors[send_key] = staged_tensor
+        else:
+            raise ValueError(f"Unsupported P2P operation: {op.op}")
+
+        if staged_tensor.storage_offset() != 0:
+            raise RuntimeError(
+                "Failed to create an offset-zero NPU staging tensor for EPLB P2P."
+            )
+
+        staged_ops.append(
+            P2POp(
+                op=op.op,
+                tensor=staged_tensor,
+                peer=op.peer,
+                group=op.group,
+                tag=op.tag,
+            )
+        )
+
+    return staged_ops, recv_copy_infos
+
+
+def _copy_staged_p2p_recvs(
+    recv_copy_infos: List[Tuple[torch.Tensor, torch.Tensor]],
+):
+    for staged_tensor, destination_tensor in recv_copy_infos:
+        destination_tensor.copy_(staged_tensor)
+
+
 def update_expert_weights_single_layer(
     routed_experts_weights: List[torch.Tensor],
     temp_buffers: List[torch.Tensor],
@@ -581,9 +653,16 @@ def update_expert_weights_single_layer(
                 if eid in ops_by_expert:
                     batch_ops.extend(ops_by_expert[eid])
             if batch_ops:
+                batch_ops, recv_copy_infos = _stage_npu_p2p_ops(batch_ops)
                 reqs = torch.distributed.batch_isend_irecv(batch_ops)
                 for req in reqs:
                     req.wait()
+                if reqs:
+                    del req
+                _copy_staged_p2p_recvs(recv_copy_infos)
+                # Release the offset-zero staging tensors before constructing
+                # the next batch. The device allocator can reuse their blocks.
+                del reqs, recv_copy_infos, batch_ops
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for (
