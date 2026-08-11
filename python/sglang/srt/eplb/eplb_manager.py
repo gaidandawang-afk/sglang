@@ -127,27 +127,58 @@ class EPLBManager:
             torch.get_device_module().synchronize()
             time_start = time.time()
 
-        if logical_count_override is None:
-            dump_record_output = get_global_expert_distribution_recorder().dump_record(
-                output_mode="object"
+        if recovering_from_rank_fault:
+            old_expert_location_metadata = get_global_expert_location_metadata()
+            expert_location_metadata = ExpertLocationMetadata.init_for_fault_recovery(
+                self._server_args,
+                old_expert_location_metadata,
+                elastic_ep_state.active_ranks_cpu,
+                moe_ep_rank=self._ps.tp_rank,
             )
-            logical_count = dump_record_output["logical_count"]
-            average_utilization_rate_over_window = dump_record_output[
-                "average_utilization_rate_over_window"
-            ]
+            changed_slots = int(
+                (
+                    expert_location_metadata.physical_to_logical_map_cpu
+                    != old_expert_location_metadata.physical_to_logical_map_cpu
+                )
+                .sum()
+                .item()
+            )
+            logger.info(
+                "[NPU FT] minimal expert recovery layout: rank=%d "
+                "active_original_ranks=%s changed_physical_slots=%d",
+                self._ps.tp_rank,
+                torch.nonzero(
+                    elastic_ep_state.active_ranks_cpu,
+                    as_tuple=False,
+                )
+                .flatten()
+                .tolist(),
+                changed_slots,
+            )
         else:
-            logical_count = logical_count_override
-            average_utilization_rate_over_window = None
+            if logical_count_override is None:
+                dump_record_output = (
+                    get_global_expert_distribution_recorder().dump_record(
+                        output_mode="object"
+                    )
+                )
+                logical_count = dump_record_output["logical_count"]
+                average_utilization_rate_over_window = dump_record_output[
+                    "average_utilization_rate_over_window"
+                ]
+            else:
+                logical_count = logical_count_override
+                average_utilization_rate_over_window = None
 
-        # Check whether rebalancing is needed
-        if not force and not self._check_rebalance_needed(
-            average_utilization_rate_over_window
-        ):
-            return
+            # Check whether rebalancing is needed
+            if not force and not self._check_rebalance_needed(
+                average_utilization_rate_over_window
+            ):
+                return
 
-        expert_location_metadata = ExpertLocationMetadata.init_by_eplb(
-            self._server_args, self._model_config, logical_count
-        )
+            expert_location_metadata = ExpertLocationMetadata.init_by_eplb(
+                self._server_args, self._model_config, logical_count
+            )
 
         from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
             init_lplb_solvers,
