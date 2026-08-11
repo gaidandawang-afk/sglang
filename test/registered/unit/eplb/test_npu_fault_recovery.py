@@ -9,6 +9,7 @@ import torch
 from sglang.srt.eplb import expert_distribution
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 from sglang.srt.eplb.expert_location_updater import (
+    _validate_survivor_movement_canary,
     update_expert_weights_single_layer,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -62,6 +63,25 @@ def _make_expert_location_metadata(physical_to_logical, ep_size=4):
 
 
 class TestNpuExpertRecovery(CustomTestCase):
+    def test_canary_skips_only_slots_pending_fallback_reload(self):
+        _validate_survivor_movement_canary(
+            expect_value=torch.tensor([2, 1]),
+            actual_value=torch.tensor([0, 1]),
+            missing_logical_experts=[2],
+            layer_id=7,
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            r"layer=7 local_slots=\[1\] expected=\[1\] actual=\[0\]",
+        ):
+            _validate_survivor_movement_canary(
+                expect_value=torch.tensor([2, 1]),
+                actual_value=torch.tensor([0, 0]),
+                missing_logical_experts=[2],
+                layer_id=7,
+            )
+
     def test_fault_layout_preserves_survivor_slots_when_coverage_is_complete(self):
         old_metadata = _make_expert_location_metadata(
             [[0, 1, 2, 3, 0, 1, 2, 3]]
