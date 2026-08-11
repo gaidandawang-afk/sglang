@@ -3,7 +3,7 @@
 import unittest
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 import torch
 
@@ -169,6 +169,40 @@ class TestNpuFTSurvivorProcessGroups(CustomTestCase):
         )
         self.assertEqual(reduced.item(), 10)
 
+    def test_rebuilt_mlp_sync_gather_has_bounded_wait(self):
+        groups = NpuFTSurvivorProcessGroups(
+            store=object(),
+            original_rank=2,
+            original_world_size=4,
+            timeout_sec=600,
+            generation=1,
+            active_original_ranks=(0, 2, 3),
+            cpu_group="gloo-pg",
+            scheduler_device_group="scheduler-hccl-pg",
+            eplb_device_group="eplb-hccl-pg",
+        )
+        work = Mock()
+        work.wait.return_value = False
+
+        with (
+            patch(
+                "sglang.srt.fault_tolerance.npu_metadata.dist.all_gather",
+                return_value=work,
+            ) as all_gather,
+            self.assertRaisesRegex(
+                TimeoutError, "returning to the FT control loop"
+            ),
+        ):
+            groups.all_gather_tensor(torch.tensor([2]), timeout_sec=5)
+
+        all_gather.assert_called_once_with(
+            [ANY, ANY, ANY],
+            ANY,
+            group="scheduler-hccl-pg",
+            async_op=True,
+        )
+        work.wait.assert_called_once_with(timeout=timedelta(seconds=5))
+
     def test_inactive_rank_cannot_rebuild(self):
         groups = NpuFTSurvivorProcessGroups(
             store=object(),
@@ -317,8 +351,9 @@ class TestNpuFTSurvivorProcessGroups(CustomTestCase):
 
     def test_mlp_sync_maps_survivors_back_to_fixed_original_slots(self):
         class _GatherGroup:
-            def all_gather_tensor(self, local_tensor):
+            def all_gather_tensor(self, local_tensor, *, timeout_sec=None):
                 self.local_tensor = local_tensor
+                self.timeout_sec = timeout_sec
                 return {
                     0: torch.tensor([2, 2, 1, 0, 1, ForwardMode.DECODE.value, 0]),
                     2: torch.tensor([3, 3, 1, 0, 1, ForwardMode.DECODE.value, 0]),
@@ -358,6 +393,7 @@ class TestNpuFTSurvivorProcessGroups(CustomTestCase):
 
         self.assertEqual(sync_info.global_num_tokens, [2, 0, 3, 4])
         self.assertEqual(sync_info.tp0_info[1, 5].item(), ForwardMode.IDLE.value)
+        self.assertEqual(gather_group.timeout_sec, 5)
 
     def test_pre_scale_mlp_sync_has_bounded_wait_for_ft_control_liveness(self):
         work = Mock()

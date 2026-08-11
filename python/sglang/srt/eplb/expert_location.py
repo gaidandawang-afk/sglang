@@ -250,12 +250,25 @@ class ExpertLocationMetadata:
             raise ValueError("fault recovery requires at least one active rank")
 
         num_local_physical_experts = old_metadata.num_local_physical_experts
-        active_physical_ids = [
-            rank * num_local_physical_experts + local_slot
+        active_original_ranks = [
+            rank
             for rank, is_active in enumerate(active_rank_values)
             if bool(is_active)
+        ]
+        active_physical_ids = [
+            rank * num_local_physical_experts + local_slot
+            for rank in active_original_ranks
             for local_slot in range(num_local_physical_experts)
         ]
+        active_physical_ids_by_rank = {
+            rank: list(
+                range(
+                    rank * num_local_physical_experts,
+                    (rank + 1) * num_local_physical_experts,
+                )
+            )
+            for rank in active_original_ranks
+        }
         num_logical_experts = old_metadata.num_logical_experts
         if len(active_physical_ids) < num_logical_experts:
             raise RuntimeError(
@@ -290,16 +303,38 @@ class ExpertLocationMetadata:
                 replica_counts == 0,
                 as_tuple=False,
             ).flatten()
+            # Spread checkpoint/DRAM reloads across survivor ranks.  A simple
+            # scan over active_physical_ids would consume every redundant slot
+            # on the lowest original rank first.  Sequential scale-down from
+            # four ranks to two can then make one survivor reload half of the
+            # model while the other waits for its FT command acknowledgement.
+            replacement_rank_cursor = 0
             for missing_logical_id_tensor in missing_logical_ids:
                 missing_logical_id = int(missing_logical_id_tensor.item())
-                replacement_physical_id = next(
-                    (
-                        physical_id
-                        for physical_id in active_physical_ids
-                        if replica_counts[int(layer_map[physical_id].item())] > 1
-                    ),
-                    None,
-                )
+                replacement_physical_id = None
+                for rank_offset in range(len(active_original_ranks)):
+                    rank_index = (
+                        replacement_rank_cursor + rank_offset
+                    ) % len(active_original_ranks)
+                    candidate_rank = active_original_ranks[rank_index]
+                    replacement_physical_id = next(
+                        (
+                            physical_id
+                            for physical_id in active_physical_ids_by_rank[
+                                candidate_rank
+                            ]
+                            if replica_counts[
+                                int(layer_map[physical_id].item())
+                            ]
+                            > 1
+                        ),
+                        None,
+                    )
+                    if replacement_physical_id is not None:
+                        replacement_rank_cursor = (
+                            rank_index + 1
+                        ) % len(active_original_ranks)
+                        break
                 if replacement_physical_id is None:
                     raise RuntimeError(
                         "unable to reserve a survivor slot for missing logical "
