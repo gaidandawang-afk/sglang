@@ -225,7 +225,12 @@ class MLPSyncBatchInfo:
             )
 
             survivor_process_groups = get_npu_ft_metadata_group()
-            gathered = survivor_process_groups.all_gather_tensor(
+            # This metadata collective is graph-external and tiny.  Keep it on
+            # the rebuilt survivor Gloo group so a later rank failure can time
+            # out on the host.  WorkHCCL.wait(timeout) only inserts a device-
+            # stream dependency on supported TorchNPU versions; consuming the
+            # output can then block this device-owner thread indefinitely.
+            gathered = survivor_process_groups.all_gather_cpu_tensor(
                 local_info_tensor,
                 timeout_sec=_NPU_MC2_FT_MLP_SYNC_COLLECTIVE_TIMEOUT_SEC,
             )
