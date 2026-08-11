@@ -219,15 +219,26 @@ class WeightUpdater:
             )
 
         def get_weight_iter(config):
-            iter = loader._get_weights_iterator(
+            weight_iter = loader._get_weights_iterator(
                 DefaultModelLoader.Source.init_new(config, self.get_model())
             )
             if weight_name_filter is not None:
-                iter = (
-                    (name, weight) for name, weight in iter if weight_name_filter(name)
+                raw_weight_iter = weight_iter
+                weight_observer = getattr(
+                    weight_name_filter, "_sglang_ft_observe_weight", None
                 )
 
-            return iter
+                def filtered_weight_iter():
+                    for name, weight in raw_weight_iter:
+                        if not weight_name_filter(name):
+                            continue
+                        if weight_observer is not None:
+                            weight_observer(name, weight)
+                        yield name, weight
+
+                weight_iter = filtered_weight_iter()
+
+            return weight_iter
 
         def model_load_weights(model, iter):
             return _load_weights_for_disk_update(
