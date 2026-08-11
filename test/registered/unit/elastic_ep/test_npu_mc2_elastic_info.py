@@ -7,7 +7,6 @@ import torch
 from sglang.srt.elastic_ep.npu_mc2 import (
     NpuMC2ElasticInfo,
     build_mc2_elastic_info_values,
-    compact_mc2_physical_expert_ids,
 )
 from sglang.srt.eplb.eplb_algorithms.elasticity_aware import rebalance_experts
 from sglang.srt.eplb.expert_location_dispatch import (
@@ -47,67 +46,29 @@ class TestNpuMC2ElasticInfo(CustomTestCase):
             [1, 3, 0, 24, 0, -1, 1, 2, 0, 2, 3, -1],
         )
 
-    def test_original_physical_ids_are_compacted_around_rank_holes(self):
+    def test_expert_dispatch_preserves_original_ids_for_sparse_survivors(self):
         payload = build_mc2_elastic_info_values(
-            [1, 0, 1, 1],
-            original_ep_size=4,
-            num_local_physical_experts=8,
-        )
-        original_ids = torch.tensor(
-            [0, 7, 8, 15, 16, 23, 24, 31, -1], dtype=torch.int64
-        )
-
-        compact_ids = compact_mc2_physical_expert_ids(
-            original_ids,
-            elastic_info=payload,
-            original_ep_size=4,
-            num_local_physical_experts=8,
-        )
-
-        self.assertEqual(
-            compact_ids.tolist(),
-            [0, 7, -1, -1, 8, 15, 16, 23, -1],
-        )
-
-    def test_healthy_physical_id_compaction_is_identity(self):
-        payload = build_mc2_elastic_info_values(
-            [1, 1, 1, 1],
-            original_ep_size=4,
-            num_local_physical_experts=8,
-        )
-        original_ids = torch.tensor([0, 7, 8, 23, 31], dtype=torch.int32)
-
-        compact_ids = compact_mc2_physical_expert_ids(
-            original_ids,
-            elastic_info=payload,
-            original_ep_size=4,
-            num_local_physical_experts=8,
-        )
-
-        self.assertTrue(torch.equal(compact_ids, original_ids))
-
-    def test_expert_dispatch_compacts_survivor_storage_ids_for_mc2(self):
-        payload = build_mc2_elastic_info_values(
-            [1, 0, 1, 1],
+            [1, 0, 1, 0],
             original_ep_size=4,
             num_local_physical_experts=8,
         )
         info = ExpertLocationDispatchInfo(
             ep_dispatch_algorithm="static",
             partial_logical_to_rank_dispatch_physical_map=torch.tensor(
-                [0, 16, 24], dtype=torch.int64
+                [0, 16], dtype=torch.int64
             ),
             partial_logical_to_all_physical_map=torch.empty(0),
             partial_logical_to_all_physical_map_num_valid=torch.empty(0),
             num_physical_experts=32,
             npu_mc2_elastic_info=payload,
-            npu_mc2_original_ep_size=4,
-            npu_mc2_num_local_physical_experts=8,
         )
 
-        compact_ids = topk_ids_logical_to_physical(torch.tensor([0, 1, 2]), info)
+        original_ids = topk_ids_logical_to_physical(torch.tensor([0, 1]), info)
 
-        self.assertEqual(compact_ids.tolist(), [0, 8, 16])
+        # Rank 2 must remain original rank 2 (physical ID 16), rather than be
+        # pre-compacted to rank 1 (physical ID 8). elastic_info performs that
+        # rank translation inside MC2 exactly once.
+        self.assertEqual(original_ids.tolist(), [0, 16])
 
     def test_update_preserves_graph_captured_storage(self):
         elastic_info = NpuMC2ElasticInfo.create(
@@ -188,7 +149,7 @@ class TestNpuMC2ElasticInfo(CustomTestCase):
             ((valid_locations >= 43) & (valid_locations < 86)).any().item()
         )
 
-    def test_qwen3_redundant_layout_fits_mc2_compact_namespace(self):
+    def test_qwen3_redundant_layout_uses_active_original_rank_namespace(self):
         _, logical_to_physical, _ = rebalance_experts(
             weight=torch.arange(1, 129, dtype=torch.float32).repeat(2, 1),
             num_replicas=512,
@@ -198,23 +159,12 @@ class TestNpuMC2ElasticInfo(CustomTestCase):
             enable_hierarchical=False,
             active_ranks=torch.tensor([1, 0, 1, 1], dtype=torch.int32),
         )
-        payload = build_mc2_elastic_info_values(
-            [1, 0, 1, 1],
-            original_ep_size=4,
-            num_local_physical_experts=128,
-        )
-
-        compact_locations = compact_mc2_physical_expert_ids(
-            logical_to_physical,
-            elastic_info=payload,
-            original_ep_size=4,
-            num_local_physical_experts=128,
-        )
-
         valid = logical_to_physical >= 0
-        self.assertTrue((compact_locations[valid] >= 0).all().item())
-        self.assertTrue((compact_locations[valid] < 384).all().item())
-        self.assertTrue((compact_locations[~valid] == -1).all().item())
+        original_ranks = torch.div(
+            logical_to_physical[valid], 128, rounding_mode="floor"
+        )
+        self.assertTrue((logical_to_physical[valid] < 512).all().item())
+        self.assertFalse((original_ranks == 1).any().item())
 
 
 if __name__ == "__main__":
