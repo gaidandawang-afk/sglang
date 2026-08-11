@@ -23,6 +23,10 @@ MC2_LOG_PATTERN = re.compile(
     r"\[NPU FT\].*MC2.*rank=(?P<rank>\d+).*"
     r"data_ptr=(?P<data_ptr>\d+).*values=\[(?P<values>[^]]*)\]"
 )
+ORIGINAL_GLOO_PREWARM_LOG_PATTERN = re.compile(
+    r"\[NPU FT\] prewarmed original graph-external MLP-sync Gloo group: "
+    r"original_rank=(?P<rank>\d+)"
+)
 PROCESS_GROUP_LOG_PATTERN = re.compile(
     r"\[NPU FT\] rebuilt graph-external process groups: "
     r"generation=(?P<generation>\d+) original_rank=(?P<rank>\d+) "
@@ -112,6 +116,21 @@ def _response_text(response: Any) -> Any:
 
 def _parse_mc2_log(path: Path, original_world_size: int, victim_rank: int) -> dict:
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    prewarmed_original_ranks = sorted(
+        {
+            int(match.group("rank"))
+            for line in lines
+            if (match := ORIGINAL_GLOO_PREWARM_LOG_PATTERN.search(line))
+            is not None
+        }
+    )
+    expected_original_ranks = list(range(original_world_size))
+    if prewarmed_original_ranks != expected_original_ranks:
+        raise AssertionError(
+            "missing original MLP-sync Gloo prewarm logs: "
+            f"got={prewarmed_original_ranks} expected={expected_original_ranks}"
+        )
+
     matches = []
     for line_index, line in enumerate(lines):
         match = MC2_LOG_PATTERN.search(line)
@@ -268,6 +287,7 @@ def _parse_mc2_log(path: Path, original_world_size: int, victim_rank: int) -> di
             )
 
     return {
+        "prewarmed_original_ranks": prewarmed_original_ranks,
         "initial_by_rank": initial_by_rank,
         "updates": updates,
         "process_group_updates": process_group_updates,

@@ -1,13 +1,15 @@
 """CPU tests for rebuilt Ascend FT graph-external process groups."""
 
 import unittest
+from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
 from sglang.srt.fault_tolerance.npu_metadata import (
     NpuFTSurvivorProcessGroups,
+    prewarm_npu_ft_original_mlp_sync_group,
 )
 from sglang.srt.managers.prefill_delayer import PrefillDelayer
 from sglang.srt.managers.scheduler_components import dp_attn
@@ -19,6 +21,17 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestNpuFTSurvivorProcessGroups(CustomTestCase):
+    def test_original_mlp_sync_gloo_group_is_prewarmed_before_faults(self):
+        with patch(
+            "sglang.srt.fault_tolerance.npu_metadata.dist.barrier"
+        ) as barrier:
+            prewarm_npu_ft_original_mlp_sync_group(
+                "original-gloo",
+                original_rank=3,
+            )
+
+        barrier.assert_called_once_with(group="original-gloo")
+
     def test_rebuild_uses_compact_rank_and_separate_graph_external_groups(self):
         groups = NpuFTSurvivorProcessGroups(
             store=object(),
@@ -345,6 +358,77 @@ class TestNpuFTSurvivorProcessGroups(CustomTestCase):
 
         self.assertEqual(sync_info.global_num_tokens, [2, 0, 3, 4])
         self.assertEqual(sync_info.tp0_info[1, 5].item(), ForwardMode.IDLE.value)
+
+    def test_pre_scale_mlp_sync_has_bounded_wait_for_ft_control_liveness(self):
+        work = Mock()
+        work.wait.return_value = True
+        output = torch.empty(4, dtype=torch.int64)
+        local = torch.ones(1, dtype=torch.int64)
+
+        with (
+            patch.object(dp_attn, "_is_npu_mc2_ft_enabled", return_value=True),
+            patch.object(
+                torch.distributed,
+                "all_gather_into_tensor",
+                return_value=work,
+            ) as all_gather,
+        ):
+            dp_attn._all_gather_original_mlp_sync_group(
+                output,
+                local,
+                group="original-gloo",
+            )
+
+        all_gather.assert_called_once_with(
+            output,
+            local,
+            group="original-gloo",
+            async_op=True,
+        )
+        work.wait.assert_called_once_with(timeout=timedelta(seconds=5))
+
+    def test_pre_scale_mlp_sync_timeout_returns_to_ft_loop(self):
+        work = Mock()
+        work.wait.return_value = False
+
+        with (
+            patch.object(dp_attn, "_is_npu_mc2_ft_enabled", return_value=True),
+            patch.object(
+                torch.distributed,
+                "all_gather_into_tensor",
+                return_value=work,
+            ),
+            self.assertRaisesRegex(
+                TimeoutError, "returning to the FT control loop"
+            ),
+        ):
+            dp_attn._all_gather_original_mlp_sync_group(
+                torch.empty(4, dtype=torch.int64),
+                torch.ones(1, dtype=torch.int64),
+                group="original-gloo",
+            )
+
+    def test_non_ft_mlp_sync_keeps_synchronous_collective(self):
+        output = torch.empty(4, dtype=torch.int64)
+        local = torch.ones(1, dtype=torch.int64)
+
+        with (
+            patch.object(dp_attn, "_is_npu_mc2_ft_enabled", return_value=False),
+            patch.object(
+                torch.distributed, "all_gather_into_tensor"
+            ) as all_gather,
+        ):
+            dp_attn._all_gather_original_mlp_sync_group(
+                output,
+                local,
+                group="original-gloo",
+            )
+
+        all_gather.assert_called_once_with(
+            output,
+            local,
+            group="original-gloo",
+        )
 
 
 if __name__ == "__main__":

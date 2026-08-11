@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
@@ -35,18 +36,23 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+_NPU_MC2_FT_ORIGINAL_COLLECTIVE_TIMEOUT_SEC = 5.0
+
+
+def _is_npu_mc2_ft_enabled() -> bool:
+    from sglang.srt.runtime_context import get_server_args
+
+    server_args = get_server_args()
+    return bool(
+        server_args.enable_fault_tolerance
+        and server_args.elastic_ep_backend == "mc2"
+    )
 
 
 def _get_npu_ft_active_ranks() -> Optional[torch.Tensor]:
     """Return the sparse original-rank mask when MC2 has scaled down."""
 
-    from sglang.srt.runtime_context import get_server_args
-
-    server_args = get_server_args()
-    if (
-        not server_args.enable_fault_tolerance
-        or server_args.elastic_ep_backend != "mc2"
-    ):
+    if not _is_npu_mc2_ft_enabled():
         return None
 
     from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
@@ -57,6 +63,52 @@ def _get_npu_ft_active_ranks() -> Optional[torch.Tensor]:
     if bool(state.active_ranks_cpu.all().item()):
         return None
     return state.active_ranks_cpu
+
+
+def _all_gather_original_mlp_sync_group(
+    output: torch.Tensor,
+    local: torch.Tensor,
+    *,
+    group: torch.distributed.ProcessGroup,
+) -> None:
+    """Run the pre-scale MLP-sync collective without starving FT control.
+
+    A rank can fail while another survivor is inside the original full-world
+    collective.  The Scheduler device-owner thread must return to its request
+    loop before it can consume the scale-down command and run stop/restart on
+    that same thread.  Normal configurations keep the existing synchronous
+    behavior; NPU MC2 FT uses an async work handle with a short bounded wait so
+    a missing peer becomes a Scheduler exception and the FT pause loop can
+    process the queued control command.
+    """
+
+    if not _is_npu_mc2_ft_enabled():
+        torch.distributed.all_gather_into_tensor(output, local, group=group)
+        return
+
+    work = torch.distributed.all_gather_into_tensor(
+        output,
+        local,
+        group=group,
+        async_op=True,
+    )
+    try:
+        completed = work.wait(
+            timeout=timedelta(
+                seconds=_NPU_MC2_FT_ORIGINAL_COLLECTIVE_TIMEOUT_SEC
+            )
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "NPU MC2 original MLP-sync collective failed; "
+            "returning to the FT control loop"
+        ) from exc
+    if completed is False:
+        raise TimeoutError(
+            "NPU MC2 original MLP-sync collective timed out after "
+            f"{_NPU_MC2_FT_ORIGINAL_COLLECTIVE_TIMEOUT_SEC:g}s; "
+            "returning to the FT control loop"
+        )
 
 
 def _resolve_elastic_world_dp_size(
@@ -193,7 +245,7 @@ class MLPSyncBatchInfo:
             missing = flat_info.abs().sum(dim=1) == 0
             flat_info[missing] = fallback_tensor
         else:
-            torch.distributed.all_gather_into_tensor(
+            _all_gather_original_mlp_sync_group(
                 global_info_tensor.flatten(),
                 local_info_tensor,
                 group=group,

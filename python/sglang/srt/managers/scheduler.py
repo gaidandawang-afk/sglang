@@ -961,6 +961,19 @@ class Scheduler(
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
+        if (
+            self.server_args.enable_fault_tolerance
+            and self.server_args.elastic_ep_backend == "mc2"
+        ):
+            from sglang.srt.fault_tolerance.npu_metadata import (
+                prewarm_npu_ft_original_mlp_sync_group,
+            )
+
+            prewarm_npu_ft_original_mlp_sync_group(
+                self.tp_cpu_group,
+                original_rank=self.ps.dp_rank,
+            )
+
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use
         # the base TP group. Entry rank is the local rank 0 in that group.

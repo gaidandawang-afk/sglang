@@ -10,11 +10,18 @@ Before starting SGLang, apply
 `sgl-kernel-npu` checkout and rebuild/install its DeepEP package. The patch
 passes the optional tensor through both the default C++ strategy and the
 `DEEP_USE_MODE=ops` torch-npu strategy down to the ACLNN `elasticInfo` input.
+For this EP=4 test, select `DEEP_USE_MODE=default`: on the torch-npu 2.10/CANN
+9.0 stack, the `ops` path reaches `aclnnMoeDistributeDispatchV4`, whose tiling
+requires `epWorldSize` to be a multiple of 16 and rejects EP=4.
+It is rebased and `git apply --check`-validated against the `2026.7.2` source
+tag (`7a396def6d0d7ce85e940549a366351ce1d7821b`), including that version's
+`use_mxfp4` DeepEP argument. Regenerate the patch rather than applying it with
+fuzz when using a different DeepEP source commit.
 
 Start a disposable server with the target topology (adapt model and log paths):
 
 ```bash
-DEEP_USE_MODE=ops python -m sglang.launch_server \
+DEEP_USE_MODE=default python -m sglang.launch_server \
   --model-path Qwen/Qwen3-30B-A3B \
   --host 0.0.0.0 \
   --port 30000 \
@@ -60,6 +67,13 @@ survivors through the controller-hosted rendezvous store:
   after scale-down. The required `--deepep-mode low_latency` keeps prefill and
   decode on the MC2 low-latency path, so DeepEP normal prefill communication is
   not enabled in this FT configuration.
+
+Before the service becomes ready, every original rank also prewarms the
+MLP-sync Gloo group. This prevents a survivor from attempting that group's lazy
+four-rank full-mesh initialization after another rank has already failed. A
+pre-scale-down MLP-sync collective uses a bounded wait so its Scheduler owner
+thread can return to the FT request loop and consume a queued scale-down
+command instead of starving the survivor-only rebuild.
 
 Before rebuilding those domains, every survivor calls
 `torch_npu.npu.stop_device(local_device_id)` followed immediately by
