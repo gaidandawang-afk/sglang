@@ -272,6 +272,26 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertEqual(output.message, "scaled down")
         self.assertFalse(scheduler._engine_paused)
 
+    def test_scale_down_failure_returns_negative_ack_without_unpausing(self):
+        scheduler = self.make_scheduler()
+        scheduler.tp_worker.model_runner.apply_fault_tolerance_scale_down.side_effect = (
+            AssertionError("deferred expert reload canary")
+        )
+        request = FaultToleranceCommandReqInput(
+            request_id="failed-scale-down",
+            command="scale_down",
+            target_ranks=[1],
+            active_mask=[True, False],
+        )
+
+        output = self.handle_command(scheduler, request)
+
+        self.assertFalse(output.success)
+        self.assertEqual(output.rank, 1)
+        self.assertIn("AssertionError: deferred expert reload canary", output.message)
+        self.assertTrue(scheduler._engine_paused)
+        self.assertEqual(scheduler._ft_pause_deadline, 130.0)
+
     def test_nonleader_executes_without_ack(self):
         scheduler = self.make_scheduler(leader=False)
         request = FaultToleranceCommandReqInput(

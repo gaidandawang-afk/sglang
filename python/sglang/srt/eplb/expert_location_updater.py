@@ -125,16 +125,67 @@ def _update_expert_weights_with_canary(
     )
 
     for layer_id in update_layer_ids:
-        # can optimize speed if needed
         expect_value = _get_canary_value(new_expert_location_metadata, layer_id)
         actual_value = routed_experts_weights_of_layer[layer_id][-1].cpu()
-        assert torch.all(expect_value == actual_value), (
-            f"{expect_value=} {actual_value=} {layer_id=} "
-            f"{old_expert_location_metadata.physical_to_logical_map_cpu.tolist()=} "
-            f"{new_expert_location_metadata.physical_to_logical_map_cpu.tolist()=} "
+        _validate_survivor_movement_canary(
+            expect_value=expect_value,
+            actual_value=actual_value,
+            missing_logical_experts=missing_logical_experts_by_layers.get(
+                layer_id, []
+            ),
+            layer_id=layer_id,
         )
 
     return missing_logical_experts_by_layers
+
+
+def _validate_survivor_movement_canary(
+    *,
+    expect_value: torch.Tensor,
+    actual_value: torch.Tensor,
+    missing_logical_experts: List[int],
+    layer_id: int,
+) -> None:
+    """Validate movement completed before the fallback weight reload.
+
+    Experts absent from every survivor are only recorded by the raw updater;
+    their DRAM/checkpoint load happens after this function returns.  Exclude
+    exactly those destination slots from the movement canary instead of
+    treating the intentionally deferred load as a P2P-copy failure.
+    """
+
+    expect_value = expect_value.detach().to(device="cpu")
+    actual_value = actual_value.detach().to(device="cpu")
+    if expect_value.shape != actual_value.shape:
+        raise AssertionError(
+            "expert recovery canary shape mismatch: "
+            f"layer={layer_id} expected={tuple(expect_value.shape)} "
+            f"actual={tuple(actual_value.shape)}"
+        )
+
+    pending_reload = set(missing_logical_experts)
+    validate_mask = torch.tensor(
+        [
+            int(logical_id) not in pending_reload
+            for logical_id in expect_value.tolist()
+        ],
+        dtype=torch.bool,
+    )
+    mismatch_slots = torch.nonzero(
+        validate_mask & (expect_value != actual_value),
+        as_tuple=False,
+    ).flatten()
+    if mismatch_slots.numel() == 0:
+        return
+
+    mismatch_slot_values = mismatch_slots.tolist()
+    raise AssertionError(
+        "expert recovery survivor-movement canary mismatch: "
+        f"layer={layer_id} local_slots={mismatch_slot_values} "
+        f"expected={expect_value[mismatch_slots].tolist()} "
+        f"actual={actual_value[mismatch_slots].tolist()} "
+        f"pending_reload_experts={sorted(pending_reload)}"
+    )
 
 
 def _update_expert_weights_raw(

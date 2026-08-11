@@ -4512,23 +4512,52 @@ class Scheduler(
         if rank not in recv_req.target_ranks:
             return None
 
-        if recv_req.command == "retry":
-            from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+        logger.info(
+            "FT scheduler command begin: request_id=%s command=%s rank=%s "
+            "active_mask=%s",
+            recv_req.request_id,
+            recv_req.command,
+            rank,
+            recv_req.active_mask,
+        )
+        try:
+            if recv_req.command == "retry":
+                from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
-            state = ElasticEPStateManager.instance()
-            state.active_ranks.copy_(state.last_active_ranks)
-            state.active_ranks_cpu.copy_(state.last_active_ranks.detach().cpu())
-            message = "retried"
-        elif recv_req.command == "scale_down":
-            self.tp_worker.model_runner.apply_fault_tolerance_scale_down(
-                recv_req.active_mask
+                state = ElasticEPStateManager.instance()
+                state.active_ranks.copy_(state.last_active_ranks)
+                state.active_ranks_cpu.copy_(state.last_active_ranks.detach().cpu())
+                message = "retried"
+            elif recv_req.command == "scale_down":
+                self.tp_worker.model_runner.apply_fault_tolerance_scale_down(
+                    recv_req.active_mask
+                )
+                message = "scaled down"
+            else:
+                logger.warning(
+                    "FT scheduler received unknown command: %s", recv_req.command
+                )
+                return None
+        except Exception as exc:
+            logger.exception(
+                "FT scheduler command failed: request_id=%s command=%s rank=%s",
+                recv_req.request_id,
+                recv_req.command,
+                rank,
             )
-            message = "scaled down"
-        else:
-            logger.warning(
-                "FT scheduler received unknown command: %s", recv_req.command
+            # Only the DP attention leader owns the command ACK socket.  A
+            # negative ACK lets FaultToleranceManager terminate the failed
+            # operation immediately instead of waiting until this Scheduler's
+            # unattended-pause deadline.  Non-leaders still re-raise so their
+            # local FT loop reports the rank fault.
+            if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:
+                raise
+            return FaultToleranceCommandReqOutput(
+                request_id=recv_req.request_id,
+                rank=rank,
+                success=False,
+                message=f"{type(exc).__name__}: {exc}",
             )
-            return None
 
         self._engine_paused = False
         self._ft_pause_deadline = None
