@@ -47,6 +47,27 @@ def create_npu_ft_metadata_store_server(endpoint: str) -> TCPStore:
     )
 
 
+def prewarm_npu_ft_original_mlp_sync_group(
+    group: dist.ProcessGroup,
+    *,
+    original_rank: int,
+) -> None:
+    """Eagerly connect the original Gloo group while every rank is healthy.
+
+    TorchNPU/PyTorch may defer Gloo's full-mesh connection until the first CPU
+    collective.  If that first use races with a rank failure, a survivor can
+    block in rendezvous before it has a chance to consume the scale-down
+    command.  A startup barrier removes that post-failure lazy-init path.
+    """
+
+    dist.barrier(group=group)
+    logger.info(
+        "[NPU FT] prewarmed original graph-external MLP-sync Gloo group: "
+        "original_rank=%d",
+        original_rank,
+    )
+
+
 @dataclass
 class NpuFTSurvivorProcessGroups:
     """Own the latest survivor-only CPU and NPU process groups.
