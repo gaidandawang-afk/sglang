@@ -68,6 +68,9 @@ def _load_weights_for_disk_update(
         # The model's weight loaders copy the selected checkpoint tensors into
         # those slots without replacing the full parameter storage.
         model.load_weights(weights)
+        finalize = getattr(model, "finalize_ft_filtered_weight_reload", None)
+        if callable(finalize):
+            finalize()
     else:
         loader.load_weights_and_postprocess(model, weights, target_device)
     return model

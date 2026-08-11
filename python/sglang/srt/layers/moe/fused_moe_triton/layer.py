@@ -548,6 +548,129 @@ class FusedMoE(torch.nn.Module):
                 is_bias=is_bias,
             )
 
+    def _commit_npu_formatted_expert_reload(
+        self,
+        destination: torch.Tensor,
+        staging: torch.Tensor,
+    ) -> None:
+        """Format one complete expert and update its captured storage in place."""
+
+        from sglang.srt.hardware_backend.npu.utils import (
+            copy_npu_formatted_tensor_,
+            npu_format_cast,
+        )
+
+        formatted_staging = npu_format_cast(staging)
+        copy_npu_formatted_tensor_(destination, formatted_staging)
+
+    def _load_npu_formatted_expert_weight(
+        self,
+        *,
+        param: torch.nn.Parameter,
+        expert_data: torch.Tensor,
+        expert_id: int,
+        shard_dim: int,
+        shard_id: str,
+        loaded_weight: torch.Tensor,
+        tp_rank: int,
+    ) -> None:
+        """Reload one unquantized expert without replacing graph-captured storage.
+
+        A leading-dimension view of a 3-D FRACTAL_NZ weight cannot be updated
+        with a normal logical ``copy_``.  Build an offset-zero ND expert using
+        the ordinary loader (therefore retaining TP slicing/orientation), cast
+        the complete expert to the serving format, then raw-copy the formatted
+        bytes into the physical slot.
+
+        w13 must be committed only after both w1 and w3 have arrived: the two
+        halves are interleaved in FRACTAL_NZ storage and cannot be formatted or
+        copied independently.
+        """
+
+        if shard_id == "w2":
+            staging = torch.empty(
+                tuple(expert_data.shape),
+                dtype=expert_data.dtype,
+                device=expert_data.device,
+            )
+            self._load_w2(
+                expert_data=staging,
+                shard_dim=shard_dim,
+                shard_id=shard_id,
+                loaded_weight=loaded_weight,
+                tp_rank=tp_rank,
+            )
+            self._commit_npu_formatted_expert_reload(expert_data, staging)
+            return
+
+        if shard_id not in ("w1", "w3", "w13"):
+            raise ValueError(f"Unsupported NPU formatted expert shard: {shard_id}")
+
+        if shard_id == "w13":
+            staging = torch.empty(
+                tuple(expert_data.shape),
+                dtype=expert_data.dtype,
+                device=expert_data.device,
+            )
+            self._load_w13(
+                expert_data=staging,
+                shard_dim=shard_dim,
+                shard_id=shard_id,
+                loaded_weight=loaded_weight,
+                tp_rank=tp_rank,
+            )
+            self._commit_npu_formatted_expert_reload(expert_data, staging)
+            return
+
+        pending = getattr(self, "_npu_formatted_expert_reload_pending", None)
+        if pending is None:
+            pending = {}
+            self._npu_formatted_expert_reload_pending = pending
+        pending_key = (id(param), expert_id)
+        state = pending.get(pending_key)
+        if state is None:
+            state = {
+                "destination": expert_data,
+                "staging": torch.empty(
+                    tuple(expert_data.shape),
+                    dtype=expert_data.dtype,
+                    device=expert_data.device,
+                ),
+                "shards": set(),
+            }
+            pending[pending_key] = state
+        if shard_id in state["shards"]:
+            raise RuntimeError(
+                "Duplicate NPU formatted expert shard during reload: "
+                f"expert_id={expert_id} shard_id={shard_id}"
+            )
+
+        self._load_w13(
+            expert_data=state["staging"],
+            shard_dim=shard_dim,
+            shard_id=shard_id,
+            loaded_weight=loaded_weight,
+            tp_rank=tp_rank,
+        )
+        state["shards"].add(shard_id)
+        if state["shards"] == {"w1", "w3"}:
+            self._commit_npu_formatted_expert_reload(
+                state["destination"], state["staging"]
+            )
+            del pending[pending_key]
+
+    def finalize_npu_formatted_expert_reload(self) -> None:
+        pending = getattr(self, "_npu_formatted_expert_reload_pending", None)
+        if pending:
+            incomplete = [
+                {"expert_key": key, "shards": sorted(state["shards"])}
+                for key, state in pending.items()
+            ]
+            raise RuntimeError(
+                "Incomplete NPU formatted expert reload: "
+                f"pending={incomplete[:32]} pending_count={len(incomplete)}"
+            )
+
     def _load_per_channel_weight_scale(
         self,
         expert_data: torch.Tensor,
@@ -1204,6 +1327,17 @@ class FusedMoE(torch.nn.Module):
 
         # Case model weights
         if "weight" in weight_name:
+            if getattr(param, "_sglang_npu_formatted_expert_weight", False):
+                self._load_npu_formatted_expert_weight(
+                    param=param,
+                    expert_data=expert_data,
+                    expert_id=expert_id,
+                    shard_dim=shard_dim,
+                    shard_id=shard_id,
+                    loaded_weight=loaded_weight,
+                    tp_rank=tp_rank,
+                )
+                return
             self._load_model_weight_or_group_weight_scale(
                 shard_id=shard_id,
                 shard_dim=shard_dim,
