@@ -1028,6 +1028,26 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "auto"
+    enable_fault_tolerance: A[
+        bool,
+        "Enable the DP-only fault-tolerance control plane.",
+        NS("parallel"),
+    ] = False
+    fault_tolerance_on_error_strategy: A[
+        Literal["pause", "continue"],
+        "Fault-tolerance strategy for scheduler exceptions.",
+        NS("parallel"),
+    ] = "pause"
+    fault_tolerance_timeout: A[
+        int,
+        "Timeout in seconds for fault-tolerance control commands.",
+        NS("parallel"),
+    ] = 60
+    fault_tolerance_pause_timeout: A[
+        float,
+        "Fail-stop timeout in seconds for an unattended fault-tolerance pause.",
+        NS("parallel"),
+    ] = 300
     attn_cp_size: A[
         int,
         Arg(
@@ -3535,6 +3555,9 @@ class ServerArgs:
         self._handle_elastic_ep()
         self._validate_experimental_sgl_marlin()
 
+        # Validate FT only after MoE and Elastic EP settings have settled.
+        self._handle_fault_tolerance()
+
         # Handle pipeline parallelism.
         self._handle_pipeline_parallelism()
 
@@ -3771,6 +3794,16 @@ class ServerArgs:
                 else "round_robin"
             )
             return
+
+    def _handle_fault_tolerance(self):
+        if not self.enable_fault_tolerance:
+            return
+
+        from sglang.srt.fault_tolerance.controller import is_ft_supported_config
+
+        supported, reason = is_ft_supported_config(self)
+        if not supported:
+            raise ValueError(f"Fault tolerance v5 unsupported config: {reason}")
 
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""

@@ -103,6 +103,9 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
+    FaultToleranceCommandReqInput,
+    FaultToleranceCommandReqOutput,
+    FaultToleranceRankFaultOutput,
     FlushCacheReqInput,
     FreezeGCReq,
     GetInternalStateReq,
@@ -261,6 +264,7 @@ from sglang.srt.utils import (
     is_hip,
     is_mps,
     kill_itself_when_parent_died,
+    notify_node_main_process_failure,
     require_mlp_sync,
     set_gpu_proc_affinity,
     set_random_seed,
@@ -1014,6 +1018,7 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+        self._ft_pause_deadline: Optional[float] = None
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1445,6 +1450,7 @@ class Scheduler(
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (FaultToleranceCommandReqInput, self.handle_fault_tolerance_command),
                 (ConfigureLoggingReq, self.configure_logging),
                 (ScaleElasticEPReqInput, self.handle_scale_elastic_ep),
                 (DumperControlReqInput, self.handle_dumper_control),
@@ -1529,7 +1535,105 @@ class Scheduler(
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
         with self.device_module.StreamContext(self.schedule_stream):
-            dispatch_event_loop(self)
+            if self.server_args.enable_fault_tolerance:
+                self._run_event_loop_fault_tolerance()
+            else:
+                dispatch_event_loop(self)
+
+    def _run_event_loop_fault_tolerance(self) -> None:
+        while True:
+            try:
+                dispatch_event_loop(self)
+                return
+            except Exception as exc:
+                recovered = self._ft_discard_inflight_window(exc)
+                should_continue = (
+                    self.server_args.fault_tolerance_on_error_strategy == "continue"
+                    and recovered
+                )
+                if not should_continue:
+                    self._engine_paused = True
+                    self._ft_pause_deadline = (
+                        time.monotonic()
+                        + self.server_args.fault_tolerance_pause_timeout
+                    )
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    FaultToleranceRankFaultOutput(
+                        rank=self.ps.dp_rank,
+                        message=str(exc),
+                    )
+                )
+                if should_continue:
+                    continue
+
+    def _ft_discard_inflight_window(self, exc: Exception) -> bool:
+        window_batches = [
+            self.cur_batch_for_debug,
+            self.last_batch,
+            self.running_batch,
+        ]
+        result_queue = getattr(self, "result_queue", None)
+        if result_queue is not None:
+            window_batches.extend(batch for batch, _ in result_queue)
+
+        discarded_by_rid = {}
+        for batch in window_batches:
+            if batch is None:
+                continue
+            for req in batch.reqs:
+                if not req.finished():
+                    discarded_by_rid.setdefault(req.rid, req)
+        if self.chunked_req is not None and not self.chunked_req.finished():
+            discarded_by_rid.setdefault(self.chunked_req.rid, self.chunked_req)
+
+        success = True
+        for req in discarded_by_rid.values():
+            try:
+                req.kv_committed_len = min(
+                    req.kv_committed_len,
+                    len(req.origin_input_ids) + len(req.output_ids),
+                )
+                release_kv_cache(
+                    req,
+                    self.tree_cache,
+                    is_insert=False,
+                    allow_non_spec_overallocated=True,
+                )
+                abort_reason = FINISH_ABORT(
+                    message=f"Request discarded after scheduler exception: {exc}",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    err_type="SchedulerFault",
+                )
+                req.finished_reason = abort_reason
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(
+                        finished_reason=abort_reason.to_json(),
+                        rid=req.rid,
+                    ),
+                    req,
+                )
+            except Exception:
+                logger.exception("FT failed to discard request state")
+                success = False
+
+        self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+        if self.chunked_req is not None and self.chunked_req.rid in discarded_by_rid:
+            self.chunked_req = None
+        if result_queue is not None:
+            result_queue.clear()
+        self.cur_batch_for_debug = None
+        self.last_batch = None
+        logger.warning(
+            "FT discarded %d in-flight request(s) after scheduler exception: %s",
+            len(discarded_by_rid),
+            exc,
+        )
+        return success
+
+    def _process_next_overlap_result(self) -> None:
+        batch, result = self.result_queue[0]
+        self.process_batch_result(batch, result)
+        self.result_queue.popleft()
 
     def _apply_war_barrier(self):
         # Called right after each launch: order later schedule_stream work
@@ -1558,6 +1662,7 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self._check_ft_pause_deadline()
             if self._engine_paused:
                 continue
 
@@ -1591,8 +1696,7 @@ class Scheduler(
 
         def pop_and_process():
             # Process the results of the last batch
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
+            self._process_next_overlap_result()
 
         while True:
             if self.gracefully_exit:
@@ -1601,6 +1705,7 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self._check_ft_pause_deadline()
             if self._engine_paused:
                 continue
 
@@ -2843,6 +2948,10 @@ class Scheduler(
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
             new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
+            if self._engine_paused:
+                return NextBatchPlan(
+                    batch_to_run=new_batch, running_batch=running_batch
+                )
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
@@ -4366,6 +4475,55 @@ class Scheduler(
         ):
             self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
         self._engine_paused = False
+
+    def handle_fault_tolerance_command(
+        self, recv_req: FaultToleranceCommandReqInput
+    ) -> Optional[FaultToleranceCommandReqOutput]:
+        rank = self.ps.dp_rank
+        if rank not in recv_req.target_ranks:
+            return None
+
+        if recv_req.command == "retry":
+            from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+            state = ElasticEPStateManager.instance()
+            state.active_ranks.copy_(state.last_active_ranks)
+            state.active_ranks_cpu.copy_(state.last_active_ranks.detach().cpu())
+            message = "retried"
+        elif recv_req.command == "scale_down":
+            self.tp_worker.model_runner.apply_fault_tolerance_scale_down(
+                recv_req.active_mask
+            )
+            message = "scaled down"
+        else:
+            logger.warning(
+                "FT scheduler received unknown command: %s", recv_req.command
+            )
+            return None
+
+        self._engine_paused = False
+        self._ft_pause_deadline = None
+
+        if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:
+            return None
+        return FaultToleranceCommandReqOutput(
+            request_id=recv_req.request_id,
+            rank=rank,
+            success=True,
+            message=message,
+        )
+
+    def _check_ft_pause_deadline(self) -> None:
+        deadline = self._ft_pause_deadline
+        if deadline is None or time.monotonic() < deadline:
+            return
+        self._ft_pause_deadline = None
+        logger.error(
+            "Fault tolerance pause unattended: timeout_sec=%s dp_rank=%s",
+            self.server_args.fault_tolerance_pause_timeout,
+            self.ps.dp_rank,
+        )
+        notify_node_main_process_failure()
 
     def handle_scale_elastic_ep(
         self, recv_req: ScaleElasticEPReqInput
