@@ -129,9 +129,15 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
             tree_cache.evict(EvictParams(num_tokens=num_tokens - available_size))
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+def release_kv_cache(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    is_insert: bool = True,
+    allow_non_spec_overallocated: bool = False,
+):
     # the two resources currently have the same lifecycle, thus simplify logic below
     assert (req.req_pool_idx is None) == (req.kv is None)
+
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
         assert (
@@ -159,7 +165,13 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         return
 
     start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
-    _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
+    _release_overallocated_kv_indices(
+        req,
+        start_p,
+        end_p,
+        tree_cache,
+        allow_non_spec_overallocated=allow_non_spec_overallocated,
+    )
 
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
@@ -176,7 +188,12 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
 
 def _release_overallocated_kv_indices(
-    req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
+    req: Req,
+    start_p: int,
+    end_p: int,
+    tree_cache: BasePrefixCache,
+    *,
+    allow_non_spec_overallocated: bool = False,
 ) -> None:
     global_server_args = get_server_args()
     page_size = global_server_args.page_size
@@ -184,7 +201,11 @@ def _release_overallocated_kv_indices(
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
-    if spec_algo is None and not global_server_args.strip_thinking_cache:
+    if (
+        spec_algo is None
+        and not global_server_args.strip_thinking_cache
+        and not allow_non_spec_overallocated
+    ):
         assert (
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
