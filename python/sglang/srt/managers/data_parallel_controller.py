@@ -821,8 +821,9 @@ class DataParallelController:
                     rank_port_args = PortArgs.init_new(
                         server_args, dp_rank, worker_ports
                     )
-                    if server_args.is_ep_scale_joiner:
-                        # Scale-joiner outputs return through the primary tokenizer.
+                    if server_args.is_ep_joiner:
+                        # Joiner (scale or recover) outputs return through the
+                        # primary tokenizer.
                         primary_addr = NetworkAddress.parse(server_args.dist_init_addr)
                         primary_port_base = primary_addr.port + 1
                         rank_port_args.tokenizer_ipc_name = NetworkAddress(

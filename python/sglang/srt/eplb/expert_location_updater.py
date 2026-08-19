@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 
 
 _LOG_INPUT = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT")
+_LOG_P2P_SCHEDULE = get_bool_env_var(
+    "SGLANG_EXPERT_LOCATION_UPDATER_LOG_P2P_SCHEDULE"
+)
 
 
 class ExpertLocationUpdater:
@@ -686,6 +689,33 @@ def update_expert_weights_single_layer(
         p2p_ops = [op for _, ops in sorted_infos for op in ops]
         if len(p2p_ops) == 0:
             return
+
+        if _LOG_P2P_SCHEDULE:
+            schedules = defaultdict(list)
+            for logical_expert_id, ops in sorted_infos:
+                for op in ops:
+                    direction = (
+                        "send"
+                        if op.op == torch.distributed.isend
+                        else "recv"
+                    )
+                    schedules[f"{direction}:{op.peer}"].append(
+                        (
+                            logical_expert_id,
+                            op.tensor.numel(),
+                            str(op.tensor.dtype),
+                        )
+                    )
+            elastic_ep_state = ElasticEPStateManager.instance()
+            active_ranks = (
+                elastic_ep_state.active_ranks_cpu.tolist()
+                if elastic_ep_state is not None
+                else None
+            )
+            logger.info(
+                "[ExpertLocationUpdaterP2PSchedule] "
+                f"{rank=} {active_ranks=} {dict(schedules)=}"
+            )
 
         # Submit P2P ops in batches to prevent NCCL/RCCL GPU-side accumulation
         # hangs on large rebalances. All ranks use the same expert_id ranges
