@@ -31,7 +31,7 @@ fuzz when using a different DeepEP source commit.
 Start a disposable server with the target topology (adapt model and log paths):
 
 ```bash
-DEEP_USE_MODE=default python -m sglang.launch_server \
+DEEP_USE_MODE=ops python -m sglang.launch_server \
   --model-path "${MODEL_PATH}" \
   --host 127.0.0.1 \
   --port 30000 \
@@ -144,7 +144,7 @@ To run the extended fault-injection test scenarios, use the **two-terminal workf
 
 **[Terminal 1] Launch Command**:
 ```bash
-DEEP_USE_MODE=default python -m sglang.launch_server \
+DEEP_USE_MODE=ops python -m sglang.launch_server \
   --model-path "${MODEL_PATH}" \
   --host 127.0.0.1 \
   --port 30000 \
@@ -193,7 +193,7 @@ python test/manual/ascend/test_fault_tolerance_suite.py --test-case cascading_sc
 
 **[Terminal 1] Launch Command** (using `--fault-tolerance-on-error-strategy continue`):
 ```bash
-DEEP_USE_MODE=default python -m sglang.launch_server \
+DEEP_USE_MODE=ops python -m sglang.launch_server \
   --model-path "${MODEL_PATH}" \
   --host 127.0.0.1 \
   --port 30000 \
@@ -232,7 +232,7 @@ python test/manual/ascend/test_fault_tolerance_suite.py --test-case strategy_con
 
 **[Terminal 1] Launch Command** (4 cards: DP=2, TP=2, EP=2):
 ```bash
-DEEP_USE_MODE=default python -m sglang.launch_server \
+DEEP_USE_MODE=ops python -m sglang.launch_server \
   --model-path "${MODEL_PATH}" \
   --host 127.0.0.1 \
   --port 30000 \
