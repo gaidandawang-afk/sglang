@@ -32,7 +32,7 @@ Start a disposable server with the target topology (adapt model and log paths):
 
 ```bash
 DEEP_USE_MODE=default python -m sglang.launch_server \
-  --model-path Qwen/Qwen3-30B-A3B \
+  --model-path "${MODEL_PATH}" \
   --host 0.0.0.0 \
   --port 30000 \
   --device npu \
@@ -134,7 +134,7 @@ To run the extended fault-injection test scenarios, use the **two-terminal workf
 **[Terminal 1] Launch Command**:
 ```bash
 DEEP_USE_MODE=default python -m sglang.launch_server \
-  --model-path Qwen/Qwen3-30B-A3B \
+  --model-path "${MODEL_PATH}" \
   --host 0.0.0.0 \
   --port 30000 \
   --device npu \
@@ -172,7 +172,7 @@ python test/manual/ascend/test_fault_tolerance_suite.py --test-case cascading_sc
 **[Terminal 1] Launch Command** (using `--fault-tolerance-on-error-strategy continue`):
 ```bash
 DEEP_USE_MODE=default python -m sglang.launch_server \
-  --model-path Qwen/Qwen3-30B-A3B \
+  --model-path "${MODEL_PATH}" \
   --host 0.0.0.0 \
   --port 30000 \
   --device npu \
@@ -200,7 +200,7 @@ python test/manual/ascend/test_fault_tolerance_suite.py --test-case strategy_con
 **[Terminal 1] Launch Command** (4 cards: DP=2, TP=2, EP=2):
 ```bash
 DEEP_USE_MODE=default python -m sglang.launch_server \
-  --model-path Qwen/Qwen3-30B-A3B \
+  --model-path "${MODEL_PATH}" \
   --host 0.0.0.0 \
   --port 30000 \
   --device npu \
