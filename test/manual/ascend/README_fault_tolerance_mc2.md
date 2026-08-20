@@ -64,7 +64,7 @@ DEEP_USE_MODE=ops python -m sglang.launch_server \
   --enable-fault-tolerance \
   --fault-tolerance-on-error-strategy pause \
   --fault-tolerance-timeout 600 \
-  2>&1 | tee /tmp/sglang-npu-ft.log
+  2>&1 | tee artifacts/npu_ft/sglang-npu-ft.log
 ```
 
 Qwen3-30B-A3B has 128 logical experts. With one of four ranks removed, each
@@ -118,7 +118,7 @@ Find a non-controller Scheduler PID and its original DP rank, then run:
 python test/manual/ascend/test_fault_tolerance_mc2_scale_down.py \
   --victim-rank 1 \
   --victim-pid <scheduler-pid-for-rank-1> \
-  --server-log /tmp/sglang-npu-ft.log
+  --server-log artifacts/npu_ft/sglang-npu-ft.log
 ```
 
 The test requires all four ranks to be healthy first. It sends a deterministic
@@ -169,7 +169,7 @@ DEEP_USE_MODE=ops python -m sglang.launch_server \
   --enable-fault-tolerance \
   --fault-tolerance-on-error-strategy pause \
   --fault-tolerance-timeout 600 \
-  2>&1 | tee /tmp/sglang-npu-ft.log
+  2>&1 | tee artifacts/npu_ft/sglang-npu-ft.log
 ```
 
 **[Terminal 2] Test Execution**:
@@ -218,7 +218,7 @@ DEEP_USE_MODE=ops python -m sglang.launch_server \
   --enable-fault-tolerance \
   --fault-tolerance-on-error-strategy continue \
   --fault-tolerance-timeout 600 \
-  2>&1 | tee /tmp/sglang-npu-ft.log
+  2>&1 | tee artifacts/npu_ft/sglang-npu-ft.log
 ```
 
 **[Terminal 2] Test Execution**:
@@ -257,7 +257,7 @@ DEEP_USE_MODE=ops python -m sglang.launch_server \
   --enable-fault-tolerance \
   --fault-tolerance-on-error-strategy pause \
   --fault-tolerance-timeout 600 \
-  2>&1 | tee /tmp/sglang-npu-ft.log
+  2>&1 | tee artifacts/npu_ft/sglang-npu-ft.log
 ```
 
 **[Terminal 2] Test Execution**:
