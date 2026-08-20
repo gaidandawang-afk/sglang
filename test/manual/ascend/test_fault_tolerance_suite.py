@@ -20,7 +20,8 @@ import re
 import signal
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -55,6 +56,72 @@ DEVICE_RESTART_LOG_PATTERN = re.compile(
 SCHEDULER_PROCESS_TITLE_PATTERN = re.compile(
     r"(?:^|\s)sglang::scheduler_DP(?P<dp_rank>\d+)(?:_|\s|$)"
 )
+
+
+@dataclass
+class ExperimentReport:
+    test_case: str
+    timestamp: str
+    strategy: str = "unknown"
+    victim_ranks: List[int] = field(default_factory=list)
+    warmup_text: str = ""
+    post_recovery_text: str = ""
+    exact_match: bool = False
+    scale_down_latency_sec: float = 0.0
+    traffic_total: int = 0
+    traffic_200_ok: int = 0
+    traffic_503_paused: int = 0
+    traffic_errors: int = 0
+    device_stops_detected: int = 0
+    device_restarts_detected: int = 0
+    group_rebuilds_detected: int = 0
+    verdict: str = "PENDING"
+    error_message: Optional[str] = None
+    details: Dict[str, Any] = field(default_factory=dict)
+
+    def save_reports(self, output_dir: Path) -> Tuple[Path, Path]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        time_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+        json_path = output_dir / f"report_{self.test_case}_{time_tag}.json"
+        md_path = output_dir / f"report_{self.test_case}_{time_tag}.md"
+
+        json_path.write_text(json.dumps(asdict(self), indent=2, ensure_ascii=False))
+
+        md_content = f"""# SGLang NPU FT 故障注入测试报告
+
+- **测试用例**: `{self.test_case}`
+- **执行时间**: `{self.timestamp}`
+- **测试判定 (Verdict)**: **{self.verdict}**
+- **FT 策略**: `{self.strategy}`
+- **受害 Rank**: `{self.victim_ranks}`
+- **缩容重构耗时**: `{self.scale_down_latency_sec:.2f} s`
+- **输出文本一致性 (Exact Match)**: `{'✅ PASS' if self.exact_match else '❌ FAIL'}`
+
+## 1. 流量统计 (In-Flight Traffic Stats)
+| 总请求数 | 200 OK (成功) | 503 Paused (熔断) | 异常/超时错误 |
+| :--- | :--- | :--- | :--- |
+| `{self.traffic_total}` | `{self.traffic_200_ok}` | `{self.traffic_503_paused}` | `{self.traffic_errors}` |
+
+## 2. NPU 驱动与通信域重建审计
+- **设备停止调用 (stop_device)**: `{self.device_stops_detected}` 次
+- **设备重启调用 (restart_device)**: `{self.device_restarts_detected}` 次
+- **存活通信域重建 (rebuilt groups)**: `{self.group_rebuilds_detected}` 次
+
+## 3. 生成内容对比
+- **基线输出 (Warmup)**:
+```text
+{self.warmup_text}
+```
+- **缩容后输出 (Post-Recovery)**:
+```text
+{self.post_recovery_text}
+```
+"""
+        if self.error_message:
+            md_content += f"\n## ⚠️ 错误详情\n```text\n{self.error_message}\n```\n"
+
+        md_path.write_text(md_content)
+        return json_path, md_path
 
 
 @dataclass
@@ -197,10 +264,12 @@ def _trigger_scale_down(
     return resp
 
 
-def _verify_server_log_rebuild(log_path: Path, expected_generation: int) -> None:
+def _verify_server_log_rebuild(
+    log_path: Path, expected_generation: int
+) -> Tuple[int, int, int]:
     if not log_path.exists():
         logger.warning(f"Log file {log_path} not found; skipping log assertions.")
-        return
+        return 0, 0, 0
 
     text = log_path.read_text(errors="replace")
     stop_matches = DEVICE_STOP_LOG_PATTERN.findall(text)
@@ -219,6 +288,7 @@ def _verify_server_log_rebuild(log_path: Path, expected_generation: int) -> None
         logger.warning(
             f"No process group rebuild log found for generation {expected_generation}!"
         )
+    return len(stop_matches), len(restart_matches), len(rebuild_matches)
 
 
 # ==============================================================================
@@ -231,15 +301,25 @@ def run_exp1_idle_scale_down(
     log_path: Path,
     *,
     direct_api: bool = False,
-) -> None:
+) -> ExperimentReport:
     logger.info("=== [EXP-1] Starting Idle Scale-Down Test ===")
+    report = ExperimentReport(
+        test_case="idle_scale_down",
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        victim_ranks=[victim_rank],
+    )
+    status = _get_ft_status(session, base_url)
+    report.strategy = str(status.get("strategy", "unknown"))
+
     # 1. Warmup Baseline
     warmup = _generate_single(
         session, base_url, "Count from 1 to 5:", max_new_tokens=16
     )
     assert warmup.status_code == 200, f"Warmup failed: {warmup}"
+    report.warmup_text = warmup.text
     logger.info(f"Warmup baseline output: {warmup.text!r}")
 
+    t_start_scale = time.monotonic()
     if direct_api:
         logger.info("Directly triggering scale_down without killing process...")
         _trigger_scale_down(session, base_url, [victim_rank])
@@ -252,6 +332,7 @@ def run_exp1_idle_scale_down(
         os.kill(victim_pid, signal.SIGKILL)
         _wait_for_incident(session, base_url, [victim_rank])
         _trigger_scale_down(session, base_url, [victim_rank])
+    report.scale_down_latency_sec = time.monotonic() - t_start_scale
 
     time.sleep(2.0)
     # 2. Verify Post-Scale-Down Inference
@@ -261,12 +342,22 @@ def run_exp1_idle_scale_down(
     assert (
         post_req.status_code == 200
     ), f"Post-scale-down request failed: {post_req.error}"
+    report.post_recovery_text = post_req.text
+    report.exact_match = (post_req.text == warmup.text)
     logger.info(f"Post-scale-down output: {post_req.text!r}")
     assert (
-        post_req.text == warmup.text
+        report.exact_match
     ), f"Output mismatch: expected {warmup.text!r}, got {post_req.text!r}"
-    _verify_server_log_rebuild(log_path, expected_generation=1)
+
+    stops, restarts, rebuilds = _verify_server_log_rebuild(
+        log_path, expected_generation=1
+    )
+    report.device_stops_detected = stops
+    report.device_restarts_detected = restarts
+    report.group_rebuilds_detected = rebuilds
+    report.verdict = "PASS"
     logger.info("=== [EXP-1] Idle Scale-Down Test PASSED ===")
+    return report
 
 
 # ==============================================================================
@@ -280,8 +371,21 @@ def run_exp2_inflight_scale_down(
     *,
     concurrency: int = 10,
     duration_secs: float = 20.0,
-) -> None:
+) -> ExperimentReport:
     logger.info("=== [EXP-2] Starting In-Flight Dynamic Scale-Down Test ===")
+    report = ExperimentReport(
+        test_case="inflight_scale_down",
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        victim_ranks=[victim_rank],
+    )
+    status = _get_ft_status(session, base_url)
+    report.strategy = str(status.get("strategy", "unknown"))
+
+    warmup = _generate_single(
+        session, base_url, "Baseline check before traffic:", max_new_tokens=16
+    )
+    report.warmup_text = warmup.text
+
     stats = InFlightTrafficStats()
     stop_event = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency + 2)
 
@@ -326,12 +430,19 @@ def run_exp2_inflight_scale_down(
     logger.info("Incident detected by watchdog. Waiting 3s then scaling down...")
     time.sleep(3.0)
 
+    t_scale_start = time.monotonic()
     _trigger_scale_down(session, base_url, [victim_rank])
+    report.scale_down_latency_sec = time.monotonic() - t_scale_start
     logger.info("Scale down completed. Letting traffic run for 5 more seconds...")
     time.sleep(5.0)
 
     stop_flag = True
     stop_event.shutdown(wait=True)
+
+    report.traffic_total = stats.total_requests
+    report.traffic_200_ok = stats.success_200
+    report.traffic_503_paused = stats.paused_503
+    report.traffic_errors = stats.other_errors
 
     logger.info(
         f"In-Flight Traffic Stats: Total={stats.total_requests}, "
@@ -339,11 +450,21 @@ def run_exp2_inflight_scale_down(
     )
     # Post recovery clean check
     post_check = _generate_single(
-        session, base_url, "Verify post-traffic recovery:", max_new_tokens=16
+        session, base_url, "Baseline check before traffic:", max_new_tokens=16
     )
     assert post_check.status_code == 200, f"Final check failed: {post_check}"
-    _verify_server_log_rebuild(log_path, expected_generation=1)
+    report.post_recovery_text = post_check.text
+    report.exact_match = (post_check.text == warmup.text)
+
+    stops, restarts, rebuilds = _verify_server_log_rebuild(
+        log_path, expected_generation=1
+    )
+    report.device_stops_detected = stops
+    report.device_restarts_detected = restarts
+    report.group_rebuilds_detected = rebuilds
+    report.verdict = "PASS"
     logger.info("=== [EXP-2] In-Flight Dynamic Scale-Down Test PASSED ===")
+    return report
 
 
 # ==============================================================================
@@ -354,12 +475,23 @@ def run_exp3_continue_isolation(
     base_url: str,
     victim_rank: int,
     log_path: Path,
-) -> None:
+) -> ExperimentReport:
     logger.info("=== [EXP-3] Starting Continue Strategy Isolation Test ===")
+    report = ExperimentReport(
+        test_case="strategy_continue_isolation",
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        victim_ranks=[victim_rank],
+    )
     status = _get_ft_status(session, base_url)
+    report.strategy = str(status.get("strategy", "unknown"))
     assert (
-        status.get("strategy") == "continue"
+        report.strategy == "continue"
     ), f"Server must be launched with --fault-tolerance-on-error-strategy continue, got {status}"
+
+    warmup = _generate_single(
+        session, base_url, "Warmup check for continue:", max_new_tokens=16
+    )
+    report.warmup_text = warmup.text
 
     pids = _find_scheduler_pids()
     victim_pid = pids.get(victim_rank)
@@ -373,18 +505,37 @@ def run_exp3_continue_isolation(
 
     logger.info("Verifying that non-faulty DP ranks continue serving without 503...")
     success_count = 0
-    for i in range(10):
+    total_probes = 10
+    for i in range(total_probes):
         res = _generate_single(
             session, base_url, f"Prompt {i}", max_new_tokens=8, timeout=5.0
         )
         if res.status_code == 200:
             success_count += 1
-    logger.info(f"Received {success_count}/10 successful responses during incident.")
+    report.traffic_total = total_probes
+    report.traffic_200_ok = success_count
+    logger.info(f"Received {success_count}/{total_probes} successful responses during incident.")
     assert success_count > 0, "No requests succeeded during continue incident state!"
 
+    t_scale_start = time.monotonic()
     _trigger_scale_down(session, base_url, [victim_rank])
-    _verify_server_log_rebuild(log_path, expected_generation=1)
+    report.scale_down_latency_sec = time.monotonic() - t_scale_start
+
+    post_check = _generate_single(
+        session, base_url, "Warmup check for continue:", max_new_tokens=16
+    )
+    report.post_recovery_text = post_check.text
+    report.exact_match = (post_check.text == warmup.text)
+
+    stops, restarts, rebuilds = _verify_server_log_rebuild(
+        log_path, expected_generation=1
+    )
+    report.device_stops_detected = stops
+    report.device_restarts_detected = restarts
+    report.group_rebuilds_detected = rebuilds
+    report.verdict = "PASS"
     logger.info("=== [EXP-3] Continue Strategy Isolation Test PASSED ===")
+    return report
 
 
 # ==============================================================================
@@ -396,8 +547,21 @@ def run_exp4_mixed_fault_injection(
     soft_victim_rank: int,
     hard_victim_rank: int,
     log_path: Path,
-) -> None:
+) -> ExperimentReport:
     logger.info("=== [EXP-4] Starting Mixed Fault Injection Test ===")
+    report = ExperimentReport(
+        test_case="mixed_fault_injection",
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        victim_ranks=[soft_victim_rank, hard_victim_rank],
+    )
+    status = _get_ft_status(session, base_url)
+    report.strategy = str(status.get("strategy", "unknown"))
+
+    warmup = _generate_single(
+        session, base_url, "Mixed fault baseline check:", max_new_tokens=16
+    )
+    report.warmup_text = warmup.text
+
     # 1. Soft fault injection via API
     logger.info(
         f"Injecting soft exception to rank {soft_victim_rank} via API endpoint..."
@@ -434,15 +598,27 @@ def run_exp4_mixed_fault_injection(
     assert states.get(hard_victim_rank) == "dead"
 
     # 4. Scale down both victims simultaneously
+    t_scale_start = time.monotonic()
     _trigger_scale_down(session, base_url, [soft_victim_rank, hard_victim_rank])
+    report.scale_down_latency_sec = time.monotonic() - t_scale_start
 
     # 5. Verify 2-rank survivor cluster
     res = _generate_single(
-        session, base_url, "Verify 2-rank survivor output:", max_new_tokens=16
+        session, base_url, "Mixed fault baseline check:", max_new_tokens=16
     )
     assert res.status_code == 200, f"Post mixed scale-down failed: {res}"
-    _verify_server_log_rebuild(log_path, expected_generation=1)
+    report.post_recovery_text = res.text
+    report.exact_match = (res.text == warmup.text)
+
+    stops, restarts, rebuilds = _verify_server_log_rebuild(
+        log_path, expected_generation=1
+    )
+    report.device_stops_detected = stops
+    report.device_restarts_detected = restarts
+    report.group_rebuilds_detected = rebuilds
+    report.verdict = "PASS"
     logger.info("=== [EXP-4] Mixed Fault Injection Test PASSED ===")
+    return report
 
 
 # ==============================================================================
@@ -453,12 +629,21 @@ def run_exp5_tp_parallel_scale_down(
     base_url: str,
     victim_dp_rank: int,
     log_path: Path,
-) -> None:
+) -> ExperimentReport:
     logger.info(
         f"=== [EXP-5] Starting TP > 1 Parallel Scale-Down Test (Victim DP {victim_dp_rank}) ==="
     )
+    report = ExperimentReport(
+        test_case="tp_parallel_scale_down",
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        victim_ranks=[victim_dp_rank],
+    )
+    status = _get_ft_status(session, base_url)
+    report.strategy = str(status.get("strategy", "unknown"))
+
     warmup = _generate_single(session, base_url, "TP test warmup:", max_new_tokens=16)
     assert warmup.status_code == 200, f"TP warmup failed: {warmup}"
+    report.warmup_text = warmup.text
 
     pids = _find_scheduler_pids()
     victim_pid = pids.get(victim_dp_rank)
@@ -472,16 +657,28 @@ def run_exp5_tp_parallel_scale_down(
     os.kill(victim_pid, signal.SIGKILL)
 
     _wait_for_incident(session, base_url, [victim_dp_rank])
+    t_scale_start = time.monotonic()
     _trigger_scale_down(session, base_url, [victim_dp_rank])
+    report.scale_down_latency_sec = time.monotonic() - t_scale_start
 
     post_req = _generate_single(
-        session, base_url, "TP test post-recovery:", max_new_tokens=16
+        session, base_url, "TP test warmup:", max_new_tokens=16
     )
     assert (
         post_req.status_code == 200
     ), f"Post TP scale-down request failed: {post_req}"
-    _verify_server_log_rebuild(log_path, expected_generation=1)
+    report.post_recovery_text = post_req.text
+    report.exact_match = (post_req.text == warmup.text)
+
+    stops, restarts, rebuilds = _verify_server_log_rebuild(
+        log_path, expected_generation=1
+    )
+    report.device_stops_detected = stops
+    report.device_restarts_detected = restarts
+    report.group_rebuilds_detected = rebuilds
+    report.verdict = "PASS"
     logger.info("=== [EXP-5] TP > 1 Parallel Scale-Down Test PASSED ===")
+    return report
 
 
 # ==============================================================================
@@ -492,15 +689,25 @@ def run_exp6_cascading_scale_down(
     base_url: str,
     victim_ranks: List[int],
     log_path: Path,
-) -> None:
+) -> ExperimentReport:
     logger.info(
         f"=== [EXP-6] Starting Cascading Scale-Down Test (Steps: {victim_ranks}) ==="
     )
+    report = ExperimentReport(
+        test_case="cascading_scale_down",
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        victim_ranks=victim_ranks,
+    )
+    status = _get_ft_status(session, base_url)
+    report.strategy = str(status.get("strategy", "unknown"))
+
     warmup = _generate_single(
         session, base_url, "Cascading test baseline:", max_new_tokens=16
     )
     assert warmup.status_code == 200
+    report.warmup_text = warmup.text
 
+    t_scale_total = 0.0
     for step, victim_rank in enumerate(victim_ranks, start=1):
         logger.info(
             f"--- Cascading Step {step}: Killing rank {victim_rank} ---"
@@ -513,22 +720,35 @@ def run_exp6_cascading_scale_down(
 
         os.kill(victim_pid, signal.SIGKILL)
         _wait_for_incident(session, base_url, [victim_rank])
+        t_step_start = time.monotonic()
         _trigger_scale_down(session, base_url, [victim_rank])
+        t_scale_total += (time.monotonic() - t_step_start)
 
         # Verify generation after each step
         res = _generate_single(
             session,
             base_url,
-            f"Cascading step {step} post-check:",
+            "Cascading test baseline:",
             max_new_tokens=16,
         )
         assert (
             res.status_code == 200
         ), f"Cascading step {step} generation failed: {res}"
+        report.post_recovery_text = res.text
+        report.exact_match = (res.text == warmup.text)
         _verify_server_log_rebuild(log_path, expected_generation=step)
         logger.info(f"--- Cascading Step {step} Complete (Generation {step}) ---")
 
+    report.scale_down_latency_sec = t_scale_total
+    stops, restarts, rebuilds = _verify_server_log_rebuild(
+        log_path, expected_generation=len(victim_ranks)
+    )
+    report.device_stops_detected = stops
+    report.device_restarts_detected = restarts
+    report.group_rebuilds_detected = rebuilds
+    report.verdict = "PASS"
     logger.info("=== [EXP-6] Cascading Scale-Down Test PASSED ===")
+    return report
 
 
 def main():
@@ -595,47 +815,75 @@ def main():
         default=Path("/tmp/sglang-npu-ft.log"),
         help="Path to SGLang server log file for audit",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("./test_reports"),
+        help="Directory to automatically save structured test reports (JSON & Markdown)",
+    )
 
     args = parser.parse_args()
     session = requests.Session()
+    report: Optional[ExperimentReport] = None
 
-    if args.test_case == "idle_scale_down":
-        run_exp1_idle_scale_down(
-            session,
-            args.base_url,
-            args.victim_rank,
-            args.log_path,
-            direct_api=args.direct_api,
-        )
-    elif args.test_case == "inflight_scale_down":
-        run_exp2_inflight_scale_down(
-            session,
-            args.base_url,
-            args.victim_rank,
-            args.log_path,
-            concurrency=args.concurrency,
-        )
-    elif args.test_case == "strategy_continue_isolation":
-        run_exp3_continue_isolation(
-            session, args.base_url, args.victim_rank, args.log_path
-        )
-    elif args.test_case == "mixed_fault_injection":
-        run_exp4_mixed_fault_injection(
-            session,
-            args.base_url,
-            args.soft_victim_rank,
-            args.hard_victim_rank,
-            args.log_path,
-        )
-    elif args.test_case == "tp_parallel_scale_down":
-        run_exp5_tp_parallel_scale_down(
-            session, args.base_url, args.victim_rank, args.log_path
-        )
-    elif args.test_case == "cascading_scale_down":
-        run_exp6_cascading_scale_down(
-            session, args.base_url, args.cascading_ranks, args.log_path
-        )
+    try:
+        if args.test_case == "idle_scale_down":
+            report = run_exp1_idle_scale_down(
+                session,
+                args.base_url,
+                args.victim_rank,
+                args.log_path,
+                direct_api=args.direct_api,
+            )
+        elif args.test_case == "inflight_scale_down":
+            report = run_exp2_inflight_scale_down(
+                session,
+                args.base_url,
+                args.victim_rank,
+                args.log_path,
+                concurrency=args.concurrency,
+            )
+        elif args.test_case == "strategy_continue_isolation":
+            report = run_exp3_continue_isolation(
+                session, args.base_url, args.victim_rank, args.log_path
+            )
+        elif args.test_case == "mixed_fault_injection":
+            report = run_exp4_mixed_fault_injection(
+                session,
+                args.base_url,
+                args.soft_victim_rank,
+                args.hard_victim_rank,
+                args.log_path,
+            )
+        elif args.test_case == "tp_parallel_scale_down":
+            report = run_exp5_tp_parallel_scale_down(
+                session, args.base_url, args.victim_rank, args.log_path
+            )
+        elif args.test_case == "cascading_scale_down":
+            report = run_exp6_cascading_scale_down(
+                session, args.base_url, args.cascading_ranks, args.log_path
+            )
+    except Exception as exc:
+        logger.error(f"Test case {args.test_case} failed with exception: {exc}", exc_info=True)
+        if report is None:
+            report = ExperimentReport(
+                test_case=args.test_case,
+                timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+        report.verdict = "FAIL"
+        report.error_message = str(exc)
+        raise
+    finally:
+        if report is not None:
+            json_p, md_p = report.save_reports(args.output_dir)
+            print("\n" + "=" * 60)
+            print(f"📊 [Test Report Saved]")
+            print(f"  • JSON Report:     {json_p.resolve()}")
+            print(f"  • Markdown Report: {md_p.resolve()}")
+            print(f"  • Final Verdict:   {report.verdict}")
+            print("=" * 60 + "\n")
 
 
 if __name__ == "__main__":
     main()
+
