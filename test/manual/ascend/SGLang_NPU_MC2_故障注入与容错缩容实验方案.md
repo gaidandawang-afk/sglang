@@ -179,40 +179,140 @@ sequenceDiagram
 
 ---
 
-## 三、 自动化测试执行与验证命令
+## 三、 各种测试类型的服务启动命令与测试执行命令
 
-我们将在 `test/manual/ascend/` 下提供参数化的综合测试入口脚本：
+每个实验均采用**双终端模式**：
+- **终端 1**：启动对应拓扑和 FT 策略的 SGLang 服务（并将日志输出到 `/tmp/sglang-npu-ft.log`）。
+- **终端 2**：在服务就绪后执行对应的自动化测试脚本。
 
+---
+
+### 1. 常规拓扑 + Pause 策略服务启动（适用于 EXP-1, EXP-2, EXP-4, EXP-6）
+
+**适用场景**：
+- EXP-1：空闲状态基线缩容测试
+- EXP-2：并发推理中动态缩容测试
+- EXP-4：混合故障源注入测试
+- EXP-6：多卡并发与连续级联缩容测试 (4 $\to$ 3 $\to$ 2)
+
+**【终端 1】服务启动命令**：
 ```bash
-# 1. 运行实验 1：空闲状态基线缩容
-python test/manual/ascend/test_fault_tolerance_suite.py \
-  --test-case idle_scale_down \
-  --strategy pause
+DEEP_USE_MODE=default python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-30B-A3B \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --device npu \
+  --tp-size 4 \
+  --dp-size 4 \
+  --ep-size 4 \
+  --moe-dense-tp-size 1 \
+  --moe-dp-size 1 \
+  --attn-cp-size 1 \
+  --enable-dp-attention \
+  --enable-dp-lm-head \
+  --moe-a2a-backend deepep \
+  --deepep-mode low_latency \
+  --enable-eplb \
+  --eplb-algorithm elasticity_aware \
+  --ep-num-redundant-experts 44 \
+  --elastic-ep-backend mc2 \
+  --enable-fault-tolerance \
+  --fault-tolerance-on-error-strategy pause \
+  --fault-tolerance-timeout 600 \
+  2>&1 | tee /tmp/sglang-npu-ft.log
+```
 
-# 2. 运行实验 2：并发推理中故障注入与缩容
-python test/manual/ascend/test_fault_tolerance_suite.py \
-  --test-case inflight_scale_down \
-  --concurrency 10 \
-  --strategy pause
+**【终端 2】测试执行命令**：
+```bash
+# 运行 EXP-1：空闲状态直接缩容
+python test/manual/ascend/test_fault_tolerance_suite.py --test-case idle_scale_down --victim-rank 3
 
-# 3. 运行实验 3：Continue 策略下的局部隔离测试
-python test/manual/ascend/test_fault_tolerance_suite.py \
-  --test-case strategy_continue_isolation \
-  --strategy continue
+# 运行 EXP-2：并发推理中动态缩容 (10 并发)
+python test/manual/ascend/test_fault_tolerance_suite.py --test-case inflight_scale_down --victim-rank 3 --concurrency 10
 
-# 4. 运行实验 4：混合故障注入测试 (Exception + SIGKILL)
-python test/manual/ascend/test_fault_tolerance_suite.py \
-  --test-case mixed_fault_injection
+# 运行 EXP-4：混合软硬故障注入测试 (Rank 1 软异常 + Rank 2 物理 SIGKILL)
+python test/manual/ascend/test_fault_tolerance_suite.py --test-case mixed_fault_injection --soft-victim-rank 1 --hard-victim-rank 2
 
-# 5. 运行实验 5：TP > 1 (TP=2, DP=2) 容错缩容测试
-python test/manual/ascend/test_fault_tolerance_suite.py \
-  --test-case tp_parallel_scale_down \
-  --tp-size 2 --dp-size 2
+# 运行 EXP-6：多轮级联连续缩容 (4 -> 3 -> 2)
+python test/manual/ascend/test_fault_tolerance_suite.py --test-case cascading_scale_down --cascading-ranks 3 2
+```
 
-# 6. 运行实验 6：连续阶梯缩容测试 (4 -> 3 -> 2)
-python test/manual/ascend/test_fault_tolerance_suite.py \
-  --test-case cascading_scale_down \
-  --steps 2
+---
+
+### 2. Continue 策略服务启动（适用于 EXP-3）
+
+**适用场景**：
+- EXP-3：Continue 策略下的局部非阻塞故障隔离测试
+
+**【终端 1】服务启动命令**（注意 `--fault-tolerance-on-error-strategy continue`）：
+```bash
+DEEP_USE_MODE=default python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-30B-A3B \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --device npu \
+  --tp-size 4 \
+  --dp-size 4 \
+  --ep-size 4 \
+  --moe-dense-tp-size 1 \
+  --moe-dp-size 1 \
+  --attn-cp-size 1 \
+  --enable-dp-attention \
+  --enable-dp-lm-head \
+  --moe-a2a-backend deepep \
+  --deepep-mode low_latency \
+  --enable-eplb \
+  --eplb-algorithm elasticity_aware \
+  --ep-num-redundant-experts 44 \
+  --elastic-ep-backend mc2 \
+  --enable-fault-tolerance \
+  --fault-tolerance-on-error-strategy continue \
+  --fault-tolerance-timeout 600 \
+  2>&1 | tee /tmp/sglang-npu-ft.log
+```
+
+**【终端 2】测试执行命令**：
+```bash
+python test/manual/ascend/test_fault_tolerance_suite.py --test-case strategy_continue_isolation --victim-rank 3
+```
+
+---
+
+### 3. TP > 1 并行拓扑服务启动（适用于 EXP-5，以 DP=2, TP=2 为例）
+
+**适用场景**：
+- EXP-5：TP > 1 张量并行协同容错与 DP 单元整组隔离测试
+
+**【终端 1】服务启动命令**（4 卡节点，划分为 2 个 DP 单元，每个 DP 内 Dense TP=2）：
+```bash
+DEEP_USE_MODE=default python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-30B-A3B \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --device npu \
+  --tp-size 4 \
+  --dp-size 2 \
+  --ep-size 2 \
+  --moe-dense-tp-size 2 \
+  --moe-dp-size 1 \
+  --attn-cp-size 1 \
+  --enable-dp-attention \
+  --enable-dp-lm-head \
+  --moe-a2a-backend deepep \
+  --deepep-mode low_latency \
+  --enable-eplb \
+  --eplb-algorithm elasticity_aware \
+  --ep-num-redundant-experts 44 \
+  --elastic-ep-backend mc2 \
+  --enable-fault-tolerance \
+  --fault-tolerance-on-error-strategy pause \
+  --fault-tolerance-timeout 600 \
+  2>&1 | tee /tmp/sglang-npu-ft.log
+```
+
+**【终端 2】测试执行命令**：
+```bash
+python test/manual/ascend/test_fault_tolerance_suite.py --test-case tp_parallel_scale_down --victim-rank 1
 ```
 
 ---

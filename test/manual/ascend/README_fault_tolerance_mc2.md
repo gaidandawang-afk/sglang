@@ -125,25 +125,100 @@ failure is injected externally.
 
 ## Multi-Scenario Fault-Injection Test Suite
 
-To run the extended fault-injection test scenarios (covering idle, in-flight concurrent traffic, continue strategy isolation, mixed exception + SIGKILL, TP>1, and cascading scale-downs):
+To run the extended fault-injection test scenarios, use the **two-terminal workflow**:
+- **Terminal 1**: Launch the SGLang server with the target topology and FT strategy.
+- **Terminal 2**: Run the client-side test orchestrator after the server is ready.
 
+### 1. Standard Topology + Pause Strategy (for EXP-1, EXP-2, EXP-4, EXP-6)
+
+**[Terminal 1] Launch Command**:
 ```bash
-# 1. EXP-1: Idle baseline scale-down
+DEEP_USE_MODE=default python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-30B-A3B \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --device npu \
+  --tp-size 4 --dp-size 4 --ep-size 4 \
+  --moe-dense-tp-size 1 --moe-dp-size 1 --attn-cp-size 1 \
+  --enable-dp-attention --enable-dp-lm-head \
+  --moe-a2a-backend deepep --deepep-mode low_latency \
+  --enable-eplb --eplb-algorithm elasticity_aware \
+  --ep-num-redundant-experts 44 --elastic-ep-backend mc2 \
+  --enable-fault-tolerance \
+  --fault-tolerance-on-error-strategy pause \
+  --fault-tolerance-timeout 600 \
+  2>&1 | tee /tmp/sglang-npu-ft.log
+```
+
+**[Terminal 2] Test Execution**:
+```bash
+# EXP-1: Idle baseline scale-down
 python test/manual/ascend/test_fault_tolerance_suite.py --test-case idle_scale_down --victim-rank 3
 
-# 2. EXP-2: In-flight dynamic scale-down under concurrent traffic
+# EXP-2: In-flight dynamic scale-down under concurrent traffic (10 QPS)
 python test/manual/ascend/test_fault_tolerance_suite.py --test-case inflight_scale_down --victim-rank 3 --concurrency 10
 
-# 3. EXP-3: Continue strategy non-blocking isolation
-python test/manual/ascend/test_fault_tolerance_suite.py --test-case strategy_continue_isolation --victim-rank 3
-
-# 4. EXP-4: Mixed soft exception + hard SIGKILL multi-rank scale-down
+# EXP-4: Mixed soft exception + hard SIGKILL multi-rank scale-down
 python test/manual/ascend/test_fault_tolerance_suite.py --test-case mixed_fault_injection --soft-victim-rank 1 --hard-victim-rank 2
 
-# 5. EXP-5: TP > 1 (e.g. TP=2, DP=2) unit scale-down
-python test/manual/ascend/test_fault_tolerance_suite.py --test-case tp_parallel_scale_down --victim-rank 1
-
-# 6. EXP-6: Multi-step cascading scale-down (4 -> 3 -> 2)
+# EXP-6: Multi-step cascading scale-down (4 -> 3 -> 2)
 python test/manual/ascend/test_fault_tolerance_suite.py --test-case cascading_scale_down --cascading-ranks 3 2
 ```
+
+---
+
+### 2. Continue Strategy (for EXP-3)
+
+**[Terminal 1] Launch Command** (using `--fault-tolerance-on-error-strategy continue`):
+```bash
+DEEP_USE_MODE=default python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-30B-A3B \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --device npu \
+  --tp-size 4 --dp-size 4 --ep-size 4 \
+  --moe-dense-tp-size 1 --moe-dp-size 1 --attn-cp-size 1 \
+  --enable-dp-attention --enable-dp-lm-head \
+  --moe-a2a-backend deepep --deepep-mode low_latency \
+  --enable-eplb --eplb-algorithm elasticity_aware \
+  --ep-num-redundant-experts 44 --elastic-ep-backend mc2 \
+  --enable-fault-tolerance \
+  --fault-tolerance-on-error-strategy continue \
+  --fault-tolerance-timeout 600 \
+  2>&1 | tee /tmp/sglang-npu-ft.log
+```
+
+**[Terminal 2] Test Execution**:
+```bash
+python test/manual/ascend/test_fault_tolerance_suite.py --test-case strategy_continue_isolation --victim-rank 3
+```
+
+---
+
+### 3. Tensor Parallelism TP > 1 (for EXP-5: DP=2, TP=2)
+
+**[Terminal 1] Launch Command** (4 cards: DP=2, TP=2, EP=2):
+```bash
+DEEP_USE_MODE=default python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-30B-A3B \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --device npu \
+  --tp-size 4 --dp-size 2 --ep-size 2 \
+  --moe-dense-tp-size 2 --moe-dp-size 1 --attn-cp-size 1 \
+  --enable-dp-attention --enable-dp-lm-head \
+  --moe-a2a-backend deepep --deepep-mode low_latency \
+  --enable-eplb --eplb-algorithm elasticity_aware \
+  --ep-num-redundant-experts 44 --elastic-ep-backend mc2 \
+  --enable-fault-tolerance \
+  --fault-tolerance-on-error-strategy pause \
+  --fault-tolerance-timeout 600 \
+  2>&1 | tee /tmp/sglang-npu-ft.log
+```
+
+**[Terminal 2] Test Execution**:
+```bash
+python test/manual/ascend/test_fault_tolerance_suite.py --test-case tp_parallel_scale_down --victim-rank 1
+```
+
 
