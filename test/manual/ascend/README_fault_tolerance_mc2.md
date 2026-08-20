@@ -120,3 +120,30 @@ rebuilt process-group membership plus the expected compact-rank mapping.
 
 Use `--wait-for-existing-incident` instead of `--victim-pid` when the process
 failure is injected externally.
+
+---
+
+## Multi-Scenario Fault-Injection Test Suite
+
+To run the extended fault-injection test scenarios (covering idle, in-flight concurrent traffic, continue strategy isolation, mixed exception + SIGKILL, TP>1, and cascading scale-downs):
+
+```bash
+# 1. EXP-1: Idle baseline scale-down
+python test/manual/ascend/test_fault_tolerance_suite.py --test-case idle_scale_down --victim-rank 3
+
+# 2. EXP-2: In-flight dynamic scale-down under concurrent traffic
+python test/manual/ascend/test_fault_tolerance_suite.py --test-case inflight_scale_down --victim-rank 3 --concurrency 10
+
+# 3. EXP-3: Continue strategy non-blocking isolation
+python test/manual/ascend/test_fault_tolerance_suite.py --test-case strategy_continue_isolation --victim-rank 3
+
+# 4. EXP-4: Mixed soft exception + hard SIGKILL multi-rank scale-down
+python test/manual/ascend/test_fault_tolerance_suite.py --test-case mixed_fault_injection --soft-victim-rank 1 --hard-victim-rank 2
+
+# 5. EXP-5: TP > 1 (e.g. TP=2, DP=2) unit scale-down
+python test/manual/ascend/test_fault_tolerance_suite.py --test-case tp_parallel_scale_down --victim-rank 1
+
+# 6. EXP-6: Multi-step cascading scale-down (4 -> 3 -> 2)
+python test/manual/ascend/test_fault_tolerance_suite.py --test-case cascading_scale_down --cascading-ranks 3 2
+```
+
