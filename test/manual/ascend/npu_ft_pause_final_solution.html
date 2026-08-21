@@ -549,7 +549,8 @@
       <section id="gap">
         <h2>3. 当前问题</h2>
         <p>
-          当前触发 pause 状态只会拒绝后续请求，但没有处理执行层的在途请求。
+          当前由进程退出触发的 pause 只会拒绝后续请求，不会主动处理执层的在途请求。
+          现有 discard 仅在 MC2/HCCL 算子异常冒泡到 Scheduler FT event loop 时执行。
         </p>
       </section>
 
