@@ -68,6 +68,18 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 logger = logging.getLogger(__name__)
 
 
+def _npu_mc2_elastic_info_kwargs():
+    from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+    from sglang.srt.runtime_context import get_server_args
+
+    server_args = get_server_args()
+    if server_args.enable_fault_tolerance and server_args.elastic_ep_backend == "mc2":
+        return {
+            "elastic_info": ElasticEPStateManager.instance().npu_mc2_elastic_info.tensor
+        }
+    return {}
+
+
 def _is_mnnvl_fabric_supported() -> bool:
     if not is_flashinfer_available():
         return False
@@ -763,6 +775,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 **fp8_deepgemm_scale_opts,
+                **(_npu_mc2_elastic_info_kwargs() if _is_npu else {}),
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook
@@ -835,6 +848,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 **overlap_args_dict,
+                **(_npu_mc2_elastic_info_kwargs() if _is_npu else {}),
             )
 
         self.packed_recv_count = self.handle = None

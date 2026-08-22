@@ -660,7 +660,11 @@ class ModelRunner:
 
     def maybe_init_elastic_ep(self):
         if self.server_args.elastic_ep_backend:
-            ElasticEPStateManager.init(self.server_args)
+            state = ElasticEPStateManager.init(self.server_args)
+            if _is_npu and self.server_args.elastic_ep_backend == "mc2":
+                state.init_npu_mc2_elastic_info(
+                    num_physical_experts=get_global_expert_location_metadata().num_physical_experts
+                )
 
     def init_token_oracle(self):
         self._token_oracle_manager = install_token_oracle_from_env(
@@ -1910,6 +1914,18 @@ class ModelRunner:
 
     def apply_fault_tolerance_scale_down(self, active_mask: list[bool]) -> None:
         state = ElasticEPStateManager.instance()
+        if _is_npu and self.server_args.elastic_ep_backend == "mc2":
+            import torch_npu
+
+            from sglang.srt.fault_tolerance.npu_communication import (
+                get_npu_ft_communication,
+            )
+
+            torch_npu.npu.stop_device(self.gpu_id)
+            torch_npu.npu.restart_device(self.gpu_id)
+            get_npu_ft_communication().rebuild(
+                active_mask, torch.device("npu", self.gpu_id)
+            )
         mask = torch.as_tensor(
             active_mask,
             dtype=state.active_ranks.dtype,
@@ -1919,6 +1935,8 @@ class ModelRunner:
         state.active_ranks_cpu.copy_(mask.detach().cpu())
         for _ in self.eplb_manager.rebalance(force=True):
             pass
+        if _is_npu and self.server_args.elastic_ep_backend == "mc2":
+            state.update_npu_mc2_elastic_info()
         state.snapshot_active_to_last()
 
     def update_model_fields(
