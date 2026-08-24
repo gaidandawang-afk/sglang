@@ -62,7 +62,8 @@ from sglang.srt.eplb.expert_distribution import (
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     append_trivial_expert_slots,
-    broadcast_global_expert_location_metadata,
+    broadcast_global_expert_location_metadata_for_recovery,
+    broadcast_global_expert_location_metadata_for_scale,
     compute_initial_expert_location_metadata,
     format_expert_location_layout,
     get_global_expert_location_metadata,
@@ -416,7 +417,7 @@ class ModelRunner:
         )
 
         global_ep_rank = self.ps.tp_rank + self.server_args.ep_join_rank_offset
-        broadcast_global_expert_location_metadata(
+        broadcast_global_expert_location_metadata_for_scale(
             model_config=self.model_config,
             moe_ep_rank=global_ep_rank,
             src_rank=0,
@@ -827,9 +828,7 @@ class ModelRunner:
         join_process_groups()
 
         global_ep_rank = self.ps.tp_rank + self.server_args.ep_join_rank_offset
-        broadcast_global_expert_location_metadata(
-            model_config=self.model_config,
-            moe_ep_rank=global_ep_rank,
+        broadcast_global_expert_location_metadata_for_recovery(
             src_rank=get_healthy_expert_location_src_rank(
                 invoked_in_elastic_ep_rejoin_path=True
             ),
@@ -1752,7 +1751,7 @@ class ModelRunner:
             from_ep_size=effective_size,
             effective_size=target_size,
         )
-        broadcast_global_expert_location_metadata(
+        broadcast_global_expert_location_metadata_for_scale(
             model_config=self.model_config,
             moe_ep_rank=self._elastic_global_rank(),
             src_rank=0,
@@ -1827,8 +1826,6 @@ class ModelRunner:
             recovered = maybe_recover_ep_ranks(
                 tp_group=self.tp_group,
                 eplb_manager=self.eplb_manager,
-                model_config=self.model_config,
-                moe_ep_rank=self._elastic_global_rank(),
             )
             if recovered:
                 self.forward_pass_id = 0

@@ -505,7 +505,7 @@ def append_trivial_expert_slots(
     return torch.cat([physical_to_logical_map, new_slots % num_logical_experts], dim=1)
 
 
-def broadcast_global_expert_location_metadata(
+def broadcast_global_expert_location_metadata_for_scale(
     model_config: ModelConfig,
     moe_ep_rank: int,
     src_rank: int = 0,
@@ -530,6 +530,39 @@ def broadcast_global_expert_location_metadata(
     )
     set_global_expert_location_metadata(metadata, allow_overwrite=True)
     return metadata
+
+
+def broadcast_global_expert_location_metadata_for_recovery(
+    src_rank: int = 0,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+) -> ExpertLocationMetadata:
+    """Synchronize fixed-topology recovery metadata without replacing tensors."""
+    metadata = get_global_expert_location_metadata()
+    assert metadata is not None
+
+    for field in (
+        "physical_to_logical_map",
+        "logical_to_all_physical_map",
+        "logical_to_all_physical_map_num_valid",
+        "logical_to_rank_dispatch_physical_map",
+    ):
+        tensor = getattr(metadata, field)
+        if tensor is None:
+            continue
+        if not tensor.is_contiguous():
+            raise RuntimeError(
+                f"Recovery metadata tensor {field} must remain contiguous"
+            )
+        torch.distributed.broadcast(tensor, src=src_rank, group=group)
+
+    metadata.physical_to_logical_map_cpu.copy_(
+        metadata.physical_to_logical_map.cpu()
+    )
+    metadata.logical_to_all_physical_map_cpu.copy_(
+        metadata.logical_to_all_physical_map.cpu()
+    )
+    return metadata
+
 
 def _compute_logical_to_all_physical_map(
     server_args: ServerArgs,
