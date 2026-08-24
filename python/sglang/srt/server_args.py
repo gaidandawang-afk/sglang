@@ -2375,10 +2375,10 @@ class ServerArgs:
         NS("parallel"),
     ] = None
     elastic_ep_backend: A[
-        Literal[None, "mooncake", "nixl"],
+        Literal[None, "mooncake", "nixl", "mc2"],
         Arg(
-            help="Specify the collective communication backend for elastic EP. Supports 'mooncake' and 'nixl'.",
-            choices=["none", "mooncake", "nixl"],
+            help="Specify the collective communication backend for elastic EP. Supports 'mooncake', 'nixl', and Ascend 'mc2'.",
+            choices=["none", "mooncake", "nixl", "mc2"],
         ),
         NS("exec.moe"),
     ] = None
@@ -8998,6 +8998,10 @@ class PortArgs:
     # derive the /dev/shm path for load snapshots.
     instance_id: str = ""
 
+    # Persistent TCPStore hosted by DataParallelController for survivor-only
+    # graph-external NPU FT metadata. Empty when the feature is disabled.
+    fault_tolerance_metadata_ipc_name: str = ""
+
     @staticmethod
     def init_new(
         server_args: ServerArgs,
@@ -9062,26 +9066,36 @@ class PortArgs:
             dist_init_host = na.host
             dist_init_port = na.port
 
-            # We need 5 consecutive ports from port_base for:
-            # port_base, detokenizer, rpc, metrics, scheduler.
+            # NPU MC2 FT reserves one additional endpoint after the existing
+            # tokenizer/detokenizer/rpc/metrics/scheduler/load-snapshot ports.
+            # Keep the established derivation for every other configuration.
             # In multi-node, all nodes derive ports independently from
             # dist_init_port, so the derivation must be deterministic
             # (no availability-based search). If incrementing would
             # overflow the valid TCP range, decrement instead.
-            NUM_DERIVED_PORTS = 5
+            NUM_DERIVED_PORTS = (
+                6
+                if server_args.enable_fault_tolerance
+                and server_args.elastic_ep_backend == "mc2"
+                else 5
+            )
+            if dist_init_port + NUM_DERIVED_PORTS > 65535:
+                primary_port_base = dist_init_port - NUM_DERIVED_PORTS - 1
+            else:
+                primary_port_base = dist_init_port + 1
+
             if server_args.is_ep_joiner:
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA
-            elif dist_init_port + NUM_DERIVED_PORTS > 65535:
-                port_base = dist_init_port - NUM_DERIVED_PORTS - 1
             else:
-                port_base = dist_init_port + 1
+                port_base = primary_port_base
 
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_port = port_base + 3
             load_collector_port = port_base + 5
+            fault_tolerance_metadata_port = port_base + 6
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
@@ -9090,6 +9104,10 @@ class PortArgs:
                 scheduler_input_port = worker_ports[dp_rank]
 
             is_joiner = server_args.is_ep_joiner
+            is_recovery_joiner = server_args.ep_join_mode == "recover"
+            tokenizer_port = (
+                primary_port_base if is_recovery_joiner else port_base
+            )
             # Under SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE, SGLang never binds
             # dist_init_port / nccl_port (rendezvous uses the externally-managed
             # store; see distributed/bootstrap.py:_resolve_dist_init_method), so
@@ -9101,17 +9119,28 @@ class PortArgs:
                 if dp_rank is None:
                     if not (is_joiner or dist_init_overridden):
                         wait_port_available(dist_init_port, "dist_init_port")
-                    wait_port_available(port_base, "port_base")
-                    wait_port_available(detokenizer_port, "detokenizer_port")
-                    if not dist_init_overridden:
+                    if not is_recovery_joiner:
+                        wait_port_available(port_base, "port_base")
+                        wait_port_available(detokenizer_port, "detokenizer_port")
+                    if not (is_recovery_joiner or dist_init_overridden):
                         wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_port, "metrics_port")
+                    if (
+                        server_args.enable_fault_tolerance
+                        and server_args.elastic_ep_backend == "mc2"
+                    ):
+                        wait_port_available(
+                            fault_tolerance_metadata_port,
+                            "fault_tolerance_metadata_port",
+                        )
                     if server_args.nnodes > 1:
                         wait_port_available(load_collector_port, "load_collector_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
-                if dp_rank is None or worker_ports is None:
+                if not is_recovery_joiner and (
+                    dp_rank is None or worker_ports is None
+                ):
                     wait_port_available(scheduler_input_port, "scheduler_input_port")
             except ValueError:
                 logger.exception(
@@ -9119,8 +9148,19 @@ class PortArgs:
                 )
                 raise
 
+            fault_tolerance_metadata_ipc_name = (
+                NetworkAddress(
+                    dist_init_host, fault_tolerance_metadata_port
+                ).to_tcp()
+                if server_args.enable_fault_tolerance
+                and server_args.elastic_ep_backend == "mc2"
+                else ""
+            )
+
             return PortArgs(
-                tokenizer_ipc_name=NetworkAddress(dist_init_host, port_base).to_tcp(),
+                tokenizer_ipc_name=NetworkAddress(
+                    dist_init_host, tokenizer_port
+                ).to_tcp(),
                 scheduler_input_ipc_name=NetworkAddress(
                     dist_init_host, scheduler_input_port
                 ).to_tcp(),
@@ -9136,4 +9176,7 @@ class PortArgs:
                     dist_init_host, load_collector_port
                 ).to_tcp(),
                 instance_id=instance_id,
+                fault_tolerance_metadata_ipc_name=(
+                    fault_tolerance_metadata_ipc_name
+                ),
             )

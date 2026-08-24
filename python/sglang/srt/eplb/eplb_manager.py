@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Callable, List
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch.cuda
 from torch import nn
@@ -89,7 +89,12 @@ class EPLBManager:
 
             yield from self.rebalance()
 
-    def rebalance(self, *, force: bool = False):
+    def rebalance(
+        self,
+        *,
+        force: bool = False,
+        logical_count_override: Optional[torch.Tensor] = None,
+    ):
         if self._rebalance_disabled_reason is not None:
             if not self._rebalance_disabled_logged:
                 logger.debug(
@@ -101,29 +106,79 @@ class EPLBManager:
 
         logger.info("[EPLBManager] rebalance start")
 
-        enable_timing = self._rebalance_layers_per_chunk is None
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        elastic_ep_state = ElasticEPStateManager.instance()
+        recovering_from_rank_fault = (
+            elastic_ep_state is not None
+            and elastic_ep_state.active_ranks_cpu is not None
+            and not bool(elastic_ep_state.active_ranks_cpu.all().item())
+        )
+        enable_timing = (
+            self._rebalance_layers_per_chunk is None
+            and not recovering_from_rank_fault
+        )
+        if recovering_from_rank_fault:
+            logger.info(
+                "[EPLBManager] skip device-wide timing synchronization during rank-fault recovery"
+            )
 
         if enable_timing:
             torch.get_device_module().synchronize()
             time_start = time.time()
 
-        dump_record_output = get_global_expert_distribution_recorder().dump_record(
-            output_mode="object"
-        )
-        logical_count = dump_record_output["logical_count"]
-        average_utilization_rate_over_window = dump_record_output[
-            "average_utilization_rate_over_window"
-        ]
+        if recovering_from_rank_fault:
+            old_expert_location_metadata = get_global_expert_location_metadata()
+            expert_location_metadata = ExpertLocationMetadata.init_for_fault_recovery(
+                self._server_args,
+                old_expert_location_metadata,
+                elastic_ep_state.active_ranks_cpu,
+                moe_ep_rank=self._ps.tp_rank,
+            )
+            changed_slots = int(
+                (
+                    expert_location_metadata.physical_to_logical_map_cpu
+                    != old_expert_location_metadata.physical_to_logical_map_cpu
+                )
+                .sum()
+                .item()
+            )
+            logger.info(
+                "[NPU FT] minimal expert recovery layout: rank=%d "
+                "active_original_ranks=%s changed_physical_slots=%d",
+                self._ps.tp_rank,
+                torch.nonzero(
+                    elastic_ep_state.active_ranks_cpu,
+                    as_tuple=False,
+                )
+                .flatten()
+                .tolist(),
+                changed_slots,
+            )
+        else:
+            if logical_count_override is None:
+                dump_record_output = (
+                    get_global_expert_distribution_recorder().dump_record(
+                        output_mode="object"
+                    )
+                )
+                logical_count = dump_record_output["logical_count"]
+                average_utilization_rate_over_window = dump_record_output[
+                    "average_utilization_rate_over_window"
+                ]
+            else:
+                logical_count = logical_count_override
+                average_utilization_rate_over_window = None
 
-        # Check whether rebalancing is needed
-        if not force and not self._check_rebalance_needed(
-            average_utilization_rate_over_window
-        ):
-            return
+            # Check whether rebalancing is needed
+            if not force and not self._check_rebalance_needed(
+                average_utilization_rate_over_window
+            ):
+                return
 
-        expert_location_metadata = ExpertLocationMetadata.init_by_eplb(
-            self._server_args, self._model_config, logical_count
-        )
+            expert_location_metadata = ExpertLocationMetadata.init_by_eplb(
+                self._server_args, self._model_config, logical_count
+            )
 
         from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
             init_lplb_solvers,
@@ -140,6 +195,16 @@ class EPLBManager:
         for chunk_layer_ids in update_layer_ids_chunks:
             if len(update_layer_ids_chunks) > 1:
                 yield
+            survivor_process_groups = None
+            if (
+                recovering_from_rank_fault
+                and self._server_args.elastic_ep_backend == "mc2"
+            ):
+                from sglang.srt.fault_tolerance.npu_metadata import (
+                    get_npu_ft_metadata_group,
+                )
+
+                survivor_process_groups = get_npu_ft_metadata_group()
             update_expert_location_with_recovery(
                 expert_location_updater=self._get_expert_location_updater(),
                 model=self._get_model(),
@@ -153,6 +218,7 @@ class EPLBManager:
                 init_lplb_solvers_callable=lambda: init_lplb_solvers(
                     model_config=self._model_config
                 ),
+                survivor_process_groups=survivor_process_groups,
             )
 
         self._log_rebalance_layout_after_update(update_layer_ids=all_update_layer_ids)
@@ -246,6 +312,7 @@ def update_expert_location_with_recovery(
     update_weights_from_disk_callable,
     ep_dispatch_algorithm: str,
     init_lplb_solvers_callable,
+    survivor_process_groups=None,
 ):
     p2p_missing_logical_experts = expert_location_updater.update(
         model.routed_experts_weights_of_layer,
@@ -253,9 +320,21 @@ def update_expert_location_with_recovery(
         update_layer_ids=update_layer_ids,
         nnodes=nnodes,
         rank=tp_rank,
+        survivor_process_groups=survivor_process_groups,
     )
 
     if len(p2p_missing_logical_experts) > 0:
+        missing_expert_layer_pairs = sum(
+            len(expert_ids)
+            for expert_ids in p2p_missing_logical_experts.values()
+        )
+        unique_missing_experts = sorted(
+            {
+                expert_id
+                for expert_ids in p2p_missing_logical_experts.values()
+                for expert_id in expert_ids
+            }
+        )
         # Load the missing expert weights from disk
         if callable(getattr(model, "generate_weight_name_filter", None)):
             # Filter and load only missing expert weights
@@ -270,16 +349,86 @@ def update_expert_location_with_recovery(
             )
             weight_name_filter = None
 
+        reload_source = (
+            "dram"
+            if expert_backup_client is not None and expert_backup_client.use_backup
+            else "disk"
+        )
+        reload_start = time.monotonic()
+        logger.info(
+            "[NPU FT] missing-expert reload begin: rank=%d source=%s "
+            "layers=%d expert_layer_pairs=%d unique_experts=%d",
+            tp_rank,
+            reload_source,
+            len(p2p_missing_logical_experts),
+            missing_expert_layer_pairs,
+            len(unique_missing_experts),
+        )
         if expert_backup_client is not None and expert_backup_client.use_backup:
             # Load the missing weights from the DRAM backup
             expert_backup_client.update_weights(weight_name_filter)
         else:
             # Load the missing weights from disk
-            update_weights_from_disk_callable(
+            update_result = update_weights_from_disk_callable(
                 get_server_args().model_path,
                 get_server_args().load_format,
                 weight_name_filter=weight_name_filter,
             )
+            if (
+                survivor_process_groups is not None
+                and isinstance(update_result, tuple)
+                and not update_result[0]
+            ):
+                raise RuntimeError(
+                    "NPU FT failed to reload missing experts from disk: "
+                    f"{update_result[1]}"
+                )
+            reload_stats = getattr(
+                weight_name_filter, "_sglang_ft_reload_stats", None
+            )
+            if reload_stats is not None:
+                expected_pairs = reload_stats["expected_pairs"]
+                selected_pairs = reload_stats["selected_pairs"]
+                unmatched_pairs = sorted(expected_pairs - selected_pairs)
+                logger.info(
+                    "[NPU FT] missing-expert checkpoint coverage: rank=%d "
+                    "expected_pairs=%d selected_pairs=%d selected_tensors=%d",
+                    tp_rank,
+                    len(expected_pairs),
+                    len(selected_pairs),
+                    reload_stats["selected_weight_names"],
+                )
+                if unmatched_pairs:
+                    raise RuntimeError(
+                        "NPU FT checkpoint filter did not find every requested "
+                        "expert: "
+                        f"rank={tp_rank} unmatched_pairs={unmatched_pairs[:32]} "
+                        f"unmatched_count={len(unmatched_pairs)}"
+                    )
+                if envs.SGLANG_NPU_FT_VERIFY_EXPERT_RELOAD.get():
+                    validate_probe = getattr(
+                        model, "validate_ft_reloaded_expert_probe", None
+                    )
+                    if not callable(validate_probe):
+                        raise RuntimeError(
+                            "SGLANG_NPU_FT_VERIFY_EXPERT_RELOAD requires a "
+                            "model-specific expert content validator"
+                        )
+                    probe_result = validate_probe(reload_stats, tp_rank)
+                    logger.info(
+                        "[NPU FT] missing-expert content probe: rank=%d %s",
+                        tp_rank,
+                        probe_result,
+                    )
+        logger.info(
+            "[NPU FT] missing-expert reload end: rank=%d source=%s "
+            "layers=%d expert_layer_pairs=%d elapsed=%.3fs",
+            tp_rank,
+            reload_source,
+            len(p2p_missing_logical_experts),
+            missing_expert_layer_pairs,
+            time.monotonic() - reload_start,
+        )
 
     # Re-init LPLB solvers after expert location update
     if ep_dispatch_algorithm == "lp":

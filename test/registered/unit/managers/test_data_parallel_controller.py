@@ -26,6 +26,7 @@ from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
     LoadBalanceMethod,
+    _get_control_message_step,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 
@@ -116,6 +117,26 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         )
         self.assertEqual(budget.total_requests, [10, 2, 30])
         self.assertEqual(budget.total_tokens, [100, 50, 300])
+
+
+class TestControlMessageFanout(CustomTestCase):
+    def test_fault_tolerance_fans_out_before_survivor_group_rebuild(self):
+        args = SimpleNamespace(
+            enable_dp_attention=True,
+            enable_dp_attention_local_control_broadcast=False,
+            enable_fault_tolerance=True,
+            tp_size=4,
+        )
+        self.assertEqual(_get_control_message_step(args), 1)
+
+    def test_non_ft_full_tp_control_keeps_existing_stride(self):
+        args = SimpleNamespace(
+            enable_dp_attention=True,
+            enable_dp_attention_local_control_broadcast=False,
+            enable_fault_tolerance=False,
+            tp_size=4,
+        )
+        self.assertEqual(_get_control_message_step(args), 4)
 
 
 class TestDPBudgetDispatch(CustomTestCase):

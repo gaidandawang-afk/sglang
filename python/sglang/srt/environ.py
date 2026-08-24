@@ -674,6 +674,9 @@ class Envs:
     SGLANG_EXPERT_LOCATION_UPDATER_CANARY = EnvBool(False)
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS = EnvBool(False)
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
+    # Compare one filtered checkpoint expert with its recovered NPU physical
+    # slot before committing an MC2 scale-down. Intended for FT bring-up only.
+    SGLANG_NPU_FT_VERIFY_EXPERT_RELOAD = EnvBool(False)
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
     SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
     SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC = EnvBool(False)

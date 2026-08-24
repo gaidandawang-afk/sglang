@@ -308,6 +308,15 @@ class PrefillDelayer:
         max_prefill_bs: int = 0,
         waiting_queue_len: int = 0,
     ):
+        from sglang.srt.runtime_context import get_resources
+
+        survivor_process_groups = get_resources().buffers.get(
+            "npu_ft_survivor_process_groups"
+        )
+        use_survivor_group = (
+            survivor_process_groups is not None
+            and survivor_process_groups.is_rebuilt
+        )
         local_info = torch.tensor(
             [
                 int(local_prefillable),
@@ -316,9 +325,17 @@ class PrefillDelayer:
                 max_prefill_bs,
                 waiting_queue_len,
             ],
-            device=self._gather_device,
+            device="cpu" if use_survivor_group else self._gather_device,
             dtype=torch.int64,
         )
+        if use_survivor_group:
+            gathered = survivor_process_groups.all_gather_cpu_tensor(local_info)
+            return torch.stack(
+                [
+                    gathered[rank]
+                    for rank in survivor_process_groups.active_original_ranks
+                ]
+            )
         torch.distributed.all_gather_into_tensor(
             self._global_info_buffer.flatten(),
             local_info,

@@ -1,0 +1,63 @@
+diff --git a/python/deep_ep/deep_ep/strategies/low_latency_strategy.py b/python/deep_ep/deep_ep/strategies/low_latency_strategy.py
+--- a/python/deep_ep/deep_ep/strategies/low_latency_strategy.py
++++ b/python/deep_ep/deep_ep/strategies/low_latency_strategy.py
+@@ -187,6 +187,16 @@
+ 
+     def get_supported_modes(self) -> List[str]:
+         return ["low_latency"]
++
++    def _comm_alg_for_elastic_info(
++        self, elastic_info: Optional[torch.Tensor]
++    ) -> str:
++        # The dynamic scale-down tiling path is not implemented for hierarchy.
++        # Keep the existing ops default for non-elastic users, but make the
++        # dispatch/combine pair use the elastic-compatible fullmesh template.
++        if elastic_info is not None and self.comm_alg == "hierarchy":
++            return "fullmesh_v1"
++        return self.comm_alg
+ 
+     def low_latency_dispatch(
+         self,
+@@ -211,6 +221,7 @@
+         Callable,
+     ]:
+ 
++        comm_alg = self._comm_alg_for_elastic_info(elastic_info)
+         topk_ids = topk_idx.int()
+         x_active_mask = torch.zeros(
+             num_max_dispatch_tokens_per_rank,
+@@ -219,7 +230,7 @@
+         )
+         x_active_mask[: x.size(0)] = True
+         padding_size = num_max_dispatch_tokens_per_rank - x.size(0)
+-        if self.comm_alg == "hierarchy":
++        if comm_alg == "hierarchy":
+             assert (
+                 topk_weights is not None
+             ), "When comm_alg='hierarchy', topk_weights can not be None"
+@@ -257,7 +268,7 @@
+             topk_idx=topk_padding,
+             num_experts=num_experts,
+             quant_mode=3 if use_ue8m0 else 2 if use_fp8 else 0,
+-            comm_alg=self.comm_alg,
++            comm_alg=comm_alg,
+             topk_weights=weight_padding,
+             x_active_mask=x_active_mask,
+             num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
+@@ -301,6 +312,7 @@
+         elastic_info: Optional[torch.Tensor] = None,
+     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
+ 
++        comm_alg = self._comm_alg_for_elastic_info(elastic_info)
+         topk_ids = topk_idx.int()
+         src_num = topk_idx.size(0)
+         (
+@@ -323,7 +335,7 @@
+             assist_info_for_combine=src_info,
+             ep_send_counts=layout_range,
+             num_experts=num_experts,
+-            comm_alg=self.comm_alg,
++            comm_alg=comm_alg,
+             expand_scales=expand_scales,
+             x_active_mask=x_active_mask,
+             num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,

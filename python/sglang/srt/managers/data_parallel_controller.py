@@ -83,6 +83,16 @@ FT_WATCHDOG_POLL_INTERVAL = 1.0
 FT_WATCHDOG_SEND_TIMEOUT_MS = 1000
 
 
+def _get_control_message_step(server_args: ServerArgs) -> int:
+    if not server_args.enable_dp_attention:
+        return 1
+    local_control_fanout = (
+        server_args.enable_dp_attention_local_control_broadcast
+        or server_args.enable_fault_tolerance
+    )
+    return 1 if local_control_fanout else server_args.tp_size
+
+
 class LoadBalanceMethod(Enum):
     """Load balance method."""
 
@@ -163,6 +173,7 @@ class DataParallelController:
         self.send_to_tokenizer = None
         self.recv_from_ft_controller = None
         self.ft_control_endpoint = None
+        self.npu_ft_metadata_store = None
         if server_args.enable_fault_tolerance:
             self.send_to_tokenizer = get_zmq_socket(
                 self.context, zmq.PUSH, port_args.tokenizer_ipc_name, False
@@ -172,6 +183,14 @@ class DataParallelController:
                 self.context, zmq.PULL, host=host
             )
             self.ft_control_endpoint = NetworkAddress(host, port).to_tcp()
+            if server_args.elastic_ep_backend == "mc2":
+                from sglang.srt.fault_tolerance.npu_metadata import (
+                    create_npu_ft_metadata_store_server,
+                )
+
+                self.npu_ft_metadata_store = create_npu_ft_metadata_store_server(
+                    port_args.fault_tolerance_metadata_ipc_name
+                )
 
         # Dispatch method
         self.round_robin_counter = 0
@@ -227,11 +246,14 @@ class DataParallelController:
             # within its own attn_tp_group instead of the full tp_group.
             # Otherwise fall back to the original behaviour: send to only the
             # first leader, which then broadcasts over the full tp_group.
-            local_ctrl = server_args.enable_dp_attention_local_control_broadcast
-            self.control_message_step = 1 if local_ctrl else server_args.tp_size
+            # Fault-tolerance commands must reach every surviving DP leader
+            # directly.  In particular, scale-down is what rebuilds the
+            # graph-external Gloo/HCCL groups, so it cannot depend on an old
+            # cross-rank control group being usable.
+            self.control_message_step = _get_control_message_step(server_args)
         else:
             self.launch_dp_schedulers(server_args, port_args)
-            self.control_message_step = 1
+            self.control_message_step = _get_control_message_step(server_args)
 
         self._scheduler_watchdog = None
         if server_args.enable_fault_tolerance and self.scheduler_procs:
@@ -288,10 +310,19 @@ class DataParallelController:
 
     def shutdown_dp(self, obj: FaultToleranceDPCShutdownReqInput):
         targets = set(obj.target_dp_ranks)
+        logger.warning(
+            "FT DPC shutdown request targets only DP rank(s) %s",
+            sorted(targets),
+        )
         for proc, dp_rank in zip(
             self.scheduler_procs, self.scheduler_process_dp_ranks
         ):
             if dp_rank in targets and proc.is_alive():
+                logger.warning(
+                    "FT DPC killing requested scheduler DP rank %s (pid=%s)",
+                    dp_rank,
+                    proc.pid,
+                )
                 proc.kill()
 
     def _handle_scheduler_process_exit(self, index, proc, name):
@@ -790,8 +821,9 @@ class DataParallelController:
                     rank_port_args = PortArgs.init_new(
                         server_args, dp_rank, worker_ports
                     )
-                    if server_args.is_ep_scale_joiner:
-                        # Scale-joiner outputs return through the primary tokenizer.
+                    if server_args.is_ep_joiner:
+                        # Joiner (scale or recover) outputs return through the
+                        # primary tokenizer.
                         primary_addr = NetworkAddress.parse(server_args.dist_init_addr)
                         primary_port_base = primary_addr.port + 1
                         rank_port_args.tokenizer_ipc_name = NetworkAddress(

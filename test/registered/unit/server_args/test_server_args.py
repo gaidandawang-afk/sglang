@@ -712,6 +712,27 @@ class TestPortArgs(unittest.TestCase):
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
         self.assertIsInstance(port_args.nccl_port, int)
 
+    @patch("sglang.srt.server_args.wait_port_available")
+    def test_npu_ft_metadata_endpoint_is_reserved_only_for_mc2_ft(
+        self, _mock_wait_port
+    ):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.nccl_port = 25010
+        server_args.enable_dp_attention = True
+        server_args.nnodes = 1
+        server_args.dist_init_addr = "127.0.0.1:25000"
+
+        port_args = PortArgs.init_new(server_args)
+        self.assertEqual(port_args.fault_tolerance_metadata_ipc_name, "")
+
+        server_args.enable_fault_tolerance = True
+        server_args.elastic_ep_backend = "mc2"
+        port_args = PortArgs.init_new(server_args)
+        self.assertEqual(
+            port_args.fault_tolerance_metadata_ipc_name,
+            "tcp://127.0.0.1:25007",
+        )
+
     def test_init_new_with_ipv4_address(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000

@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 
 
 _LOG_INPUT = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT")
+_LOG_P2P_SCHEDULE = get_bool_env_var(
+    "SGLANG_EXPERT_LOCATION_UPDATER_LOG_P2P_SCHEDULE"
+)
 
 
 class ExpertLocationUpdater:
@@ -46,6 +49,7 @@ class ExpertLocationUpdater:
         update_layer_ids: List[int],
         nnodes: int,
         rank: int,
+        survivor_process_groups=None,
     ):
         """
         Update experts' physical location after EPLB.
@@ -67,6 +71,7 @@ class ExpertLocationUpdater:
             update_layer_ids=update_layer_ids,
             nnodes=nnodes,
             rank=rank,
+            survivor_process_groups=survivor_process_groups,
         )
         old_expert_location_metadata.update(
             new_expert_location_metadata,
@@ -91,6 +96,7 @@ def _update_expert_weights_with_canary(
     update_layer_ids: List[int],
     nnodes: int,
     rank: int,
+    survivor_process_groups=None,
 ):
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
 
@@ -118,19 +124,71 @@ def _update_expert_weights_with_canary(
         update_layer_ids=update_layer_ids,
         nnodes=nnodes,
         rank=rank,
+        survivor_process_groups=survivor_process_groups,
     )
 
     for layer_id in update_layer_ids:
-        # can optimize speed if needed
         expect_value = _get_canary_value(new_expert_location_metadata, layer_id)
         actual_value = routed_experts_weights_of_layer[layer_id][-1].cpu()
-        assert torch.all(expect_value == actual_value), (
-            f"{expect_value=} {actual_value=} {layer_id=} "
-            f"{old_expert_location_metadata.physical_to_logical_map_cpu.tolist()=} "
-            f"{new_expert_location_metadata.physical_to_logical_map_cpu.tolist()=} "
+        _validate_survivor_movement_canary(
+            expect_value=expect_value,
+            actual_value=actual_value,
+            missing_logical_experts=missing_logical_experts_by_layers.get(
+                layer_id, []
+            ),
+            layer_id=layer_id,
         )
 
     return missing_logical_experts_by_layers
+
+
+def _validate_survivor_movement_canary(
+    *,
+    expect_value: torch.Tensor,
+    actual_value: torch.Tensor,
+    missing_logical_experts: List[int],
+    layer_id: int,
+) -> None:
+    """Validate movement completed before the fallback weight reload.
+
+    Experts absent from every survivor are only recorded by the raw updater;
+    their DRAM/checkpoint load happens after this function returns.  Exclude
+    exactly those destination slots from the movement canary instead of
+    treating the intentionally deferred load as a P2P-copy failure.
+    """
+
+    expect_value = expect_value.detach().to(device="cpu")
+    actual_value = actual_value.detach().to(device="cpu")
+    if expect_value.shape != actual_value.shape:
+        raise AssertionError(
+            "expert recovery canary shape mismatch: "
+            f"layer={layer_id} expected={tuple(expect_value.shape)} "
+            f"actual={tuple(actual_value.shape)}"
+        )
+
+    pending_reload = set(missing_logical_experts)
+    validate_mask = torch.tensor(
+        [
+            int(logical_id) not in pending_reload
+            for logical_id in expect_value.tolist()
+        ],
+        dtype=torch.bool,
+    )
+    mismatch_slots = torch.nonzero(
+        validate_mask & (expect_value != actual_value),
+        as_tuple=False,
+    ).flatten()
+    if mismatch_slots.numel() == 0:
+        return
+
+    mismatch_slot_values = mismatch_slots.tolist()
+    raise AssertionError(
+        "expert recovery survivor-movement canary mismatch: "
+        f"layer={layer_id} local_slots={mismatch_slot_values} "
+        f"expected={expect_value[mismatch_slots].tolist()} "
+        f"actual={actual_value[mismatch_slots].tolist()} "
+        f"pending_reload_experts={sorted(pending_reload)}"
+    )
 
 
 def _update_expert_weights_raw(
@@ -140,6 +198,7 @@ def _update_expert_weights_raw(
     update_layer_ids: List[int],
     nnodes: int,
     rank: int,
+    survivor_process_groups=None,
 ):
     log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
 
@@ -169,15 +228,116 @@ def _update_expert_weights_raw(
             rank=rank,
             world_size=world_size,
             missing_logical_experts_info=missing_logical_experts_info,
+            survivor_process_groups=survivor_process_groups,
             log_metrics=log_metrics,
         )
         if len(missing_logical_experts_info) > 0:
-            missing_logical_experts_by_layers[layer_id] = missing_logical_experts_info
+            missing_logical_experts_by_layers[layer_id] = list(
+                dict.fromkeys(missing_logical_experts_info)
+            )
     return missing_logical_experts_by_layers
 
 
 def create_temp_buffers(sample_tensors):
     return [torch.empty_like(tensor) for tensor in sample_tensors]
+
+
+def _copy_expert_tensor_(
+    destination_tensor: torch.Tensor, source_tensor: torch.Tensor
+) -> None:
+    """Copy an expert while preserving an NPU internal-format slot layout."""
+
+    if destination_tensor.device.type == "npu":
+        from sglang.srt.hardware_backend.npu.utils import (
+            copy_npu_formatted_tensor_,
+            is_npu_internal_format_tensor,
+        )
+
+        supports_offset_zero_alias = destination_tensor.dtype in (
+            torch.float16,
+            torch.float32,
+            torch.bfloat16,
+        )
+        if supports_offset_zero_alias and is_npu_internal_format_tensor(
+            destination_tensor
+        ):
+            copy_npu_formatted_tensor_(destination_tensor, source_tensor)
+            return
+
+    destination_tensor.copy_(source_tensor)
+
+
+def _needs_npu_p2p_staging(tensor: torch.Tensor) -> bool:
+    return tensor.device.type == "npu" and tensor.storage_offset() != 0
+
+
+def _stage_npu_p2p_ops(
+    p2p_ops: List[P2POp],
+) -> Tuple[List[P2POp], List[Tuple[torch.Tensor, torch.Tensor]]]:
+    """Give HCCL offset-zero buffers for internal-format tensor views.
+
+    Expert weights are stored with the local-expert dimension first, so
+    selecting any expert after index 0 usually returns a view with a non-zero
+    storage offset. HCCL rejects such views when their underlying NPU tensor
+    uses an internal format. Stage only those NPU views; CUDA/ROCm retain the
+    existing zero-copy behavior.
+    """
+
+    staged_ops = []
+    recv_copy_infos = []
+    staged_send_tensors = {}
+    for op in p2p_ops:
+        tensor = op.tensor
+        if not _needs_npu_p2p_staging(tensor):
+            staged_ops.append(op)
+            continue
+
+        if op.op == torch.distributed.irecv:
+            staged_tensor = torch.empty_like(tensor)
+            recv_copy_infos.append((staged_tensor, tensor))
+        elif op.op == torch.distributed.isend:
+            # A single expert tensor can be sent to multiple peers. Reuse one
+            # offset-zero clone instead of multiplying the memory peak by the
+            # destination fanout.
+            send_key = (
+                tensor.device,
+                tensor.data_ptr(),
+                tensor.storage_offset(),
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+                tensor.dtype,
+            )
+            staged_tensor = staged_send_tensors.get(send_key)
+            if staged_tensor is None:
+                staged_tensor = torch.empty_like(tensor)
+                _copy_expert_tensor_(staged_tensor, tensor)
+                staged_send_tensors[send_key] = staged_tensor
+        else:
+            raise ValueError(f"Unsupported P2P operation: {op.op}")
+
+        if staged_tensor.storage_offset() != 0:
+            raise RuntimeError(
+                "Failed to create an offset-zero NPU staging tensor for EPLB P2P."
+            )
+
+        staged_ops.append(
+            P2POp(
+                op=op.op,
+                tensor=staged_tensor,
+                peer=op.peer,
+                group=op.group,
+                tag=op.tag,
+            )
+        )
+
+    return staged_ops, recv_copy_infos
+
+
+def _copy_staged_p2p_recvs(
+    recv_copy_infos: List[Tuple[torch.Tensor, torch.Tensor]],
+):
+    for staged_tensor, destination_tensor in recv_copy_infos:
+        _copy_expert_tensor_(destination_tensor, staged_tensor)
 
 
 def update_expert_weights_single_layer(
@@ -190,6 +350,7 @@ def update_expert_weights_single_layer(
     rank: int,
     world_size: Optional[int] = None,
     missing_logical_experts_info: Optional[List[int]] = None,
+    survivor_process_groups=None,
     debug: bool = False,
     log_metrics: bool = False,
 ):
@@ -217,6 +378,28 @@ def update_expert_weights_single_layer(
 
     num_physical_experts = len(old_physical_to_logical_map)
     num_tensors = len(routed_experts_weights)
+    if world_size is None:
+        world_size = num_physical_experts // num_local_physical_experts
+
+    if survivor_process_groups is None:
+        active_rank_mask = [True] * world_size
+        p2p_group = None
+
+        def _to_peer_rank(original_rank: int) -> int:
+            return original_rank
+
+    else:
+        active_rank_mask = [
+            original_rank in survivor_process_groups.active_original_ranks
+            for original_rank in range(world_size)
+        ]
+        p2p_group = survivor_process_groups.eplb_device_group
+
+        def _to_peer_rank(original_rank: int) -> int:
+            return survivor_process_groups.group_rank(original_rank)
+
+    def _rank_is_active(original_rank: int) -> bool:
+        return active_rank_mask[original_rank]
 
     self_node_id = rank // num_gpu_per_node
 
@@ -272,8 +455,9 @@ def update_expert_weights_single_layer(
         for src_expert_location in range(*local_expert_location_range):
             if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
                 for i in range(num_tensors):
-                    _get_tensor(temp_buffers, i, dst_expert_location).copy_(
-                        _get_tensor(routed_experts_weights, i, src_expert_location)
+                    _copy_expert_tensor_(
+                        _get_tensor(temp_buffers, i, dst_expert_location),
+                        _get_tensor(routed_experts_weights, i, src_expert_location),
                     )
                 buffer2weight_copy_infos.append(
                     (dst_expert_location, dst_expert_location)
@@ -301,6 +485,20 @@ def update_expert_weights_single_layer(
         same_node_mapping, cross_node_mapping, need_comm_self_node_dst_ranks = (
             _compute_comm_info(logical_expert_id=logical_expert_id)
         )
+
+        # No surviving rank has this logical expert.  Only this case reaches
+        # the DRAM/disk recovery loader; local reuse and survivor P2P were both
+        # exhausted first.
+        if not same_node_mapping.chunk_values and not cross_node_mapping.chunk_values:
+            if missing_logical_experts_info is None:
+                raise RuntimeError("missing expert recovery requires tracking")
+            missing_logical_experts_info.append(logical_expert_id)
+            if debug:
+                output_logs.append(
+                    "handle_recv_of_dst_expert_location "
+                    f"{dst_expert_location=} case=reload-no-survivor-copy"
+                )
+            return
 
         # case 4: same-node
         if rank in need_comm_self_node_dst_ranks:
@@ -353,7 +551,8 @@ def update_expert_weights_single_layer(
                     P2POp(
                         op=torch.distributed.irecv,
                         tensor=_get_tensor(temp_buffers, i, dst_expert_location),
-                        peer=src_rank,
+                        peer=_to_peer_rank(src_rank),
+                        group=p2p_group,
                     )
                     for i in range(num_tensors)
                 ],
@@ -403,7 +602,8 @@ def update_expert_weights_single_layer(
                         tensor=_get_tensor(
                             routed_experts_weights, i, src_expert_location
                         ),
-                        peer=dst_rank,
+                        peer=_to_peer_rank(dst_rank),
+                        group=p2p_group,
                     )
                     for dst_rank in all_dst_ranks
                     for i in range(num_tensors)
@@ -417,6 +617,7 @@ def update_expert_weights_single_layer(
                 x // num_local_physical_experts
                 for x in range(num_physical_experts)
                 if old_physical_to_logical_map[x] == logical_expert_id
+                and _rank_is_active(x // num_local_physical_experts)
             ]
         )
         all_src_nodes = [x // num_gpu_per_node for x in all_src_ranks]
@@ -429,6 +630,7 @@ def update_expert_weights_single_layer(
                 x // num_local_physical_experts
                 for x in range(num_physical_experts)
                 if new_physical_to_logical_map[x] == logical_expert_id
+                and _rank_is_active(x // num_local_physical_experts)
                 and x // num_local_physical_experts not in all_src_ranks
             ]
         )
@@ -456,6 +658,10 @@ def update_expert_weights_single_layer(
         return same_node_mapping, cross_node_mapping, need_comm_self_node_dst_ranks
 
     def _filter_p2p_ops(p2p_op_infos):
+        if survivor_process_groups is not None:
+            # Source/destination discovery already uses survivor membership and
+            # every peer is expressed in the rebuilt group's compact namespace.
+            return
         elastic_ep_state = ElasticEPStateManager.instance()
         if elastic_ep_state is not None and missing_logical_experts_info is not None:
             # Filter out inactive P2P ops and record missing expert IDs in missing_logical_experts_info
@@ -484,6 +690,33 @@ def update_expert_weights_single_layer(
         if len(p2p_ops) == 0:
             return
 
+        if _LOG_P2P_SCHEDULE:
+            schedules = defaultdict(list)
+            for logical_expert_id, ops in sorted_infos:
+                for op in ops:
+                    direction = (
+                        "send"
+                        if op.op == torch.distributed.isend
+                        else "recv"
+                    )
+                    schedules[f"{direction}:{op.peer}"].append(
+                        (
+                            logical_expert_id,
+                            op.tensor.numel(),
+                            str(op.tensor.dtype),
+                        )
+                    )
+            elastic_ep_state = ElasticEPStateManager.instance()
+            active_ranks = (
+                elastic_ep_state.active_ranks_cpu.tolist()
+                if elastic_ep_state is not None
+                else None
+            )
+            logger.info(
+                "[ExpertLocationUpdaterP2PSchedule] "
+                f"{rank=} {active_ranks=} {dict(schedules)=}"
+            )
+
         # Submit P2P ops in batches to prevent NCCL/RCCL GPU-side accumulation
         # hangs on large rebalances. All ranks use the same expert_id ranges
         # (based on num_physical_experts) so matching send/recv pairs land in
@@ -498,9 +731,16 @@ def update_expert_weights_single_layer(
                 if eid in ops_by_expert:
                     batch_ops.extend(ops_by_expert[eid])
             if batch_ops:
+                batch_ops, recv_copy_infos = _stage_npu_p2p_ops(batch_ops)
                 reqs = torch.distributed.batch_isend_irecv(batch_ops)
                 for req in reqs:
                     req.wait()
+                if reqs:
+                    del req
+                _copy_staged_p2p_recvs(recv_copy_infos)
+                # Release the offset-zero staging tensors before constructing
+                # the next batch. The device allocator can reuse their blocks.
+                del reqs, recv_copy_infos, batch_ops
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for (
@@ -508,9 +748,14 @@ def update_expert_weights_single_layer(
             routed_experts_weights_expert_location,
         ) in buffer2weight_copy_infos:
             for i in range(num_tensors):
-                _get_tensor(
-                    routed_experts_weights, i, routed_experts_weights_expert_location
-                ).copy_(_get_tensor(temp_buffers, i, temp_buffers_expert_location))
+                _copy_expert_tensor_(
+                    _get_tensor(
+                        routed_experts_weights,
+                        i,
+                        routed_experts_weights_expert_location,
+                    ),
+                    _get_tensor(temp_buffers, i, temp_buffers_expert_location),
+                )
 
     def _get_tensor(tensors, tensor_index: int, expert_location: int) -> torch.Tensor:
         return tensors[tensor_index][_get_local_expert_location(expert_location)]

@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, List, Optional
+from typing import TYPE_CHECKING, Iterable, List, Optional, Sequence
 
 import torch
 import torch.distributed
@@ -215,6 +216,183 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map=logical_to_all_physical_map.to(
                 server_args.device
             ),
+        )
+
+    @staticmethod
+    def init_for_fault_recovery(
+        server_args: ServerArgs,
+        old_metadata: "ExpertLocationMetadata",
+        active_ranks: Sequence[bool] | torch.Tensor,
+        moe_ep_rank: Optional[int] = None,
+    ) -> "ExpertLocationMetadata":
+        """Build a survivor-only layout with the minimum required movement.
+
+        Normal EPLB is free to reshuffle every physical slot for load balance.
+        During rank-fault recovery that needlessly sends internal-format expert
+        weights over P2P even when the survivors already cover every logical
+        expert.  Preserve every survivor slot first.  Only logical experts
+        with no surviving copy replace a redundant survivor slot; those slots
+        then follow the updater's DRAM/checkpoint recovery path.
+
+        The physical map remains in the immutable original-rank namespace, but
+        the dispatch map contains only active physical IDs.
+        """
+
+        if isinstance(active_ranks, torch.Tensor):
+            active_rank_values = active_ranks.detach().to(device="cpu").tolist()
+        else:
+            active_rank_values = list(active_ranks)
+        if len(active_rank_values) != old_metadata.ep_size:
+            raise ValueError(
+                "active_ranks length must match expert metadata EP size "
+                f"({old_metadata.ep_size}), got {len(active_rank_values)}"
+            )
+        if not any(bool(value) for value in active_rank_values):
+            raise ValueError("fault recovery requires at least one active rank")
+
+        num_local_physical_experts = old_metadata.num_local_physical_experts
+        active_original_ranks = [
+            rank
+            for rank, is_active in enumerate(active_rank_values)
+            if bool(is_active)
+        ]
+        active_physical_ids = [
+            rank * num_local_physical_experts + local_slot
+            for rank in active_original_ranks
+            for local_slot in range(num_local_physical_experts)
+        ]
+        active_physical_ids_by_rank = {
+            rank: list(
+                range(
+                    rank * num_local_physical_experts,
+                    (rank + 1) * num_local_physical_experts,
+                )
+            )
+            for rank in active_original_ranks
+        }
+        num_logical_experts = old_metadata.num_logical_experts
+        if len(active_physical_ids) < num_logical_experts:
+            raise RuntimeError(
+                "insufficient survivor expert slots for fault recovery: "
+                f"active_slots={len(active_physical_ids)}, "
+                f"logical_experts={num_logical_experts}"
+            )
+
+        physical_to_logical_map_cpu = (
+            old_metadata.physical_to_logical_map_cpu.clone()
+        )
+        logical_to_physical_by_layer = []
+        max_replica_count = 0
+        for layer_id in range(old_metadata.num_layers):
+            layer_map = physical_to_logical_map_cpu[layer_id]
+            active_logical_ids = layer_map[active_physical_ids].to(torch.int64)
+            if bool(
+                ((active_logical_ids < 0) | (active_logical_ids >= num_logical_experts))
+                .any()
+                .item()
+            ):
+                raise RuntimeError(
+                    "fault recovery found an invalid logical expert ID in "
+                    f"survivor slots for layer {layer_id}"
+                )
+
+            replica_counts = torch.bincount(
+                active_logical_ids,
+                minlength=num_logical_experts,
+            )
+            missing_logical_ids = torch.nonzero(
+                replica_counts == 0,
+                as_tuple=False,
+            ).flatten()
+            # Spread checkpoint/DRAM reloads across survivor ranks.  A simple
+            # scan over active_physical_ids would consume every redundant slot
+            # on the lowest original rank first.  Sequential scale-down from
+            # four ranks to two can then make one survivor reload half of the
+            # model while the other waits for its FT command acknowledgement.
+            replacement_rank_cursor = 0
+            for missing_logical_id_tensor in missing_logical_ids:
+                missing_logical_id = int(missing_logical_id_tensor.item())
+                replacement_physical_id = None
+                for rank_offset in range(len(active_original_ranks)):
+                    rank_index = (
+                        replacement_rank_cursor + rank_offset
+                    ) % len(active_original_ranks)
+                    candidate_rank = active_original_ranks[rank_index]
+                    replacement_physical_id = next(
+                        (
+                            physical_id
+                            for physical_id in active_physical_ids_by_rank[
+                                candidate_rank
+                            ]
+                            if replica_counts[
+                                int(layer_map[physical_id].item())
+                            ]
+                            > 1
+                        ),
+                        None,
+                    )
+                    if replacement_physical_id is not None:
+                        replacement_rank_cursor = (
+                            rank_index + 1
+                        ) % len(active_original_ranks)
+                        break
+                if replacement_physical_id is None:
+                    raise RuntimeError(
+                        "unable to reserve a survivor slot for missing logical "
+                        f"expert {missing_logical_id} in layer {layer_id}"
+                    )
+                replaced_logical_id = int(
+                    layer_map[replacement_physical_id].item()
+                )
+                layer_map[replacement_physical_id] = missing_logical_id
+                replica_counts[replaced_logical_id] -= 1
+                replica_counts[missing_logical_id] += 1
+
+            layer_logical_to_physical = [
+                [] for _ in range(num_logical_experts)
+            ]
+            for physical_id in active_physical_ids:
+                logical_id = int(layer_map[physical_id].item())
+                layer_logical_to_physical[logical_id].append(physical_id)
+            if any(not locations for locations in layer_logical_to_physical):
+                raise RuntimeError(
+                    "fault recovery layout does not cover every logical expert "
+                    f"in layer {layer_id}"
+                )
+            max_replica_count = max(
+                max_replica_count,
+                max(len(locations) for locations in layer_logical_to_physical),
+            )
+            logical_to_physical_by_layer.append(layer_logical_to_physical)
+
+        logical_to_all_physical_map_cpu = torch.full(
+            (
+                old_metadata.num_layers,
+                num_logical_experts,
+                max_replica_count,
+            ),
+            -1,
+            dtype=physical_to_logical_map_cpu.dtype,
+            device="cpu",
+        )
+        for layer_id, layer_mapping in enumerate(logical_to_physical_by_layer):
+            for logical_id, physical_ids in enumerate(layer_mapping):
+                logical_to_all_physical_map_cpu[
+                    layer_id, logical_id, : len(physical_ids)
+                ] = torch.tensor(
+                    physical_ids,
+                    dtype=logical_to_all_physical_map_cpu.dtype,
+                )
+
+        device = old_metadata.physical_to_logical_map.device
+        return ExpertLocationMetadata._init_raw(
+            server_args=server_args,
+            ep_size=old_metadata.ep_size,
+            physical_to_logical_map=physical_to_logical_map_cpu.to(device=device),
+            logical_to_all_physical_map=logical_to_all_physical_map_cpu.to(
+                device=device
+            ),
+            moe_ep_rank=moe_ep_rank,
         )
 
     @staticmethod
@@ -517,6 +695,14 @@ def broadcast_global_expert_location_metadata(
     metadata = get_global_expert_location_metadata()
     assert metadata is not None
 
+    if group is None and os.environ.get("MOONCAKE_EP_FORCE_FALLBACK") == "1":
+        _broadcast_global_expert_location_metadata_via_cpu_group(
+            metadata=metadata,
+            src_rank=src_rank,
+        )
+        return
+
+    # Ensure device tensors are contiguous before broadcasting in-place
     metadata.physical_to_logical_map = metadata.physical_to_logical_map.contiguous()
     torch.distributed.broadcast(
         metadata.physical_to_logical_map, src=src_rank, group=group
@@ -529,6 +715,74 @@ def broadcast_global_expert_location_metadata(
     )
     set_global_expert_location_metadata(metadata, allow_overwrite=True)
     return metadata
+
+
+def _broadcast_global_expert_location_metadata_via_cpu_group(
+    metadata: ExpertLocationMetadata,
+    src_rank: int,
+):
+    from sglang.srt.distributed.parallel_state import get_world_group
+
+    logger.info(
+        "Broadcast expert location metadata over CPU group in Mooncake forced "
+        "fallback path."
+    )
+
+    physical_to_logical_map_cpu = metadata.physical_to_logical_map_cpu.contiguous()
+    logical_to_all_physical_map_cpu = (
+        metadata.logical_to_all_physical_map_cpu.contiguous()
+    )
+
+    torch.distributed.broadcast(
+        physical_to_logical_map_cpu,
+        src=src_rank,
+        group=get_world_group().cpu_group,
+    )
+    torch.distributed.broadcast(
+        logical_to_all_physical_map_cpu,
+        src=src_rank,
+        group=get_world_group().cpu_group,
+    )
+
+    logical_to_all_physical_map_num_valid_cpu = torch.count_nonzero(
+        logical_to_all_physical_map_cpu != -1,
+        dim=-1,
+    )
+
+    logical_to_rank_dispatch_physical_map_cpu = None
+    if metadata.logical_to_rank_dispatch_physical_map is not None:
+        logical_to_rank_dispatch_physical_map_cpu = (
+            metadata.logical_to_rank_dispatch_physical_map.detach().cpu().contiguous()
+        )
+        torch.distributed.broadcast(
+            logical_to_rank_dispatch_physical_map_cpu,
+            src=src_rank,
+            group=get_world_group().cpu_group,
+        )
+
+    metadata.physical_to_logical_map_cpu = physical_to_logical_map_cpu
+    metadata.logical_to_all_physical_map_cpu = logical_to_all_physical_map_cpu
+    metadata.physical_to_logical_map = physical_to_logical_map_cpu.to(
+        device=metadata.physical_to_logical_map.device,
+        non_blocking=True,
+    )
+    metadata.logical_to_all_physical_map = logical_to_all_physical_map_cpu.to(
+        device=metadata.logical_to_all_physical_map.device,
+        non_blocking=True,
+    )
+    metadata.logical_to_all_physical_map_num_valid = (
+        logical_to_all_physical_map_num_valid_cpu.to(
+            device=metadata.logical_to_all_physical_map_num_valid.device,
+            non_blocking=True,
+        )
+    )
+    if logical_to_rank_dispatch_physical_map_cpu is not None:
+        metadata.logical_to_rank_dispatch_physical_map = (
+            logical_to_rank_dispatch_physical_map_cpu.to(
+                device=metadata.logical_to_rank_dispatch_physical_map.device,
+                non_blocking=True,
+            )
+        )
 
 
 def _compute_logical_to_all_physical_map(

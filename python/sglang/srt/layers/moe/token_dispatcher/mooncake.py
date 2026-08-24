@@ -19,7 +19,8 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.utils import DeepEPMode
+from sglang.srt.layers.moe.utils import DeepEPMode, get_moe_runner_backend
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,9 @@ assert isinstance(MooncakeDispatchOutput, DispatchOutput)
 class MooncakeCombineInput(NamedTuple):
     """Mooncake EP combine input."""
 
-    pass
+    hidden_states: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
 
     @property
     def format(self) -> CombineInputFormat:
@@ -105,11 +108,7 @@ class EPBuffer:
         state.num_experts = num_experts
 
         num_ep_buffer_bytes = 0
-        if deepep_mode.enable_normal():
-            raise NotImplementedError(
-                "Normal mode is not supported for Mooncake EP yet."
-            )
-        if deepep_mode.enable_low_latency():
+        if deepep_mode.enable_low_latency() or deepep_mode.is_normal():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
             num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(
@@ -163,6 +162,7 @@ class _MooncakeEPDispatcherImpl:
         assert self.num_max_dispatch_tokens_per_rank <= 1024
 
         self.first_execution = True
+        self._last_active_ranks_signature = None
         self.timeout_us = 10000000
 
         self.handle = None
@@ -182,7 +182,7 @@ class _MooncakeEPDispatcherImpl:
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
-            use_fp8=True,
+            use_fp8=self._should_use_fp8_dispatch(),
         )
         return (
             hidden_states,
@@ -231,7 +231,15 @@ class _MooncakeEPDispatcherImpl:
         use_fp8: bool = False,
     ):
         buffer = self._get_buffer()
-        active_ranks = ElasticEPStateManager.instance().active_ranks
+        elastic_ep_state = ElasticEPStateManager.instance()
+        elastic_ep_state.maybe_inject_test_rank_fault()
+        active_ranks = elastic_ep_state.active_ranks
+        active_ranks_signature = tuple(active_ranks.detach().cpu().tolist())
+        if self._last_active_ranks_signature is None:
+            self._last_active_ranks_signature = active_ranks_signature
+        elif active_ranks_signature != self._last_active_ranks_signature:
+            self.first_execution = True
+            self._last_active_ranks_signature = active_ranks_signature
         packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,
@@ -246,6 +254,12 @@ class _MooncakeEPDispatcherImpl:
             )
         )
         return packed_recv_hidden, packed_recv_count, event, hook
+
+    def _should_use_fp8_dispatch(self) -> bool:
+        backend = get_moe_runner_backend()
+        if envs.SGLANG_DEEPEP_BF16_DISPATCH.get() or backend.is_triton():
+            return False
+        return True
 
     def combine_a(
         self,
@@ -271,7 +285,9 @@ class _MooncakeEPDispatcherImpl:
         topk_weights: torch.Tensor,
     ):
         buffer = self._get_buffer()
-        active_ranks = ElasticEPStateManager.instance().active_ranks
+        elastic_ep_state = ElasticEPStateManager.instance()
+        elastic_ep_state.maybe_inject_test_rank_fault()
+        active_ranks = elastic_ep_state.active_ranks
         combined_hidden_states, event, hook = buffer.combine(
             hidden_states,
             topk_ids,
@@ -323,7 +339,7 @@ class MooncakeEPDispatcher(BaseDispatcher):
 
         self.deepep_mode = deepep_mode
 
-        if self.deepep_mode.enable_low_latency():
+        if self.deepep_mode.enable_low_latency() or self.deepep_mode.is_normal():
             self._low_latency_dispatcher = _MooncakeEPDispatcherImpl(
                 group=group,
                 router_topk=router_topk,
@@ -335,9 +351,6 @@ class MooncakeEPDispatcher(BaseDispatcher):
                 return_recv_hook=return_recv_hook,
                 deepep_mode=deepep_mode,
             )
-        if self.deepep_mode.enable_normal():
-            raise NotImplementedError
-
         self._stage = _Stage.INITIAL
 
     def dispatch(
@@ -375,6 +388,12 @@ class MooncakeEPDispatcher(BaseDispatcher):
         ret = self.combine_b()
         return ret
 
+    def _should_use_fp8_dispatch(self) -> bool:
+        backend = get_moe_runner_backend()
+        if envs.SGLANG_DEEPEP_BF16_DISPATCH.get() or backend.is_triton():
+            return False
+        return True
+
     def combine_a(
         self,
         combine_input: CombineInput,
@@ -397,9 +416,7 @@ class MooncakeEPDispatcher(BaseDispatcher):
     def _get_impl(self) -> _MooncakeEPDispatcherImpl:
         is_extend_in_batch = get_is_extend_in_batch()
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
-        if resolved_deepep_mode == DeepEPMode.NORMAL:
-            raise NotImplementedError
-        elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
+        if resolved_deepep_mode in (DeepEPMode.NORMAL, DeepEPMode.LOW_LATENCY):
             return self._low_latency_dispatcher
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")

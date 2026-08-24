@@ -31,7 +31,10 @@ from sglang.srt.distributed import (
     moe_tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location import (
+    ModelConfigForExpertLocation,
+    get_global_expert_location_metadata,
+)
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.cp.utils import is_cp_v2_active
@@ -52,6 +55,7 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
+    is_deepep_class_backend,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -279,7 +283,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("gate", prefix),
         )
 
-        if get_moe_a2a_backend().is_deepep():
+        if is_deepep_class_backend():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
@@ -294,7 +298,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
 
         if (
-            not get_moe_a2a_backend().is_deepep()
+            not is_deepep_class_backend()
             and not get_moe_a2a_backend().is_ascend_fuseep()
         ):
             return self.forward_normal(hidden_states)
@@ -1093,6 +1097,197 @@ class Qwen3MoeForCausalLM(nn.Module):
 
         self.capture_aux_hidden_states = True
         self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
+
+    @classmethod
+    def generate_weight_name_filter(
+        cls, logical_experts_map: Dict[int, List[int]]
+    ):
+        """Select only missing routed-expert checkpoint tensors for FT reload."""
+
+        import re
+
+        pattern = re.compile(r"layers\.(\d+)\.mlp\.experts\.(\d+)\.")
+        reload_stats = {
+            "expected_pairs": {
+                (int(layer_id), int(expert_id))
+                for layer_id, expert_ids in logical_experts_map.items()
+                for expert_id in expert_ids
+            },
+            "selected_pairs": set(),
+            "selected_weight_names": 0,
+            "probe_pair": None,
+            "source_probes": {},
+        }
+        if reload_stats["expected_pairs"]:
+            reload_stats["probe_pair"] = min(reload_stats["expected_pairs"])
+
+        probe_pattern = re.compile(
+            r"layers\.(\d+)\.mlp\.experts\.(\d+)\."
+            r"(gate_proj|up_proj|down_proj)\.weight$"
+        )
+
+        def weight_name_filter(name: str) -> bool:
+            match = pattern.search(name)
+            if match is None:
+                return False
+            layer_id, expert_id = (int(value) for value in match.groups())
+            selected = (
+                layer_id in logical_experts_map
+                and expert_id in logical_experts_map[layer_id]
+            )
+            if selected:
+                reload_stats["selected_pairs"].add((layer_id, expert_id))
+                reload_stats["selected_weight_names"] += 1
+            return selected
+
+        def observe_weight(name: str, weight: torch.Tensor) -> None:
+            match = probe_pattern.search(name)
+            if match is None:
+                return
+            layer_id, expert_id = (int(value) for value in match.groups()[:2])
+            if (layer_id, expert_id) != reload_stats["probe_pair"]:
+                return
+
+            component = match.group(3)
+            flat_weight = (
+                weight.detach().to(device="cpu").contiguous().reshape(-1)
+            )
+            if flat_weight.numel() < 4:
+                raise RuntimeError(
+                    "NPU FT checkpoint probe requires at least four values: "
+                    f"{name}"
+                )
+            reload_stats["source_probes"][component] = (
+                flat_weight[:4].to(dtype=torch.float32).tolist()
+            )
+
+        # The recovery caller checks this after the lazy checkpoint iterator
+        # has been consumed. This turns a filter/checkpoint naming mismatch
+        # into a failed scale-down instead of silently committing empty slots.
+        weight_name_filter._sglang_ft_reload_stats = reload_stats
+        weight_name_filter._sglang_ft_observe_weight = observe_weight
+
+        return weight_name_filter
+
+    def validate_ft_reloaded_expert_probe(self, reload_stats, tp_rank: int):
+        """Compare one recovered NPU slot against its checkpoint tensors.
+
+        Checkpoint-name coverage only proves that the lazy iterator selected
+        the requested tensors. This probe verifies that the Qwen3 fused-MoE
+        loader wrote gate/up/down values into the expected original-rank local
+        slot after the expert metadata changed.
+        """
+
+        probe_pair = reload_stats.get("probe_pair")
+        source_probes = reload_stats.get("source_probes", {})
+        required_components = {"gate_proj", "up_proj", "down_proj"}
+        missing_components = sorted(required_components - source_probes.keys())
+        if probe_pair is None or missing_components:
+            raise RuntimeError(
+                "NPU FT checkpoint content probe is incomplete: "
+                f"probe_pair={probe_pair} missing_components={missing_components}"
+            )
+
+        layer_id, logical_expert_id = probe_pair
+        metadata = get_global_expert_location_metadata()
+        if metadata is None:
+            raise RuntimeError("NPU FT expert content probe requires EPLB metadata")
+
+        experts = self.model.layers[layer_id].mlp.experts
+        if experts.moe_tp_size != 1:
+            raise RuntimeError(
+                "NPU FT expert content probe currently requires moe_tp_size=1, "
+                f"got {experts.moe_tp_size}"
+            )
+        storage_rank = experts._expert_storage_rank
+        local_expert_count = experts._num_local_routed
+        local_start = storage_rank * local_expert_count
+        local_end = local_start + local_expert_count
+        physical_expert_ids = metadata.logical_to_all_physical(
+            layer_id, logical_expert_id
+        )
+        local_physical_ids = [
+            physical_id
+            for physical_id in physical_expert_ids
+            if local_start <= physical_id < local_end
+        ]
+        if len(local_physical_ids) != 1:
+            raise RuntimeError(
+                "NPU FT expert content probe expected exactly one local target: "
+                f"rank={tp_rank} storage_rank={storage_rank} "
+                f"pair={probe_pair} physical_ids={physical_expert_ids} "
+                f"local_physical_ids={local_physical_ids}"
+            )
+
+        physical_expert_id = local_physical_ids[0]
+        local_slot = physical_expert_id - local_start
+        w13 = experts.w13_weight.data[local_slot].detach().to(device="cpu")
+        w2 = experts.w2_weight.data[local_slot].detach().to(device="cpu")
+        w13_half = w13.shape[0] // 2
+        up_first = getattr(
+            experts.quant_method, "load_up_proj_weight_first", False
+        )
+        target_weights = {
+            ("up_proj" if up_first else "gate_proj"): w13[:w13_half],
+            ("gate_proj" if up_first else "up_proj"): w13[w13_half:],
+            "down_proj": w2,
+        }
+
+        mismatches = []
+        max_abs_diff = 0.0
+        for component in sorted(required_components):
+            target_values = (
+                target_weights[component]
+                .contiguous()
+                .reshape(-1)[:4]
+                .to(dtype=torch.float32)
+                .tolist()
+            )
+            component_diffs = [
+                abs(actual - expected)
+                for actual, expected in zip(
+                    target_values, source_probes[component], strict=True
+                )
+            ]
+            component_max_diff = max(component_diffs, default=0.0)
+            max_abs_diff = max(max_abs_diff, component_max_diff)
+            if component_max_diff != 0.0:
+                mismatches.append(
+                    {
+                        "component": component,
+                        "expected": source_probes[component],
+                        "actual": target_values,
+                        "max_abs_diff": component_max_diff,
+                    }
+                )
+
+        if mismatches:
+            raise RuntimeError(
+                "NPU FT expert content probe found an incorrect physical slot: "
+                f"rank={tp_rank} pair={probe_pair} "
+                f"physical_expert_id={physical_expert_id} "
+                f"local_slot={local_slot} mismatches={mismatches}"
+            )
+
+        return {
+            "pair": probe_pair,
+            "physical_expert_id": physical_expert_id,
+            "local_slot": local_slot,
+            "components": sorted(required_components),
+            "max_abs_diff": max_abs_diff,
+        }
+
+    def finalize_ft_filtered_weight_reload(self) -> None:
+        """Reject a checkpoint reload that left an incomplete fused w13."""
+
+        for layer in self.model.layers:
+            mlp = getattr(layer, "mlp", None)
+            experts = getattr(mlp, "experts", None)
+            finalize = getattr(
+                experts, "finalize_npu_formatted_expert_reload", None
+            )
+            if callable(finalize):
+                finalize()
 
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
