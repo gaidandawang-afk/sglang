@@ -4493,12 +4493,10 @@ class Scheduler(
             state = ElasticEPStateManager.instance()
             state.active_ranks.copy_(state.last_active_ranks)
             state.active_ranks_cpu.copy_(state.last_active_ranks.detach().cpu())
-            message = "retried"
         elif recv_req.command == "scale_down":
             self.tp_worker.model_runner.apply_fault_tolerance_scale_down(
                 recv_req.active_mask
             )
-            message = "scaled down"
         else:
             logger.warning(
                 "FT scheduler received unknown command: %s", recv_req.command
@@ -4513,8 +4511,6 @@ class Scheduler(
         return FaultToleranceCommandReqOutput(
             request_id=recv_req.request_id,
             rank=rank,
-            success=True,
-            message=message,
         )
 
     def _check_ft_pause_deadline(self) -> None:

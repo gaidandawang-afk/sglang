@@ -252,7 +252,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertEqual(state.active_ranks_cpu.value, [1, 1])
         self.assertFalse(scheduler._engine_paused)
         self.assertIsNone(scheduler._ft_pause_deadline)
-        self.assertEqual(output.message, "retried")
+        self.assertEqual((output.request_id, output.rank), ("r", 1))
 
     def test_scale_down_is_one_command_and_unpauses(self):
         scheduler = self.make_scheduler()
@@ -269,7 +269,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             scheduler.tp_worker.model_runner.apply_fault_tolerance_scale_down
         )
         apply_scale_down.assert_called_once_with([True, False])
-        self.assertEqual(output.message, "scaled down")
+        self.assertEqual((output.request_id, output.rank), ("s", 1))
         self.assertFalse(scheduler._engine_paused)
 
     def test_nonleader_executes_without_ack(self):

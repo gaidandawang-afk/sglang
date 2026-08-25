@@ -8,7 +8,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from sglang.srt.fault_tolerance.controller import FaultToleranceState, ft_failure
+from sglang.srt.fault_tolerance.controller import FaultToleranceState
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     ActiveRanksUpdateReqOutput,
@@ -54,13 +54,9 @@ class PendingFTCommand:
     target_ranks: set[int]
     future: asyncio.Future
     acked: set[int] = dataclasses.field(default_factory=set)
-    failed: Dict[int, str] = dataclasses.field(default_factory=dict)
 
     def finish_if_ready(self) -> None:
-        if (
-            not self.future.done()
-            and self.acked.union(self.failed) >= self.target_ranks
-        ):
+        if not self.future.done() and self.acked >= self.target_ranks:
             self.future.set_result(None)
 
 
@@ -107,10 +103,10 @@ class FaultToleranceManager:
         try:
             instruction, params, request_id = validate_apply_payload(obj)
         except ValueError as exc:
-            return 400, ft_failure(str(exc))
+            return 400, {"message": str(exc)}
         # One centralized SGLang request controls all DP engines atomically.
         if self.state.ft_operation_in_progress:
-            return 409, ft_failure("ft_operation_in_progress")
+            return 409, {"message": "ft_operation_in_progress"}
 
         self.state.ft_operation_in_progress = True
         try:
@@ -128,7 +124,11 @@ class FaultToleranceManager:
     async def _run_submitted_apply(
         self, instruction: str, params: Dict[str, Any], request_id: str
     ) -> None:
-        error = await self._execute_apply(instruction, params)
+        timeout = self.server_args.fault_tolerance_timeout
+        if instruction == "retry":
+            error = await self._apply_retry(timeout)
+        else:
+            error = await self._apply_scale_down(params["removed_dp_ranks"], timeout)
         if error is None:
             self._last_ft_request_id = None
             self._ft_error = None
@@ -136,15 +136,6 @@ class FaultToleranceManager:
             self._last_ft_request_id = request_id
             self._ft_error = error
         self.state.ft_operation_in_progress = False
-
-    async def _execute_apply(
-        self, instruction: str, params: Dict[str, Any]
-    ) -> Optional[str]:
-        timeout = self.server_args.fault_tolerance_timeout
-        if instruction == "retry":
-            return await self._apply_retry(timeout)
-
-        return await self._apply_scale_down(params["removed_dp_ranks"], timeout)
 
     async def _apply_retry(self, timeout: int) -> Optional[str]:
         st = self.state
@@ -195,10 +186,6 @@ class FaultToleranceManager:
         await self._publish_route_dp_mask(candidate_dp_mask, timeout)
         st.finish_scale_down(requested)
         return None
-
-    def validate_routed_rank(self, rank: int) -> None:
-        if not 0 <= rank < len(self._route_dp_mask) or not self._route_dp_mask[rank]:
-            raise ValueError(f"routed_dp_rank={rank} is not active")
 
     def should_reject_admission(self) -> bool:
         return self.state.should_reject_admission(self._route_dp_mask)
@@ -315,10 +302,7 @@ class FaultToleranceManager:
         if pending is None:
             logger.warning("Unknown fault tolerance command ack: rank=%s", output.rank)
             return
-        if output.success:
-            pending.acked.add(output.rank)
-        else:
-            pending.failed[output.rank] = output.message
+        pending.acked.add(output.rank)
         pending.finish_if_ready()
 
     def handle_active_ranks_update_output(
@@ -327,10 +311,7 @@ class FaultToleranceManager:
         future = self._pending_active_rank_updates.get(output.request_id)
         if future is None or future.done():
             return
-        if output.success:
-            future.set_result(None)
-        else:
-            future.set_exception(RuntimeError(output.message))
+        future.set_result(None)
 
     def handle_rank_fault(self, event: FaultToleranceRankFaultOutput) -> None:
         self.state.observe_rank_fault(event.rank)
@@ -377,10 +358,10 @@ class FaultToleranceManager:
         target_ranks: List[int],
         timeout_sec: int,
         active_global_rank_mask: Optional[List[bool]] = None,
-    ) -> set[int]:
+    ) -> None:
         targets = set(target_ranks)
         if not targets:
-            return set()
+            return
         request_id = uuid.uuid4().hex
         pending = PendingFTCommand(
             target_ranks=targets, future=self.event_loop.create_future()
@@ -399,11 +380,6 @@ class FaultToleranceManager:
             await asyncio.wait_for(pending.future, timeout=timeout_sec)
         finally:
             self._pending_commands.pop(request_id, None)
-        if pending.failed:
-            raise RuntimeError(
-                f"fault tolerance command {command} failed: {pending.failed}"
-            )
-        return pending.acked
 
     def _finish_shutdown_if_ready(self) -> None:
         if self._shutdown_waiter is None:

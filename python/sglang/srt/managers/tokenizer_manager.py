@@ -49,7 +49,6 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.fault_tolerance.controller import ft_failure
 from sglang.srt.fault_tolerance.manager import FaultToleranceManager
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
@@ -715,16 +714,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
-            if self.fault_tolerance is not None:
-                self.fault_tolerance.validate_routed_rank(obj.routed_dp_rank)
-
         if (
             self.fault_tolerance is not None
             and self.fault_tolerance.should_reject_admission()
         ):
             raise fastapi.HTTPException(
                 status_code=503,
-                detail=ft_failure("fault_tolerance_paused"),
+                detail="fault_tolerance_paused",
             )
 
         self._init_req_state(obj, request)
@@ -1834,12 +1830,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def fault_tolerance_status(self):
         if self.fault_tolerance is None:
-            return 503, ft_failure("fault_tolerance_disabled")
+            return 503, {"message": "fault_tolerance_disabled"}
         return self.fault_tolerance.status()
 
-    async def fault_tolerance_apply(self, obj: Dict[str, Any]):
+    def fault_tolerance_apply(self, obj: Dict[str, Any]):
         if self.fault_tolerance is None:
-            return 503, ft_failure("fault_tolerance_disabled")
+            return 503, {"message": "fault_tolerance_disabled"}
         return self.fault_tolerance.submit(obj)
 
     async def update_weights_from_disk(

@@ -51,7 +51,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager.state.expected_dp_mask = [True, True, False, True]
         manager.state.process_alive_global_rank_mask[2] = False
         manager.state.unhealthy_dp_ranks.add(0)
-        manager._send_command_collect = AsyncMock(return_value={0, 1, 3})
+        manager._send_command_collect = AsyncMock()
         manager._publish_route_dp_mask = AsyncMock()
 
         status, response = await submit_and_finish(
@@ -131,7 +131,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager = make_manager(dp_size=4, ranks_per_dp=2)
         manager.state.unhealthy_dp_ranks.add(0)
         manager._shutdown_dp_processes = AsyncMock()
-        manager._send_command_collect = AsyncMock(return_value={0, 1, 3})
+        manager._send_command_collect = AsyncMock()
         manager._publish_route_dp_mask = AsyncMock()
 
         await submit_and_finish(
@@ -236,7 +236,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager._last_ft_request_id = "old-request"
         manager._ft_error = "old-error"
         manager.state.unhealthy_dp_ranks.add(0)
-        manager._send_command_collect = AsyncMock(return_value={0, 1})
+        manager._send_command_collect = AsyncMock()
         manager._publish_route_dp_mask = AsyncMock()
 
         await submit_and_finish(
@@ -408,10 +408,9 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
                 FaultToleranceCommandReqOutput(
                     request_id=request.request_id,
                     rank=rank,
-                    success=True,
                 )
             )
-        self.assertEqual(await task, {0, 1})
+        self.assertIsNone(await task)
 
     async def test_rank_fault_only_updates_unhealthy_state(self):
         manager = make_manager()

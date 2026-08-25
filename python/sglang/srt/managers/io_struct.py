@@ -1528,8 +1528,6 @@ class FaultToleranceCommandReqInput(BaseReq, kw_only=True):
 class FaultToleranceCommandReqOutput(BaseReq, kw_only=True):
     request_id: str
     rank: int
-    success: bool
-    message: str = ""
 
 
 class FaultToleranceRankFaultOutput(BaseReq, kw_only=True):
@@ -1846,8 +1844,6 @@ class FaultToleranceDPCShutdownReqInput(BaseReq, kw_only=True):
 
 class ActiveRanksUpdateReqOutput(BaseReq, kw_only=True):
     request_id: str
-    success: bool
-    message: str = ""
 
 
 class ElasticScaleUpdateReq(BaseReq, kw_only=True):

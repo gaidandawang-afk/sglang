@@ -392,8 +392,6 @@ class DataParallelController:
                 self.send_to_tokenizer,
                 ActiveRanksUpdateReqOutput(
                     request_id=ranks.request_id,
-                    success=True,
-                    message="active ranks updated",
                 )
             )
 

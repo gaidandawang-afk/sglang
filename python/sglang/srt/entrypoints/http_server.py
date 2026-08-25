@@ -109,7 +109,6 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
-from sglang.srt.fault_tolerance.controller import ft_failure
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -189,13 +188,6 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 # Global constants
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
-FT_ADMISSION_BYPASS_PATHS = {
-    "/fault_tolerance/status",
-    "/fault_tolerance/apply",
-    "/health",
-    "/metrics",
-    "/ping",
-}
 
 
 # Store global states
@@ -457,17 +449,6 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
     )
 
     app.add_middleware(RequestDecompressionMiddleware)
-
-@app.middleware("http")
-async def fault_tolerance_admission_gate(request: Request, call_next):
-    if _global_state is not None and request.url.path not in FT_ADMISSION_BYPASS_PATHS:
-        ft = getattr(_global_state.tokenizer_manager, "fault_tolerance", None)
-        if ft is not None and ft.should_reject_admission():
-            return ORJSONResponse(
-                content=ft_failure("fault_tolerance_paused"), status_code=503
-            )
-    return await call_next(request)
-
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -1707,7 +1688,7 @@ async def fault_tolerance_apply(request: Request):
         return _fault_tolerance_error_response(
             HTTPStatus.BAD_REQUEST, "Invalid JSON format"
         )
-    status_code, body = await _global_state.tokenizer_manager.fault_tolerance_apply(obj)
+    status_code, body = _global_state.tokenizer_manager.fault_tolerance_apply(obj)
     if status_code != HTTPStatus.ACCEPTED:
         return _fault_tolerance_error_response(status_code, body["message"])
     return ORJSONResponse(content=body, status_code=status_code)

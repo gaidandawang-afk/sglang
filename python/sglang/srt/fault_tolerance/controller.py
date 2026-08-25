@@ -10,10 +10,6 @@ class RankState(str, Enum):
     DEAD = "dead"
 
 
-def ft_failure(message: str) -> Dict[str, Any]:
-    return {"success": False, "message": message}
-
-
 def _dp_attention_gate(server_args) -> bool:
     if not getattr(server_args, "enable_dp_attention", False):
         return True
@@ -180,8 +176,7 @@ class FaultToleranceState:
         self.cluster_paused = False
 
     def finish_scale_down(self, ranks: Iterable[int]) -> None:
-        removed = sorted(set(ranks))
-        for rank in removed:
+        for rank in ranks:
             self.expected_dp_mask[rank] = False
         self.unhealthy_dp_ranks.clear()
         self.cluster_paused = False

@@ -182,7 +182,6 @@ class SubprocessWatchdog:
         self,
         processes: List[Process],
         process_names: Optional[List[str]] = None,
-        stop_join_timeout: float = 2.0,
         on_exit: Optional[Callable[[int, Process, str], None]] = None,
         fail_stop_on_exit: bool = True,
         interval: float = 1.0,
@@ -193,7 +192,6 @@ class SubprocessWatchdog:
         self._processes = processes
         self._names = process_names or [f"process_{i}" for i in range(len(processes))]
         self._interval = interval
-        self._stop_join_timeout = stop_join_timeout
         self._on_exit = on_exit
         self._fail_stop_on_exit = fail_stop_on_exit
         self._on_poll = on_poll
@@ -214,12 +212,8 @@ class SubprocessWatchdog:
     def stop(self) -> None:
         if self._thread is not None:
             self._stop_event.set()
-            self._thread.join(timeout=self._stop_join_timeout)
+            self._thread.join(timeout=self._interval * 2)
             self._thread = None
-
-    def wait(self) -> None:
-        if self._thread is not None:
-            self._thread.join()
 
     def _monitor_loop(self) -> None:
         try:
