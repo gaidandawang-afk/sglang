@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from contextlib import suppress
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from sglang.srt.fault_tolerance.manager import FaultToleranceManager
 from sglang.srt.managers.io_struct import (
@@ -29,6 +29,14 @@ def make_manager(*, dp_size=2, ranks_per_dp=1, strategy="pause"):
     return manager
 
 
+async def submit_and_finish(manager, obj):
+    status, response = manager.submit(obj)
+    tasks = list(manager.asyncio_tasks)
+    if tasks:
+        await asyncio.gather(*tasks)
+    return status, response
+
+
 class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
     async def _stop_watchdog(self, manager):
         await asyncio.sleep(0)
@@ -46,10 +54,18 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager._send_command_collect = AsyncMock(return_value={0, 1, 3})
         manager._publish_route_dp_mask = AsyncMock()
 
-        status, response = await manager.apply({"instruction": "retry", "params": {}})
+        status, response = await submit_and_finish(
+            manager,
+            {
+                "instruction": "retry",
+                "params": {"timeout": 99},
+                "request_id": "retry-1",
+            },
+        )
 
-        self.assertEqual(status, 200)
-        self.assertEqual(response["ranks"][2]["state"], "dead")
+        self.assertEqual(status, 202)
+        self.assertEqual(response["request_id"], "retry-1")
+        self.assertEqual(manager.status()[1]["engines"][2]["status"], "dead")
         manager._send_command_collect.assert_awaited_once_with(
             command="retry",
             target_ranks=[0, 1, 3],
@@ -64,12 +80,18 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager.state.unhealthy_dp_ranks.add(0)
         manager.state.observe_process_active_ranks([1], active=False)
 
-        status, response = await manager.apply({"instruction": "retry", "params": {}})
-
-        self.assertEqual(status, 400)
-        self.assertEqual(
-            response["message"], "retry_requires_all_expected_processes_alive"
+        status, _ = await submit_and_finish(
+            manager,
+            {"instruction": "retry", "params": {}, "request_id": "retry-2"},
         )
+
+        self.assertEqual(status, 202)
+        for engine in manager.status()[1]["engines"]:
+            self.assertEqual(engine["last_ft_request_id"], "retry-2")
+            self.assertEqual(
+                engine["ft_error"], "retry_requires_all_expected_processes_alive"
+            )
+        self.assertFalse(manager.state.ft_operation_in_progress)
 
     async def test_scale_down_has_one_scheduler_phase_after_shutdown(self):
         manager = make_manager(dp_size=4)
@@ -91,14 +113,19 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager._send_command_collect = command
         manager._publish_route_dp_mask = publish
 
-        status, response = await manager.apply(
-            {"instruction": "scale_down", "params": {"ranks": [2]}}
+        status, _ = await submit_and_finish(
+            manager,
+            {
+                "instruction": "scale_down",
+                "params": {"removed_dp_ranks": [2]},
+                "request_id": "scale-1",
+            },
         )
 
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 202)
         self.assertEqual(order, ["shutdown", "scale_down", "route"])
         self.assertEqual(manager.state.expected_dp_mask, [True, True, False, True])
-        self.assertEqual(response["ranks"][2]["state"], "dead")
+        self.assertEqual(manager.status()[1]["engines"][2]["status"], "dead")
 
     async def test_scale_down_sends_sparse_global_mask(self):
         manager = make_manager(dp_size=4, ranks_per_dp=2)
@@ -107,7 +134,13 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager._send_command_collect = AsyncMock(return_value={0, 1, 3})
         manager._publish_route_dp_mask = AsyncMock()
 
-        await manager.apply({"instruction": "scale_down", "params": {"ranks": [2]}})
+        await submit_and_finish(
+            manager,
+            {
+                "instruction": "scale_down",
+                "params": {"removed_dp_ranks": [2]},
+            },
+        )
 
         manager._send_command_collect.assert_awaited_once_with(
             command="scale_down",
@@ -136,7 +169,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
             ProcessActiveRanksOutput(ranks=[1], active=True)
         )
 
-        self.assertEqual(manager.status()[1]["ranks"][1]["state"], "dead")
+        self.assertEqual(manager.status()[1]["engines"][1]["status"], "dead")
         self.assertEqual(manager.state.pending_recovery_global_ranks, {1})
 
         update = manager.observe_active_ranks(ActiveRanksOutput(status=[True, True]))
@@ -144,17 +177,114 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(update.status, [True, True])
         self.assertEqual(manager.state.expected_dp_mask, [True, True])
         self.assertEqual(manager.state.pending_recovery_global_ranks, set())
-        self.assertEqual(manager.status()[1]["ranks"][1]["state"], "healthy")
+        self.assertEqual(manager.status()[1]["engines"][1]["status"], "healthy")
 
     async def test_recover_instruction_is_not_an_ft_api(self):
         manager = make_manager()
 
-        status, response = await manager.apply(
-            {"instruction": "recover", "params": {"ranks": [1]}}
+        status, response = manager.submit(
+            {"instruction": "recover", "params": {"removed_dp_ranks": [1]}}
         )
 
         self.assertEqual(status, 400)
-        self.assertIn("unsupported instruction: recover", response["message"])
+        self.assertEqual(response["message"], "Invalid instruction: 'recover'.")
+
+    async def test_submit_uses_vllm_accepted_response_and_rejects_concurrency(self):
+        manager = make_manager()
+        manager.state.unhealthy_dp_ranks.add(0)
+        command_started = asyncio.Event()
+        release_command = asyncio.Event()
+
+        async def command(**kwargs):
+            command_started.set()
+            await release_command.wait()
+            return set(kwargs["target_ranks"])
+
+        manager._send_command_collect = command
+        manager._publish_route_dp_mask = AsyncMock()
+
+        status, response = manager.submit(
+            {"instruction": "retry", "request_id": "request-1"}
+        )
+
+        self.assertEqual(status, 202)
+        self.assertEqual(
+            response,
+            {
+                "message": (
+                    "Request accepted; poll /fault_tolerance/status for updates."
+                ),
+                "request_id": "request-1",
+            },
+        )
+        self.assertTrue(manager.state.ft_operation_in_progress)
+        await command_started.wait()
+
+        busy_status, busy_response = manager.submit(
+            {"instruction": "retry", "request_id": "request-2"}
+        )
+        self.assertEqual(busy_status, 409)
+        self.assertEqual(busy_response["message"], "ft_operation_in_progress")
+
+        tasks = list(manager.asyncio_tasks)
+        release_command.set()
+        await asyncio.gather(*tasks)
+        self.assertFalse(manager.state.ft_operation_in_progress)
+
+    async def test_success_clears_previous_aggregate_error(self):
+        manager = make_manager()
+        manager._last_ft_request_id = "old-request"
+        manager._ft_error = "old-error"
+        manager.state.unhealthy_dp_ranks.add(0)
+        manager._send_command_collect = AsyncMock(return_value={0, 1})
+        manager._publish_route_dp_mask = AsyncMock()
+
+        await submit_and_finish(
+            manager,
+            {"instruction": "retry", "request_id": "new-request"},
+        )
+
+        for engine in manager.status()[1]["engines"]:
+            self.assertNotIn("last_ft_request_id", engine)
+            self.assertNotIn("ft_error", engine)
+
+    async def test_lower_execution_failure_keeps_failstop_behavior(self):
+        manager = make_manager()
+        manager.state.unhealthy_dp_ranks.add(0)
+        manager._send_command_collect = AsyncMock(
+            side_effect=RuntimeError("ack failed")
+        )
+        manager._failstop = Mock(side_effect=RuntimeError("failstop"))
+
+        status, _ = manager.submit(
+            {"instruction": "retry", "request_id": "request-fail"}
+        )
+        tasks = list(manager.asyncio_tasks)
+
+        self.assertEqual(status, 202)
+        with self.assertRaisesRegex(RuntimeError, "failstop"):
+            await asyncio.gather(*tasks)
+        manager._failstop.assert_called_once()
+        self.assertTrue(manager.state.ft_operation_in_progress)
+        self.assertIsNone(manager._ft_error)
+
+    async def test_apply_envelope_validation_matches_vllm(self):
+        manager = make_manager()
+        invalid_requests = [
+            ([], "Request body must be a JSON object."),
+            ({}, "'instruction' is required."),
+            ({"instruction": "retry", "params": []}, "'params' must be an object."),
+            (
+                {"instruction": "retry", "request_id": 1},
+                "'request_id' must be a string.",
+            ),
+        ]
+
+        for request, expected_error in invalid_requests:
+            with self.subTest(request=request):
+                status, response = manager.submit(request)
+                self.assertEqual(status, 400)
+                self.assertEqual(response["message"], expected_error)
 
     async def test_native_ready_before_process_up_still_auto_recovers(self):
         manager = make_manager()
@@ -168,7 +298,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
             manager.observe_active_ranks(ActiveRanksOutput(status=[True, True]))
         )
         self.assertEqual(manager.state.expected_dp_mask, [True, False])
-        self.assertEqual(manager.status()[1]["ranks"][1]["state"], "dead")
+        self.assertEqual(manager.status()[1]["engines"][1]["status"], "dead")
 
         update = manager.observe_process_active_ranks(
             ProcessActiveRanksOutput(ranks=[1], active=True)
@@ -176,7 +306,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(update.status, [True, True])
         self.assertEqual(manager.state.expected_dp_mask, [True, True])
-        self.assertEqual(manager.status()[1]["ranks"][1]["state"], "healthy")
+        self.assertEqual(manager.status()[1]["engines"][1]["status"], "healthy")
 
     async def test_process_up_waits_for_native_ready_before_reopening_route(self):
         manager = make_manager()
@@ -188,10 +318,10 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager.observe_process_active_ranks(
             ProcessActiveRanksOutput(ranks=[1], active=True)
         )
-        self.assertEqual(manager.status()[1]["ranks"][1]["state"], "dead")
+        self.assertEqual(manager.status()[1]["engines"][1]["status"], "dead")
 
         update = manager.observe_active_ranks(ActiveRanksOutput(status=[True, True]))
-        self.assertEqual(manager.status()[1]["ranks"][1]["state"], "healthy")
+        self.assertEqual(manager.status()[1]["engines"][1]["status"], "healthy")
         self.assertEqual(update.status, [True, True])
 
     async def test_continue_route_intersects_native_process_and_expected(self):
@@ -225,7 +355,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         # The route was already all-true, so no new publish is emitted; recovery
         # shows up purely as the DP returning to HEALTHY.
         self.assertIsNone(update)
-        self.assertEqual(manager.status()[1]["ranks"][1]["state"], "healthy")
+        self.assertEqual(manager.status()[1]["engines"][1]["status"], "healthy")
 
     async def test_watchdog_lease_expiry_marks_global_processes_down(self):
         manager = make_manager(dp_size=2, ranks_per_dp=2, strategy="continue")

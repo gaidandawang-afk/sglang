@@ -125,10 +125,12 @@ class FaultToleranceState:
 
     def status_response(self) -> Dict[str, Any]:
         return {
-            "ranks": [
-                {"rank": rank, "state": self._rank_state(rank).value}
+            "schema_version": 1,
+            "total_engines": self.dp_size,
+            "engines": [
+                {"id": rank, "status": self._rank_state(rank).value}
                 for rank in range(self.dp_size)
-            ]
+            ],
         }
 
     def has_incident(self) -> bool:
@@ -173,24 +175,13 @@ class FaultToleranceState:
             self.unhealthy_dp_ranks.add(rank)
             self.cluster_paused = True
 
-    def finish_retry(self) -> Dict[str, Any]:
+    def finish_retry(self) -> None:
         self.unhealthy_dp_ranks.clear()
-        self.ft_operation_in_progress = False
         self.cluster_paused = False
-        return self._success("fault_tolerance_retry_committed")
 
-    def finish_scale_down(self, ranks: Iterable[int]) -> Dict[str, Any]:
+    def finish_scale_down(self, ranks: Iterable[int]) -> None:
         removed = sorted(set(ranks))
         for rank in removed:
             self.expected_dp_mask[rank] = False
         self.unhealthy_dp_ranks.clear()
-        self.ft_operation_in_progress = False
         self.cluster_paused = False
-        body = self._success("fault_tolerance_scale_down_committed")
-        body["removed_ranks"] = removed
-        return body
-
-    def _success(self, message: str) -> Dict[str, Any]:
-        body = self.status_response()
-        body.update({"success": True, "message": message})
-        return body

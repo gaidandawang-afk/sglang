@@ -16,6 +16,21 @@ def make_state(*, dp_size=2, ranks_per_dp=1, strategy="pause"):
 
 
 class TestFaultToleranceState(unittest.TestCase):
+    def test_status_uses_vllm_engine_schema_for_all_dps(self):
+        state = make_state(dp_size=2)
+
+        self.assertEqual(
+            state.status_response(),
+            {
+                "schema_version": 1,
+                "total_engines": 2,
+                "engines": [
+                    {"id": 0, "status": "healthy"},
+                    {"id": 1, "status": "healthy"},
+                ],
+            },
+        )
+
     def test_single_dp_is_rejected(self):
         args = SimpleNamespace(
             pp_size=1,
@@ -89,7 +104,7 @@ class TestFaultToleranceState(unittest.TestCase):
             state.process_alive_global_rank_mask, [True, True, False, True]
         )
         self.assertEqual(state.process_alive_dp_mask(), [True, False])
-        self.assertEqual(state.status_response()["ranks"][1]["state"], "dead")
+        self.assertEqual(state.status_response()["engines"][1]["status"], "dead")
 
     def test_sparse_expected_mask_expands_to_whole_dp_blocks(self):
         state = make_state(dp_size=4, ranks_per_dp=2)
@@ -103,10 +118,10 @@ class TestFaultToleranceState(unittest.TestCase):
         state.observe_rank_fault(1)
 
         self.assertEqual(
-            state.status_response()["ranks"],
+            state.status_response()["engines"],
             [
-                {"rank": 0, "state": "healthy"},
-                {"rank": 1, "state": "unhealthy"},
+                {"id": 0, "status": "healthy"},
+                {"id": 1, "status": "unhealthy"},
             ],
         )
         self.assertTrue(state.has_incident())
@@ -116,15 +131,15 @@ class TestFaultToleranceState(unittest.TestCase):
         state.expected_dp_mask[1] = False
         state.observe_process_active_ranks([1], active=False)
         state.observe_process_active_ranks([1], active=True)
-        self.assertEqual(state.status_response()["ranks"][1]["state"], "dead")
+        self.assertEqual(state.status_response()["engines"][1]["status"], "dead")
         self.assertEqual(state.pending_recovery_global_ranks, {1})
 
         state.observe_native_active_dp_mask([True, True])
         self.assertEqual(state.pending_recovery_global_ranks, set())
-        self.assertEqual(state.status_response()["ranks"][1]["state"], "dead")
+        self.assertEqual(state.status_response()["engines"][1]["status"], "dead")
 
         state.observe_process_active_ranks([1], active=False)
-        self.assertEqual(state.status_response()["ranks"][1]["state"], "dead")
+        self.assertEqual(state.status_response()["engines"][1]["status"], "dead")
 
     def test_native_active_dp_clears_all_pending_global_ranks_in_dp(self):
         state = make_state(dp_size=2, ranks_per_dp=2)
@@ -161,7 +176,7 @@ class TestFaultToleranceState(unittest.TestCase):
         # continue never pauses admission; faults only drop requests / update status.
         self.assertFalse(state.should_reject_admission([True, True]))
         self.assertEqual(state.unhealthy_dp_ranks, set())
-        self.assertEqual(state.status_response()["ranks"][1]["state"], "dead")
+        self.assertEqual(state.status_response()["engines"][1]["status"], "dead")
 
 
 if __name__ == "__main__":

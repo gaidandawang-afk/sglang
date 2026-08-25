@@ -26,6 +26,27 @@ logger = logging.getLogger(__name__)
 
 WATCHDOG_LEASE_SWEEP_INTERVAL_SEC = 1
 WATCHDOG_LEASE_TIMEOUT_SEC = 5
+FT_REQUEST_ACCEPTED_MESSAGE = (
+    "Request accepted; poll /fault_tolerance/status for updates."
+)
+_ALLOWED_INSTRUCTIONS = {"retry", "scale_down"}
+
+
+def validate_apply_payload(obj: Any) -> Tuple[str, Dict[str, Any], str]:
+    if not isinstance(obj, dict):
+        raise ValueError("Request body must be a JSON object.")
+    instruction = obj.get("instruction")
+    if not instruction:
+        raise ValueError("'instruction' is required.")
+    if instruction not in _ALLOWED_INSTRUCTIONS:
+        raise ValueError(f"Invalid instruction: '{instruction}'.")
+    params = obj.get("params", {})
+    if not isinstance(params, dict):
+        raise ValueError("'params' must be an object.")
+    request_id = obj.get("request_id", "")
+    if not isinstance(request_id, str):
+        raise ValueError("'request_id' must be a string.")
+    return instruction, params, request_id
 
 
 @dataclasses.dataclass
@@ -61,6 +82,8 @@ class FaultToleranceManager:
         self._watchdog_leases: Dict[int, Tuple[float, Tuple[int, ...]]] = {}
         self._watchdog_lease_task: Optional[asyncio.Task] = None
         self._route_dp_mask = [True] * server_args.dp_size
+        self._last_ft_request_id: Optional[str] = None
+        self._ft_error: Optional[str] = None
 
     def bind_event_loop(self, loop) -> None:
         if self.event_loop is loop:
@@ -73,74 +96,91 @@ class FaultToleranceManager:
         self.asyncio_tasks = set()
 
     def status(self) -> tuple[int, dict]:
-        return 200, self.state.status_response()
+        body = self.state.status_response()
+        if self._ft_error is not None:
+            for engine in body["engines"]:
+                engine["last_ft_request_id"] = self._last_ft_request_id
+                engine["ft_error"] = self._ft_error
+        return 200, body
 
-    def _parse_apply_args(self, obj: Dict[str, Any]) -> Tuple[str, List[int], int]:
-        instruction = obj["instruction"]
-        if instruction not in ("retry", "scale_down"):
-            raise ValueError(f"unsupported instruction: {instruction}")
-        params = obj["params"]
-        timeout = params.get("timeout", self.server_args.fault_tolerance_timeout)
-        ranks = params.get("ranks", [])
-        if timeout <= 0:
-            raise ValueError("timeout must be positive")
-        if any(rank < 0 or rank >= self.state.dp_size for rank in ranks):
-            raise ValueError("rank out of range")
-        return instruction, ranks, timeout
-
-    async def apply(self, obj: Dict[str, Any]) -> tuple[int, dict]:
+    def submit(self, obj: Any) -> tuple[int, dict]:
         try:
-            instruction, ranks, timeout = self._parse_apply_args(obj)
-        except Exception as exc:
-            return 400, ft_failure(f"invalid params: {exc}")
+            instruction, params, request_id = validate_apply_payload(obj)
+        except ValueError as exc:
+            return 400, ft_failure(str(exc))
+        # One centralized SGLang request controls all DP engines atomically.
         if self.state.ft_operation_in_progress:
             return 409, ft_failure("ft_operation_in_progress")
 
+        self.state.ft_operation_in_progress = True
         try:
-            if instruction == "retry":
-                return await self._apply_retry(timeout)
-            return await self._apply_scale_down(ranks, timeout)
-        except Exception as exc:
-            self._failstop(f"fault tolerance apply {instruction} failed: {exc}")
+            self._create_task(
+                self._run_submitted_apply(instruction, params, request_id)
+            )
+        except Exception:
+            self.state.ft_operation_in_progress = False
+            raise
+        return 202, {
+            "message": FT_REQUEST_ACCEPTED_MESSAGE,
+            "request_id": request_id,
+        }
 
-    async def _apply_retry(self, timeout: int) -> tuple[int, dict]:
+    async def _run_submitted_apply(
+        self, instruction: str, params: Dict[str, Any], request_id: str
+    ) -> None:
+        error = await self._execute_apply(instruction, params)
+        if error is None:
+            self._last_ft_request_id = None
+            self._ft_error = None
+        else:
+            self._last_ft_request_id = request_id
+            self._ft_error = error
+        self.state.ft_operation_in_progress = False
+
+    async def _execute_apply(
+        self, instruction: str, params: Dict[str, Any]
+    ) -> Optional[str]:
+        timeout = self.server_args.fault_tolerance_timeout
+        if instruction == "retry":
+            return await self._apply_retry(timeout)
+
+        return await self._apply_scale_down(params["removed_dp_ranks"], timeout)
+
+    async def _apply_retry(self, timeout: int) -> Optional[str]:
         st = self.state
         if not st.unhealthy_dp_ranks:
-            return 400, ft_failure("retry_requires_unhealthy_rank")
+            return "retry_requires_unhealthy_rank"
         process_alive_dp_mask = st.process_alive_dp_mask()
         if any(
             expected and not process_alive_dp_mask[rank]
             for rank, expected in enumerate(st.expected_dp_mask)
         ):
-            return 400, ft_failure("retry_requires_all_expected_processes_alive")
+            return "retry_requires_all_expected_processes_alive"
 
-        st.ft_operation_in_progress = True
         await self._send_command_collect(
             command="retry", target_ranks=st.expected_dp_ranks(), timeout_sec=timeout
         )
         await self._publish_route_dp_mask(st.expected_dp_mask, timeout)
-        return 200, st.finish_retry()
+        st.finish_retry()
+        return None
 
-    async def _apply_scale_down(
-        self, ranks: List[int], timeout: int
-    ) -> tuple[int, dict]:
+    async def _apply_scale_down(self, ranks: List[int], timeout: int) -> Optional[str]:
         st = self.state
         requested = set(ranks)
         if not st.has_incident():
-            return 400, ft_failure("scale_down_requires_incident")
+            return "scale_down_requires_incident"
         if not requested:
-            return 400, ft_failure("scale_down_requires_ranks")
+            return "scale_down_requires_ranks"
         if any(not st.expected_dp_mask[rank] for rank in requested):
-            return 400, ft_failure("scale_down_requires_expected_ranks")
+            return "scale_down_requires_expected_ranks"
 
         candidate_dp_mask = [
             expected and rank not in requested
             for rank, expected in enumerate(st.expected_dp_mask)
         ]
         if not any(candidate_dp_mask):
-            return 400, ft_failure("cannot_scale_down_all_expected_ranks")
+            return "cannot_scale_down_all_expected_ranks"
 
-        st.ft_operation_in_progress = True
         await self._shutdown_dp_processes(requested, timeout)
         await self._send_command_collect(
             command="scale_down",
@@ -153,7 +193,8 @@ class FaultToleranceManager:
             ),
         )
         await self._publish_route_dp_mask(candidate_dp_mask, timeout)
-        return 200, st.finish_scale_down(requested)
+        st.finish_scale_down(requested)
+        return None
 
     def validate_routed_rank(self, rank: int) -> None:
         if not 0 <= rank < len(self._route_dp_mask) or not self._route_dp_mask[rank]:

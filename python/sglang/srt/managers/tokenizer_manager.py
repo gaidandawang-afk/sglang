@@ -1840,7 +1840,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def fault_tolerance_apply(self, obj: Dict[str, Any]):
         if self.fault_tolerance is None:
             return 503, ft_failure("fault_tolerance_disabled")
-        return await self.fault_tolerance.apply(obj)
+        return self.fault_tolerance.submit(obj)
 
     async def update_weights_from_disk(
         self,
