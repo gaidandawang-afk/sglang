@@ -33,6 +33,10 @@ class FaultToleranceRankFaultOutput(Struct):
     pass
 
 
+class NpuFTMLPSyncInterrupted(RuntimeError):
+    pass
+
+
 class ProcessActiveRanksOutput(Struct):
     pass
 
@@ -158,6 +162,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 "FaultToleranceCommandReqInput": FaultToleranceCommandReqInput,
                 "FaultToleranceCommandReqOutput": FaultToleranceCommandReqOutput,
                 "FaultToleranceRankFaultOutput": FaultToleranceRankFaultOutput,
+                "NpuFTMLPSyncInterrupted": NpuFTMLPSyncInterrupted,
                 "HTTPStatus": HTTPStatus,
                 "Optional": Optional,
                 "ScheduleBatch": FakeBatch,
@@ -313,6 +318,36 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertTrue(scheduler._engine_paused)
         self.assertEqual(scheduler._ft_pause_deadline, 130.0)
         self.assertEqual(events, ["fault", "report"])
+
+    def test_mlp_sync_interruption_pauses_without_reporting_rank_fault(self):
+        events = []
+
+        def dispatch(_):
+            if not events:
+                events.append("interrupted")
+                raise NpuFTMLPSyncInterrupted("old group timed out")
+            raise KeyboardInterrupt()
+
+        self.run_ft_loop.__globals__["dispatch_event_loop"] = dispatch
+        sender = SimpleNamespace(send_output=lambda *_: events.append("report"))
+        scheduler = SimpleNamespace(
+            _ft_discard_inflight_window=lambda exc: events.append("discarded"),
+            ipc_channels=SimpleNamespace(send_to_tokenizer=sender),
+            ps=SimpleNamespace(dp_rank=0),
+            server_args=SimpleNamespace(
+                fault_tolerance_on_error_strategy="pause",
+                fault_tolerance_pause_timeout=30,
+            ),
+            _engine_paused=False,
+            _ft_pause_deadline=None,
+        )
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_ft_loop(scheduler)
+
+        self.assertTrue(scheduler._engine_paused)
+        self.assertEqual(scheduler._ft_pause_deadline, 130.0)
+        self.assertEqual(events, ["interrupted", "discarded"])
 
     def test_pause_deadline_notifies_node_main_once(self):
         notify = self.check_deadline.__globals__["notify_node_main_process_failure"]

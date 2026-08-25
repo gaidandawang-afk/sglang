@@ -72,6 +72,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.fault_tolerance.exceptions import NpuFTMLPSyncInterrupted
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -1564,6 +1565,15 @@ class Scheduler(
             try:
                 dispatch_event_loop(self)
                 return
+            except NpuFTMLPSyncInterrupted as exc:
+                self._ft_discard_inflight_window(exc)
+                self._engine_paused = True
+                self._ft_pause_deadline = (
+                    time.monotonic()
+                    + self.server_args.fault_tolerance_pause_timeout
+                )
+                logger.warning("FT paused after MLP-sync interruption: %s", exc)
+                continue
             except Exception as exc:
                 recovered = self._ft_discard_inflight_window(exc)
                 should_continue = (

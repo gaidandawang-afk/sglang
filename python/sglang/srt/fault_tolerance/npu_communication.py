@@ -10,6 +10,7 @@ from sglang.srt.eplb.process_group_context import (
     EPLBProcessGroupContext,
     set_eplb_process_group_context,
 )
+from sglang.srt.fault_tolerance.exceptions import NpuFTMLPSyncInterrupted
 from torch.distributed import PrefixStore, TCPStore
 
 
@@ -81,14 +82,33 @@ class NpuFTCommunication:
             )
         )
 
-    def all_gather_mlp_sync(self, local_tensor: torch.Tensor) -> dict[int, torch.Tensor]:
-        local_tensor = local_tensor.detach().cpu().contiguous()
-        tensors = [torch.empty_like(local_tensor) for _ in self.active_original_ranks]
-        dist.all_gather(tensors, local_tensor, group=self.mlp_sync_group)
-        return dict(zip(self.active_original_ranks, tensors, strict=True))
+_communication: NpuFTCommunication | None = None
 
 
-_communication: NpuFTCommunication
+def all_gather_into_tensor_with_timeout(
+    output_tensor: torch.Tensor,
+    input_tensor: torch.Tensor,
+    *,
+    group,
+    timeout_sec: float,
+) -> None:
+    try:
+        work = dist.all_gather_into_tensor(
+            output_tensor,
+            input_tensor,
+            group=group,
+            async_op=True,
+        )
+        completed = work.wait(timeout=timedelta(seconds=timeout_sec))
+    except Exception as exc:
+        raise NpuFTMLPSyncInterrupted(
+            "NPU MC2 MLP-sync collective failed; entering the FT control loop"
+        ) from exc
+    if completed is False:
+        raise NpuFTMLPSyncInterrupted(
+            "NPU MC2 MLP-sync collective timed out after "
+            f"{timeout_sec:g}s; entering the FT control loop"
+        )
 
 
 def init_npu_ft_communication(
@@ -116,5 +136,5 @@ def init_npu_ft_communication(
     return _communication
 
 
-def get_npu_ft_communication() -> NpuFTCommunication:
+def get_npu_ft_communication() -> NpuFTCommunication | None:
     return _communication

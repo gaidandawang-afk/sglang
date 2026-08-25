@@ -10,7 +10,10 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
-from sglang.srt.eplb.process_group_context import get_eplb_process_group_context
+from sglang.srt.fault_tolerance.npu_communication import (
+    all_gather_into_tensor_with_timeout,
+    get_npu_ft_communication,
+)
 from sglang.srt.layers.dp_attention import world_dp_gather_enabled
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.recv_skipper import (
@@ -140,17 +143,23 @@ class MLPSyncBatchInfo:
             self.dp_size, self.tp_size * self.cp_size, info_width
         ).contiguous()
 
-        if get_eplb_process_group_context().group is not None:
-            from sglang.srt.fault_tolerance.npu_communication import (
-                get_npu_ft_communication,
+        npu_ft_comm = get_npu_ft_communication()
+        if npu_ft_comm is not None:
+            local_info_cpu = local_info_tensor.detach().cpu().contiguous()
+            gathered = torch.empty(
+                len(npu_ft_comm.active_original_ranks),
+                info_width,
+                dtype=local_info_cpu.dtype,
             )
-
-            for original_rank, info in (
-                get_npu_ft_communication()
-                .all_gather_mlp_sync(local_info_tensor)
-                .items()
-            ):
-                global_info_tensor[original_rank, 0] = info.to(device=device)
+            all_gather_into_tensor_with_timeout(
+                gathered.flatten(),
+                local_info_cpu,
+                group=npu_ft_comm.mlp_sync_group,
+                timeout_sec=5,
+            )
+            global_info_tensor[list(npu_ft_comm.active_original_ranks), 0] = gathered.to(
+                device=device
+            )
         elif use_all_reduce:
             # Admission can expose different WORLD sizes; use fixed global slots.
             global_info_tensor.zero_()
