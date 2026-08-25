@@ -3559,13 +3559,17 @@ class Scheduler(
         ):
             return
         from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+        from sglang.srt.elastic_ep.topology import collapse_physical_rank_status
 
         inst = ElasticEPStateManager.instance()
         if inst is not None and inst.active_ranks_cpu is not None:
+            parallel = get_parallel()
+            dp_status = collapse_physical_rank_status(
+                inst.active_ranks_cpu.tolist(),
+                parallel.attn_tp_size * parallel.attn_cp_size,
+            )
             self.ipc_channels.send_to_tokenizer.send_output(
-                ActiveRanksOutput(
-                    status=[bool(x) for x in inst.active_ranks_cpu.tolist()]
-                )
+                ActiveRanksOutput(status=dp_status)
             )
         else:
             logger.debug("[Elastic EP] active rank state is unavailable")
