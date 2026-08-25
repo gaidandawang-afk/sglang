@@ -187,8 +187,12 @@ class FaultToleranceManager:
         st.finish_scale_down(requested)
         return None
 
-    def should_reject_admission(self) -> bool:
-        return self.state.should_reject_admission(self._route_dp_mask)
+    def admission_error(self, routed_dp_rank: Optional[int]) -> Optional[str]:
+        if routed_dp_rank is not None and not self._route_dp_mask[routed_dp_rank]:
+            return f"routed_dp_rank={routed_dp_rank} is not active"
+        if self.state.should_reject_admission(self._route_dp_mask):
+            return "fault_tolerance_paused"
+        return None
 
     def _route_dp_update(
         self, route_dp_mask: List[bool]

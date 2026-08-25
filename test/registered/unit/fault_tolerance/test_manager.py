@@ -419,6 +419,15 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.state.unhealthy_dp_ranks, {1})
         self.assertFalse(hasattr(manager, "_paused_failstop_handle"))
 
+    async def test_admission_reports_scaled_down_rank(self):
+        manager = make_manager()
+        manager._route_dp_mask = [True, False]
+
+        self.assertIsNone(manager.admission_error(0))
+        self.assertEqual(
+            manager.admission_error(1), "routed_dp_rank=1 is not active"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

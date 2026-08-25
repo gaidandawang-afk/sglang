@@ -714,14 +714,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
-        if (
-            self.fault_tolerance is not None
-            and self.fault_tolerance.should_reject_admission()
-        ):
-            raise fastapi.HTTPException(
-                status_code=503,
-                detail="fault_tolerance_paused",
+        if self.fault_tolerance is not None:
+            routed_dp_rank = (
+                obj.routed_dp_rank if isinstance(obj, GenerateReqInput) else None
             )
+            if error := self.fault_tolerance.admission_error(routed_dp_rank):
+                raise fastapi.HTTPException(status_code=503, detail=error)
 
         self._init_req_state(obj, request)
         try:
