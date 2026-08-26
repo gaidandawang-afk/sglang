@@ -93,10 +93,11 @@ class FaultToleranceManager:
 
     def status(self) -> tuple[int, dict]:
         body = self.state.status_response()
-        if self._ft_error is not None:
+        if self._last_ft_request_id is not None:
             for engine in body["engines"]:
                 engine["last_ft_request_id"] = self._last_ft_request_id
-                engine["ft_error"] = self._ft_error
+                if self._ft_error is not None:
+                    engine["ft_error"] = self._ft_error
         return 200, body
 
     def submit(self, obj: Any) -> tuple[int, dict]:
@@ -130,7 +131,7 @@ class FaultToleranceManager:
         else:
             error = await self._apply_scale_down(params["removed_dp_ranks"], timeout)
         if error is None:
-            self._last_ft_request_id = None
+            self._last_ft_request_id = request_id
             self._ft_error = None
         else:
             self._last_ft_request_id = request_id

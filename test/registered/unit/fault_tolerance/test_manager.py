@@ -231,7 +231,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*tasks)
         self.assertFalse(manager.state.ft_operation_in_progress)
 
-    async def test_success_clears_previous_aggregate_error(self):
+    async def test_success_records_request_id_and_clears_previous_aggregate_error(self):
         manager = make_manager()
         manager._last_ft_request_id = "old-request"
         manager._ft_error = "old-error"
@@ -245,7 +245,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         )
 
         for engine in manager.status()[1]["engines"]:
-            self.assertNotIn("last_ft_request_id", engine)
+            self.assertEqual(engine["last_ft_request_id"], "new-request")
             self.assertNotIn("ft_error", engine)
 
     async def test_lower_execution_failure_keeps_failstop_behavior(self):
