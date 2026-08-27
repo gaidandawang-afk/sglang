@@ -10,7 +10,6 @@ from sglang.srt.eplb.process_group_context import (
     EPLBProcessGroupContext,
     set_eplb_process_group_context,
 )
-from sglang.srt.fault_tolerance.exceptions import NpuFTMLPSyncInterrupted
 from torch.distributed import PrefixStore, TCPStore
 
 
@@ -101,11 +100,11 @@ def all_gather_into_tensor_with_timeout(
         )
         completed = work.wait(timeout=timedelta(seconds=timeout_sec))
     except Exception as exc:
-        raise NpuFTMLPSyncInterrupted(
+        raise RuntimeError(
             "NPU MC2 MLP-sync collective failed; entering the FT control loop"
         ) from exc
     if completed is False:
-        raise NpuFTMLPSyncInterrupted(
+        raise RuntimeError(
             "NPU MC2 MLP-sync collective timed out after "
             f"{timeout_sec:g}s; entering the FT control loop"
         )

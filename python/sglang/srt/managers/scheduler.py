@@ -72,7 +72,6 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.fault_tolerance.exceptions import NpuFTMLPSyncInterrupted
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -1554,38 +1553,24 @@ class Scheduler(
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
-        with self.device_module.StreamContext(self.schedule_stream):
-            if self.server_args.enable_fault_tolerance:
-                self._run_event_loop_fault_tolerance()
-            else:
+        if self.server_args.enable_fault_tolerance:
+            self._run_event_loop_fault_tolerance()
+        else:
+            with self.device_module.StreamContext(self.schedule_stream):
                 dispatch_event_loop(self)
 
     def _run_event_loop_fault_tolerance(self) -> None:
         while True:
             try:
-                dispatch_event_loop(self)
+                with self.device_module.StreamContext(self.schedule_stream):
+                    dispatch_event_loop(self)
                 return
-            except NpuFTMLPSyncInterrupted as exc:
-                self._ft_discard_inflight_window(exc)
-                self._engine_paused = True
-                self._ft_pause_deadline = (
-                    time.monotonic()
-                    + self.server_args.fault_tolerance_pause_timeout
-                )
-                logger.warning("FT paused after MLP-sync interruption: %s", exc)
-                continue
             except Exception as exc:
                 recovered = self._ft_discard_inflight_window(exc)
                 should_continue = (
                     self.server_args.fault_tolerance_on_error_strategy == "continue"
                     and recovered
                 )
-                if not should_continue:
-                    self._engine_paused = True
-                    self._ft_pause_deadline = (
-                        time.monotonic()
-                        + self.server_args.fault_tolerance_pause_timeout
-                    )
                 self.ipc_channels.send_to_tokenizer.send_output(
                     FaultToleranceRankFaultOutput(
                         rank=self.ps.dp_rank,
@@ -1594,8 +1579,28 @@ class Scheduler(
                 )
                 if should_continue:
                     continue
+                self._engine_paused = True
+                self._ft_pause_deadline = (
+                    time.monotonic() + self.server_args.fault_tolerance_pause_timeout
+                )
 
-    def _ft_discard_inflight_window(self, exc: Exception) -> bool:
+            self._run_fault_tolerance_control_loop()
+
+    def _run_fault_tolerance_control_loop(self) -> None:
+        while self._engine_paused:
+            recv_reqs = self.request_receiver.recv_requests()
+            ft_reqs = [
+                recv_req
+                for recv_req in recv_reqs
+                if isinstance(recv_req, FaultToleranceCommandReqInput)
+            ]
+            if ft_reqs:
+                self.process_input_requests(ft_reqs)
+            self._check_ft_pause_deadline()
+            if self._engine_paused and not ft_reqs:
+                time.sleep(0.01)
+
+    def _ft_discard_inflight_window(self, reason) -> bool:
         window_batches = [
             self.cur_batch_for_debug,
             self.last_batch,
@@ -1629,7 +1634,7 @@ class Scheduler(
                     allow_non_spec_overallocated=True,
                 )
                 abort_reason = FINISH_ABORT(
-                    message=f"Request discarded after scheduler exception: {exc}",
+                    message=f"Request discarded during fault-tolerance recovery: {reason}",
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                     err_type="SchedulerFault",
                 )
@@ -1653,9 +1658,9 @@ class Scheduler(
         self.cur_batch_for_debug = None
         self.last_batch = None
         logger.warning(
-            "FT discarded %d in-flight request(s) after scheduler exception: %s",
+            "FT discarded %d in-flight request(s) during recovery: %s",
             len(discarded_by_rid),
-            exc,
+            reason,
         )
         return success
 
@@ -4520,9 +4525,16 @@ class Scheduler(
             state.active_ranks_cpu.copy_(state.last_active_ranks.detach().cpu())
             message = "retried"
         elif recv_req.command == "scale_down":
-            self.tp_worker.model_runner.apply_fault_tolerance_scale_down(
-                recv_req.active_mask
-            )
+            model_runner = self.tp_worker.model_runner
+            if _is_npu and self.server_args.elastic_ep_backend == "mc2":
+                model_runner.recover_npu_device_for_fault_tolerance_scale_down()
+                schedule_stream = self.device_module.Stream(priority=0)
+                with self.device_module.StreamContext(schedule_stream):
+                    model_runner.apply_fault_tolerance_scale_down(recv_req.active_mask)
+                self.schedule_stream = schedule_stream
+            else:
+                with self.device_module.StreamContext(self.schedule_stream):
+                    model_runner.apply_fault_tolerance_scale_down(recv_req.active_mask)
             message = "scaled down"
         else:
             logger.warning(

@@ -1,5 +1,6 @@
 import ast
 from collections import deque
+from contextlib import nullcontext
 from http import HTTPStatus
 import logging
 from pathlib import Path
@@ -30,10 +31,6 @@ class FaultToleranceDPCShutdownReqInput(Struct):
 
 
 class FaultToleranceRankFaultOutput(Struct):
-    pass
-
-
-class NpuFTMLPSyncInterrupted(RuntimeError):
     pass
 
 
@@ -151,6 +148,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             "Scheduler",
             {
                 "_run_event_loop_fault_tolerance",
+                "_run_fault_tolerance_control_loop",
                 "handle_fault_tolerance_command",
                 "_check_ft_pause_deadline",
                 "_ft_discard_inflight_window",
@@ -162,7 +160,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 "FaultToleranceCommandReqInput": FaultToleranceCommandReqInput,
                 "FaultToleranceCommandReqOutput": FaultToleranceCommandReqOutput,
                 "FaultToleranceRankFaultOutput": FaultToleranceRankFaultOutput,
-                "NpuFTMLPSyncInterrupted": NpuFTMLPSyncInterrupted,
                 "HTTPStatus": HTTPStatus,
                 "Optional": Optional,
                 "ScheduleBatch": FakeBatch,
@@ -170,14 +167,31 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 "logger": logging.getLogger(__name__),
                 "notify_node_main_process_failure": Mock(),
                 "release_kv_cache": lambda *args, **kwargs: None,
-                "time": SimpleNamespace(monotonic=lambda: 100.0),
+                "time": SimpleNamespace(monotonic=lambda: 100.0, sleep=Mock()),
+                "_is_npu": False,
             },
         )
         cls.run_ft_loop = staticmethod(scheduler["_run_event_loop_fault_tolerance"])
+        cls.run_ft_control_loop = staticmethod(
+            scheduler["_run_fault_tolerance_control_loop"]
+        )
         cls.handle_command = staticmethod(scheduler["handle_fault_tolerance_command"])
         cls.check_deadline = staticmethod(scheduler["_check_ft_pause_deadline"])
         cls.discard = staticmethod(scheduler["_ft_discard_inflight_window"])
         cls.process_overlap = staticmethod(scheduler["_process_next_overlap_result"])
+
+        server_args = load_class_methods(
+            REPO_ROOT / "python/sglang/srt/server_args.py",
+            "ServerArgs",
+            {"_handle_fault_tolerance"},
+            {
+                "is_npu": lambda: True,
+                "logger": logging.getLogger(__name__),
+            },
+        )
+        cls.handle_fault_tolerance_args = staticmethod(
+            server_args["_handle_fault_tolerance"]
+        )
 
         cls.dpc_globals = {
             "FaultToleranceCommandReqInput": FaultToleranceCommandReqInput,
@@ -218,7 +232,10 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         cls.dpc_methods = dpc
 
     def make_scheduler(self, *, leader=True):
-        model_runner = SimpleNamespace(apply_fault_tolerance_scale_down=Mock())
+        model_runner = SimpleNamespace(
+            apply_fault_tolerance_scale_down=Mock(),
+            recover_npu_device_for_fault_tolerance_scale_down=Mock(),
+        )
         return SimpleNamespace(
             ps=SimpleNamespace(
                 dp_rank=1,
@@ -226,6 +243,12 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 attn_cp_rank=0,
             ),
             tp_worker=SimpleNamespace(model_runner=model_runner),
+            server_args=SimpleNamespace(elastic_ep_backend="mc2"),
+            device_module=SimpleNamespace(
+                Stream=Mock(return_value=object()),
+                StreamContext=lambda stream: nullcontext(),
+            ),
+            schedule_stream=object(),
             _engine_paused=True,
             _ft_pause_deadline=130.0,
         )
@@ -277,6 +300,90 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertEqual(output.message, "scaled down")
         self.assertFalse(scheduler._engine_paused)
 
+    def test_npu_scale_down_recovers_then_rebuilds_on_new_schedule_stream(self):
+        events = []
+        new_stream = object()
+        scheduler = self.make_scheduler()
+        old_stream = object()
+        scheduler.schedule_stream = old_stream
+        scheduler.device_module.Stream = Mock(
+            side_effect=lambda priority=0: events.append("new_stream") or new_stream
+        )
+
+        class RecordingContext:
+            def __enter__(self):
+                events.append("enter_new_stream")
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("exit_new_stream")
+
+        scheduler.device_module.StreamContext = lambda stream: RecordingContext()
+        model_runner = scheduler.tp_worker.model_runner
+        model_runner.recover_npu_device_for_fault_tolerance_scale_down.side_effect = (
+            lambda: events.append("recover_device")
+        )
+        model_runner.apply_fault_tolerance_scale_down.side_effect = lambda mask: (
+            events.append(("scale_down", mask))
+        )
+        request = FaultToleranceCommandReqInput(
+            request_id="s",
+            command="scale_down",
+            target_ranks=[1],
+            active_mask=[True, False],
+        )
+
+        self.handle_command.__globals__["_is_npu"] = True
+        try:
+            output = self.handle_command(scheduler, request)
+        finally:
+            self.handle_command.__globals__["_is_npu"] = False
+
+        self.assertEqual(
+            events,
+            [
+                "recover_device",
+                "new_stream",
+                "enter_new_stream",
+                ("scale_down", [True, False]),
+                "exit_new_stream",
+            ],
+        )
+        self.assertIs(scheduler.schedule_stream, new_stream)
+        self.assertEqual(output.message, "scaled down")
+
+    def test_retry_does_not_recover_or_replace_schedule_stream(self):
+        state = SimpleNamespace(
+            active_ranks=FakeTensor([1, 0]),
+            active_ranks_cpu=FakeTensor([1, 0]),
+            last_active_ranks=FakeTensor([1, 1]),
+        )
+        module = ModuleType("sglang.srt.elastic_ep.elastic_ep")
+        module.ElasticEPStateManager = SimpleNamespace(instance=lambda: state)
+        modules = {
+            "sglang": ModuleType("sglang"),
+            "sglang.srt": ModuleType("sglang.srt"),
+            "sglang.srt.elastic_ep": ModuleType("sglang.srt.elastic_ep"),
+            "sglang.srt.elastic_ep.elastic_ep": module,
+        }
+        scheduler = self.make_scheduler()
+        old_stream = object()
+        scheduler.schedule_stream = old_stream
+        request = FaultToleranceCommandReqInput(
+            request_id="r", command="retry", target_ranks=[1], active_mask=None
+        )
+
+        self.handle_command.__globals__["_is_npu"] = True
+        try:
+            with patch.dict(sys.modules, modules):
+                self.handle_command(scheduler, request)
+        finally:
+            self.handle_command.__globals__["_is_npu"] = False
+
+        self.assertIs(scheduler.schedule_stream, old_stream)
+        scheduler.device_module.Stream.assert_not_called()
+        recover = scheduler.tp_worker.model_runner.recover_npu_device_for_fault_tolerance_scale_down
+        recover.assert_not_called()
+
     def test_nonleader_executes_without_ack(self):
         scheduler = self.make_scheduler(leader=False)
         request = FaultToleranceCommandReqInput(
@@ -303,9 +410,12 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.run_ft_loop.__globals__["dispatch_event_loop"] = dispatch
         sender = SimpleNamespace(send_output=lambda *_: events.append("report"))
         scheduler = SimpleNamespace(
-            _ft_discard_inflight_window=lambda exc: True,
+            _ft_discard_inflight_window=lambda exc: events.append("discarded") or True,
+            _run_fault_tolerance_control_loop=lambda: events.append("control"),
             ipc_channels=SimpleNamespace(send_to_tokenizer=sender),
             ps=SimpleNamespace(dp_rank=0),
+            device_module=SimpleNamespace(StreamContext=lambda stream: nullcontext()),
+            schedule_stream=object(),
             server_args=SimpleNamespace(
                 fault_tolerance_on_error_strategy="pause",
                 fault_tolerance_pause_timeout=30,
@@ -317,23 +427,92 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             self.run_ft_loop(scheduler)
         self.assertTrue(scheduler._engine_paused)
         self.assertEqual(scheduler._ft_pause_deadline, 130.0)
-        self.assertEqual(events, ["fault", "report"])
+        self.assertEqual(events, ["fault", "discarded", "report", "control"])
 
-    def test_mlp_sync_interruption_pauses_without_reporting_rank_fault(self):
+    def test_gpu_continue_discards_and_reenters_normal_loop(self):
         events = []
 
         def dispatch(_):
             if not events:
-                events.append("interrupted")
-                raise NpuFTMLPSyncInterrupted("old group timed out")
+                events.append("fault")
+                raise RuntimeError("boom")
             raise KeyboardInterrupt()
 
         self.run_ft_loop.__globals__["dispatch_event_loop"] = dispatch
-        sender = SimpleNamespace(send_output=lambda *_: events.append("report"))
+        self.run_ft_loop.__globals__["_is_npu"] = False
         scheduler = SimpleNamespace(
-            _ft_discard_inflight_window=lambda exc: events.append("discarded"),
-            ipc_channels=SimpleNamespace(send_to_tokenizer=sender),
+            _ft_discard_inflight_window=lambda exc: events.append("discarded") or True,
+            _run_fault_tolerance_control_loop=lambda: events.append("control"),
+            ipc_channels=SimpleNamespace(
+                send_to_tokenizer=SimpleNamespace(
+                    send_output=lambda *_: events.append("report")
+                )
+            ),
             ps=SimpleNamespace(dp_rank=0),
+            device_module=SimpleNamespace(StreamContext=lambda stream: nullcontext()),
+            schedule_stream=object(),
+            server_args=SimpleNamespace(
+                fault_tolerance_on_error_strategy="continue",
+                fault_tolerance_pause_timeout=30,
+            ),
+            _engine_paused=False,
+            _ft_pause_deadline=None,
+        )
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_ft_loop(scheduler)
+
+        self.assertEqual(events, ["fault", "discarded", "report"])
+
+    def test_npu_continue_strategy_is_normalized_during_startup(self):
+        module = ModuleType("sglang.srt.fault_tolerance.controller")
+        module.is_ft_supported_config = lambda server_args: (True, "")
+        server_args = SimpleNamespace(
+            enable_fault_tolerance=True,
+            fault_tolerance_on_error_strategy="continue",
+        )
+
+        with patch.dict(
+            sys.modules,
+            {"sglang.srt.fault_tolerance.controller": module},
+        ):
+            self.handle_fault_tolerance_args(server_args)
+
+        self.assertEqual(server_args.fault_tolerance_on_error_strategy, "pause")
+
+    def test_fault_control_starts_after_faulted_stream_context_exits(self):
+        events = []
+
+        class RecordingContext:
+            def __enter__(self):
+                events.append("enter_stream")
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("exit_stream")
+
+        def dispatch(_):
+            events.append("fault")
+            raise RuntimeError("boom")
+
+        def run_control_loop():
+            events.append("control")
+            raise KeyboardInterrupt()
+
+        self.run_ft_loop.__globals__["dispatch_event_loop"] = dispatch
+        self.run_ft_loop.__globals__["_is_npu"] = False
+        scheduler = SimpleNamespace(
+            _ft_discard_inflight_window=lambda exc: events.append("discarded") or True,
+            _run_fault_tolerance_control_loop=run_control_loop,
+            ipc_channels=SimpleNamespace(
+                send_to_tokenizer=SimpleNamespace(
+                    send_output=lambda *_: events.append("report")
+                )
+            ),
+            ps=SimpleNamespace(dp_rank=0),
+            device_module=SimpleNamespace(
+                StreamContext=lambda stream: RecordingContext()
+            ),
+            schedule_stream=object(),
             server_args=SimpleNamespace(
                 fault_tolerance_on_error_strategy="pause",
                 fault_tolerance_pause_timeout=30,
@@ -345,9 +524,57 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             self.run_ft_loop(scheduler)
 
-        self.assertTrue(scheduler._engine_paused)
-        self.assertEqual(scheduler._ft_pause_deadline, 130.0)
-        self.assertEqual(events, ["interrupted", "discarded"])
+        self.assertEqual(
+            events,
+            [
+                "enter_stream",
+                "fault",
+                "exit_stream",
+                "discarded",
+                "report",
+                "control",
+            ],
+        )
+
+    def test_fault_tolerance_control_loop_only_handles_ft_command(self):
+        ordinary_request = object()
+        request = FaultToleranceCommandReqInput(command="retry")
+        processed = []
+        scheduler = SimpleNamespace(
+            _engine_paused=True,
+            request_receiver=SimpleNamespace(
+                recv_requests=lambda: [ordinary_request, request]
+            ),
+            process_input_requests=lambda reqs: (
+                processed.append(reqs),
+                setattr(scheduler, "_engine_paused", False),
+            ),
+            _check_ft_pause_deadline=Mock(),
+        )
+
+        self.run_ft_control_loop(scheduler)
+
+        self.assertEqual(processed, [[request]])
+        scheduler._check_ft_pause_deadline.assert_called_once()
+
+    def test_fault_tolerance_control_loop_sleeps_after_empty_poll(self):
+        command = FaultToleranceCommandReqInput(command="retry")
+        polls = iter([[], [command]])
+        sleep = self.run_ft_control_loop.__globals__["time"].sleep
+        sleep.reset_mock()
+        scheduler = SimpleNamespace(
+            _engine_paused=True,
+            request_receiver=SimpleNamespace(recv_requests=lambda: next(polls)),
+            process_input_requests=lambda reqs: setattr(
+                scheduler, "_engine_paused", False
+            ),
+            _check_ft_pause_deadline=Mock(),
+        )
+
+        self.run_ft_control_loop(scheduler)
+
+        sleep.assert_called_once_with(0.01)
+        self.assertEqual(scheduler._check_ft_pause_deadline.call_count, 2)
 
     def test_pause_deadline_notifies_node_main_once(self):
         notify = self.check_deadline.__globals__["notify_node_main_process_failure"]

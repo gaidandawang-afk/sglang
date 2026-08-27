@@ -1912,6 +1912,17 @@ class ModelRunner:
             )
         return output
 
+    def recover_npu_device_for_fault_tolerance_scale_down(self) -> None:
+        import torch_npu
+
+        device_id = torch_npu.npu.current_device()
+        logger.info(
+            "Recovering NPU device %s for fault-tolerance scale-down", device_id
+        )
+        torch_npu.npu.stop_device(device_id)
+        torch_npu.npu.restart_device(device_id)
+        torch_npu.distributed.reinit_process_group(None, False)
+
     def apply_fault_tolerance_scale_down(self, active_mask: list[bool]) -> None:
         state = ElasticEPStateManager.instance()
         if _is_npu and self.server_args.elastic_ep_backend == "mc2":
@@ -1922,12 +1933,6 @@ class ModelRunner:
             )
 
             device_id = torch_npu.npu.current_device()
-            logger.info(
-                "Recovering NPU device %s for fault-tolerance scale-down", device_id
-            )
-            torch_npu.npu.stop_device(device_id)
-            torch_npu.npu.restart_device(device_id)
-            torch_npu.distributed.reinit_process_group(None, False)
             get_npu_ft_communication().rebuild(
                 active_mask, torch.device("npu", device_id)
             )

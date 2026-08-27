@@ -3799,6 +3799,13 @@ class ServerArgs:
         if not self.enable_fault_tolerance:
             return
 
+        if is_npu() and self.fault_tolerance_on_error_strategy == "continue":
+            logger.warning(
+                "NPU fault tolerance does not support the continue strategy; "
+                "using pause instead"
+            )
+            self.fault_tolerance_on_error_strategy = "pause"
+
         from sglang.srt.fault_tolerance.controller import is_ft_supported_config
 
         supported, reason = is_ft_supported_config(self)

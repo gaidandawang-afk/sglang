@@ -4,7 +4,6 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.fault_tolerance.exceptions import NpuFTMLPSyncInterrupted
 from sglang.srt.fault_tolerance.npu_communication import (
     all_gather_into_tensor_with_timeout,
 )
@@ -45,9 +44,7 @@ class TestNpuMLPSyncTimeout(unittest.TestCase):
                 "sglang.srt.fault_tolerance.npu_communication.dist.all_gather_into_tensor",
                 return_value=work,
             ),
-            self.assertRaisesRegex(
-                NpuFTMLPSyncInterrupted, "entering the FT control loop"
-            ),
+            self.assertRaisesRegex(RuntimeError, "entering the FT control loop"),
         ):
             all_gather_into_tensor_with_timeout(
                 torch.empty(3),
@@ -65,9 +62,7 @@ class TestNpuMLPSyncTimeout(unittest.TestCase):
                 "sglang.srt.fault_tolerance.npu_communication.dist.all_gather_into_tensor",
                 return_value=work,
             ),
-            self.assertRaisesRegex(
-                NpuFTMLPSyncInterrupted, "entering the FT control loop"
-            ),
+            self.assertRaisesRegex(RuntimeError, "entering the FT control loop"),
         ):
             all_gather_into_tensor_with_timeout(
                 torch.empty(3),
