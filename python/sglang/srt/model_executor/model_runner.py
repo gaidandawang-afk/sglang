@@ -1934,18 +1934,6 @@ class ModelRunner:
             device_id,
             stop_result,
         )
-        logger.info(
-            "Waiting 30 seconds after NPU stop for FORCE STOP to settle: "
-            "dp_rank=%s device_id=%s",
-            self.ps.dp_rank,
-            device_id,
-        )
-        time.sleep(30)
-        logger.info(
-            "NPU FORCE STOP settle wait complete: dp_rank=%s device_id=%s",
-            self.ps.dp_rank,
-            device_id,
-        )
         restart_result = torch_npu.npu.restart_device(device_id)
         logger.info(
             "NPU FT scale-down restart complete: dp_rank=%s device_id=%s result=%s",
