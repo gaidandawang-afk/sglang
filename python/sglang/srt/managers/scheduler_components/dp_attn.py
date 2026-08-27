@@ -157,6 +157,10 @@ class MLPSyncBatchInfo:
                 group=npu_ft_comm.mlp_sync_group,
                 timeout_sec=5,
             )
+            npu_ft_comm.record_mlp_sync_complete(
+                local_forward_mode=ForwardMode(self.local_forward_mode).name,
+                num_tokens=self.num_tokens,
+            )
             global_info_tensor[list(npu_ft_comm.active_original_ranks), 0] = gathered.to(
                 device=device
             )

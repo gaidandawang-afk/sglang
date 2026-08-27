@@ -758,6 +758,15 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
+        npu_ft_comm = None
+        if _is_npu:
+            from sglang.srt.fault_tolerance.npu_communication import (
+                get_npu_ft_communication,
+            )
+
+            npu_ft_comm = get_npu_ft_communication()
+            if npu_ft_comm is not None:
+                npu_ft_comm.record_device_dispatch_enter()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
@@ -778,6 +787,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 **(_npu_mc2_elastic_info_kwargs() if _is_npu else {}),
             )
         )
+        if npu_ft_comm is not None:
+            npu_ft_comm.record_device_dispatch_host_return()
         return packed_recv_hidden, self.packed_recv_count, event, hook
 
     def combine_a(

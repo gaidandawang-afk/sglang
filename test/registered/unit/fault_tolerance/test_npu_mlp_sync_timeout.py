@@ -5,11 +5,39 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.fault_tolerance.npu_communication import (
+    NpuFTCommunication,
     all_gather_into_tensor_with_timeout,
 )
 
 
 class TestNpuMLPSyncTimeout(unittest.TestCase):
+    def test_trace_correlates_mlp_sync_with_first_device_dispatch(self):
+        communication = NpuFTCommunication(
+            store=Mock(),
+            original_rank=2,
+            timeout_sec=5,
+            mlp_sync_group=Mock(),
+            active_original_ranks=(0, 1, 2, 3),
+        )
+
+        with self.assertLogs(
+            "sglang.srt.fault_tolerance.npu_communication", level="INFO"
+        ) as logs:
+            communication.record_mlp_sync_complete(
+                local_forward_mode="DECODE",
+                num_tokens=1,
+            )
+            communication.record_device_dispatch_enter()
+            communication.record_device_dispatch_enter()
+            communication.record_device_dispatch_host_return()
+            communication.record_device_dispatch_host_return()
+
+        self.assertEqual(len(logs.output), 3)
+        self.assertIn("mlp_sync_complete epoch=1", logs.output[0])
+        self.assertIn("device_dispatch_enter epoch=1", logs.output[1])
+        self.assertIn("forward_mode=DECODE", logs.output[1])
+        self.assertIn("device_dispatch_host_return epoch=1", logs.output[2])
+
     def test_mlp_sync_gather_has_bounded_wait(self):
         work = Mock()
         work.wait.return_value = True
