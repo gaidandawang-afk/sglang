@@ -1925,17 +1925,13 @@ class ModelRunner:
 
     def apply_fault_tolerance_scale_down(self, active_mask: list[bool]) -> None:
         state = ElasticEPStateManager.instance()
-        if _is_npu and self.server_args.elastic_ep_backend == "mc2":
-            import torch_npu
-
+        is_npu_ft_mc2 = _is_npu and self.server_args.elastic_ep_backend == "mc2"
+        if is_npu_ft_mc2:
             from sglang.srt.fault_tolerance.npu_communication import (
                 get_npu_ft_communication,
             )
 
-            device_id = torch_npu.npu.current_device()
-            get_npu_ft_communication().rebuild(
-                active_mask, torch.device("npu", device_id)
-            )
+            get_npu_ft_communication().rebuild_mlp_sync_group(active_mask)
         mask = torch.as_tensor(
             active_mask,
             dtype=state.active_ranks.dtype,
@@ -1943,10 +1939,15 @@ class ModelRunner:
         )
         state.active_ranks.copy_(mask)
         state.active_ranks_cpu.copy_(mask.detach().cpu())
-        for _ in self.eplb_manager.rebalance(force=True):
-            pass
-        if _is_npu and self.server_args.elastic_ep_backend == "mc2":
+        if is_npu_ft_mc2:
+            logger.info(
+                "Skipping NPU EPLB during fault-tolerance scale-down; "
+                "the original MC2 HCCL group will be reused with elastic info"
+            )
             state.update_npu_mc2_elastic_info()
+        else:
+            for _ in self.eplb_manager.rebalance(force=True):
+                pass
         state.snapshot_active_to_last()
 
     def update_model_fields(

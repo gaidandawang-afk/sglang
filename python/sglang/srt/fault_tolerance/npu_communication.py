@@ -6,10 +6,6 @@ from typing import Any, Sequence
 
 import torch
 import torch.distributed as dist
-from sglang.srt.eplb.process_group_context import (
-    EPLBProcessGroupContext,
-    set_eplb_process_group_context,
-)
 from torch.distributed import PrefixStore, TCPStore
 
 
@@ -33,7 +29,7 @@ class NpuFTCommunication:
     active_original_ranks: tuple[int, ...]
     generation: int = 0
 
-    def rebuild(self, active_mask: Sequence[bool], device: torch.device | str) -> None:
+    def rebuild_mlp_sync_group(self, active_mask: Sequence[bool]) -> None:
         active_ranks = tuple(rank for rank, active in enumerate(active_mask) if active)
         compact_rank = active_ranks.index(self.original_rank)
         generation = self.generation + 1
@@ -41,9 +37,6 @@ class NpuFTCommunication:
         prefix = f"npu-ft/{membership}/{generation}"
         timeout = timedelta(seconds=self.timeout_sec)
 
-        from sglang.srt.distributed.parallel_state import (
-            get_torch_distributed_pg_options,
-        )
         from sglang.srt.utils import init_custom_process_group
 
         mlp_sync_group = init_custom_process_group(
@@ -54,32 +47,11 @@ class NpuFTCommunication:
             rank=compact_rank,
             group_name=f"npu_ft_mlp_sync_{membership}_{generation}",
         )
-        eplb_group = init_custom_process_group(
-            backend="hccl",
-            store=PrefixStore(f"{prefix}/eplb", self.store),
-            timeout=timeout,
-            world_size=len(active_ranks),
-            rank=compact_rank,
-            group_name=f"npu_ft_eplb_{membership}_{generation}",
-            pg_options=get_torch_distributed_pg_options(
-                "moe_npu_ft_eplb_survivors"
-            ),
-            device_id=torch.device(device),
-        )
-
         dist.barrier(group=mlp_sync_group)
-        warmup = torch.zeros(1, dtype=torch.int32, device=device)
-        dist.all_reduce(warmup, group=eplb_group)
 
         self.mlp_sync_group = mlp_sync_group
         self.active_original_ranks = active_ranks
         self.generation = generation
-        set_eplb_process_group_context(
-            EPLBProcessGroupContext(
-                group=eplb_group,
-                active_original_ranks=active_ranks,
-            )
-        )
 
 _communication: NpuFTCommunication | None = None
 
