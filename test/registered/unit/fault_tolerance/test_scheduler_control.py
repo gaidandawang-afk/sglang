@@ -149,7 +149,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             {
                 "_run_event_loop_fault_tolerance",
                 "_run_fault_tolerance_control_loop",
-                "_run_npu_fault_tolerance_early_stop_sentinel",
                 "handle_fault_tolerance_command",
                 "_check_ft_pause_deadline",
                 "_ft_discard_inflight_window",
@@ -175,9 +174,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         cls.run_ft_loop = staticmethod(scheduler["_run_event_loop_fault_tolerance"])
         cls.run_ft_control_loop = staticmethod(
             scheduler["_run_fault_tolerance_control_loop"]
-        )
-        cls.run_npu_early_stop_sentinel = staticmethod(
-            scheduler["_run_npu_fault_tolerance_early_stop_sentinel"]
         )
         cls.handle_command = staticmethod(scheduler["handle_fault_tolerance_command"])
         cls.check_deadline = staticmethod(scheduler["_check_ft_pause_deadline"])
@@ -239,24 +235,19 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             device=lambda device_type, device_id: (device_type, device_id),
             npu=SimpleNamespace(set_device=Mock(), synchronize=Mock()),
         )
+        cls.fake_time = SimpleNamespace(sleep=Mock())
         model_runner = load_class_methods(
             REPO_ROOT / "python/sglang/srt/model_executor/model_runner.py",
             "ModelRunner",
-            {
-                "stop_npu_device_for_fault_tolerance_early_pause",
-                "recover_npu_device_for_fault_tolerance_scale_down",
-            },
+            {"recover_npu_device_for_fault_tolerance_scale_down"},
             {
                 "logger": logging.getLogger(__name__),
-                "os": SimpleNamespace(environ={}),
                 "threading": SimpleNamespace(
                     current_thread=lambda: SimpleNamespace(name="sentinel")
                 ),
+                "time": cls.fake_time,
                 "torch": cls.fake_torch,
             },
-        )
-        cls.stop_npu_early = staticmethod(
-            model_runner["stop_npu_device_for_fault_tolerance_early_pause"]
         )
         cls.recover_npu = staticmethod(
             model_runner["recover_npu_device_for_fault_tolerance_scale_down"]
@@ -266,7 +257,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         model_runner = SimpleNamespace(
             apply_fault_tolerance_scale_down=Mock(),
             recover_npu_device_for_fault_tolerance_scale_down=Mock(),
-            stop_npu_device_for_fault_tolerance_early_pause=Mock(),
         )
         return SimpleNamespace(
             ps=SimpleNamespace(
@@ -608,39 +598,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         sleep.assert_called_once_with(0.01)
         self.assertEqual(scheduler._check_ft_pause_deadline.call_count, 2)
 
-    def test_npu_early_stop_sentinel_handles_watchdog_signal_out_of_band(self):
-        scheduler = self.make_scheduler()
-        pipe_reader = SimpleNamespace(recv=Mock(side_effect=[0, EOFError()]))
-
-        self.run_npu_early_stop_sentinel(scheduler, pipe_reader)
-
-        stop = (
-            scheduler.tp_worker.model_runner.stop_npu_device_for_fault_tolerance_early_pause
-        )
-        stop.assert_called_once_with(0)
-
-    def test_npu_early_stop_binds_configured_device_before_stop(self):
-        calls = []
-        npu = SimpleNamespace(
-            current_device=lambda: calls.append(("current",)) or 2,
-            stop_device=lambda device_id: calls.append(("stop", device_id)) or 0,
-            restart_device=Mock(return_value=0),
-        )
-        torch_npu = ModuleType("torch_npu")
-        torch_npu.npu = npu
-        torch_npu.distributed = SimpleNamespace(reinit_process_group=Mock())
-        runner = SimpleNamespace(gpu_id=2, ps=SimpleNamespace(dp_rank=2))
-        self.fake_torch.npu.set_device = lambda device: calls.append(("set", device))
-
-        with patch.dict(sys.modules, {"torch_npu": torch_npu}):
-            self.stop_npu_early(runner, dead_rank=0)
-
-        self.assertEqual(
-            calls,
-            [("set", ("npu", 2)), ("current",), ("stop", 2)],
-        )
-
-    def test_npu_scale_down_matches_vllm_recovery_sequence(self):
+    def test_npu_scale_down_waits_for_force_stop_before_restart(self):
         calls = []
         npu = SimpleNamespace(
             current_device=lambda: 3,
@@ -655,6 +613,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         runner = SimpleNamespace(gpu_id=3, ps=SimpleNamespace(dp_rank=3))
         self.fake_torch.npu.set_device = lambda device: calls.append(("set", device))
         self.fake_torch.npu.synchronize = lambda: calls.append(("synchronize",))
+        self.fake_time.sleep = lambda seconds: calls.append(("sleep", seconds))
 
         with patch.dict(sys.modules, {"torch_npu": torch_npu}):
             self.recover_npu(runner)
@@ -664,6 +623,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             [
                 ("set", ("npu", 3)),
                 ("stop", 3),
+                ("sleep", 30),
                 ("restart", 3),
                 ("reinit", None, False),
                 ("synchronize",),
@@ -717,11 +677,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.dpc_globals["zmq"].Context = lambda: context
         dpc = SimpleNamespace(
             workers=[Sender(), Sender()],
-            scheduler_procs=[
-                SimpleNamespace(pid=100 + i, is_alive=lambda: True)
-                for i in range(3)
-            ],
-            scheduler_early_stop_writers=[Mock(), Mock(), Mock()],
+            scheduler_procs=[],
             scheduler_process_dp_ranks=[0, 1, 1],
             scheduler_process_global_ranks=[0, 2, 3],
             server_args=SimpleNamespace(node_rank=1),
@@ -745,9 +701,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertEqual(down.ranks, [2])
         self.assertEqual(heartbeat.ranks, [0, 2, 3])
         self.assertEqual(heartbeat.control_endpoint, "tcp://node1:2")
-        dpc.scheduler_early_stop_writers[0].send.assert_called_once_with(2)
-        dpc.scheduler_early_stop_writers[1].send.assert_not_called()
-        dpc.scheduler_early_stop_writers[2].send.assert_called_once_with(2)
 
     def test_shutdown_kills_every_local_member_of_target_dp(self):
         dpc, _ = self.make_dpc()

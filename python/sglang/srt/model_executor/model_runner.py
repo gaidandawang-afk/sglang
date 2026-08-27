@@ -18,7 +18,6 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
-import os
 import threading
 import time
 from dataclasses import dataclass
@@ -1914,34 +1913,6 @@ class ModelRunner:
             )
         return output
 
-    def stop_npu_device_for_fault_tolerance_early_pause(self, dead_rank: int) -> None:
-        import torch_npu
-
-        device_id = self.gpu_id
-        torch.npu.set_device(torch.device("npu", device_id))
-        bound_device = torch_npu.npu.current_device()
-        logger.info(
-            "NPU FT early-stop begin: dead_rank=%s dp_rank=%s configured_device=%s "
-            "bound_device=%s thread=%s "
-            "ASCEND_RT_VISIBLE_DEVICES=%s NPU_VISIBLE_DEVICES=%s",
-            dead_rank,
-            self.ps.dp_rank,
-            device_id,
-            bound_device,
-            threading.current_thread().name,
-            os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
-            os.environ.get("NPU_VISIBLE_DEVICES"),
-        )
-        result = torch_npu.npu.stop_device(device_id)
-        logger.info(
-            "NPU FT early-stop complete: dead_rank=%s dp_rank=%s device_id=%s "
-            "result=%s",
-            dead_rank,
-            self.ps.dp_rank,
-            device_id,
-            result,
-        )
-
     def recover_npu_device_for_fault_tolerance_scale_down(self) -> None:
         import torch_npu
 
@@ -1962,6 +1933,18 @@ class ModelRunner:
             self.ps.dp_rank,
             device_id,
             stop_result,
+        )
+        logger.info(
+            "Waiting 30 seconds after NPU stop for FORCE STOP to settle: "
+            "dp_rank=%s device_id=%s",
+            self.ps.dp_rank,
+            device_id,
+        )
+        time.sleep(30)
+        logger.info(
+            "NPU FORCE STOP settle wait complete: dp_rank=%s device_id=%s",
+            self.ps.dp_rank,
+            device_id,
         )
         restart_result = torch_npu.npu.restart_device(device_id)
         logger.info(
