@@ -1921,10 +1921,15 @@ class ModelRunner:
                 get_npu_ft_communication,
             )
 
-            torch_npu.npu.stop_device(self.gpu_id)
-            torch_npu.npu.restart_device(self.gpu_id)
+            device_id = torch_npu.npu.current_device()
+            logger.info(
+                "Recovering NPU device %s for fault-tolerance scale-down", device_id
+            )
+            torch_npu.npu.stop_device(device_id)
+            torch_npu.npu.restart_device(device_id)
+            torch_npu.distributed.reinit_process_group(None, False)
             get_npu_ft_communication().rebuild(
-                active_mask, torch.device("npu", self.gpu_id)
+                active_mask, torch.device("npu", device_id)
             )
         mask = torch.as_tensor(
             active_mask,
