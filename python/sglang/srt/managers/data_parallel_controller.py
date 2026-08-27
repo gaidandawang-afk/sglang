@@ -225,6 +225,7 @@ class DataParallelController:
         self.scheduler_procs = []
         self.scheduler_process_dp_ranks: List[int] = []
         self.scheduler_process_global_ranks: List[int] = []
+        self.scheduler_early_stop_writers = []
         self.workers: List[Optional[zmq.Socket]] = [None] * self.max_dp_size
         self.status: List[bool] = list(self.dp_active)
         self._active_workers: List[int] = list(range(self.launch_dp_size))
@@ -315,6 +316,28 @@ class DataParallelController:
             dp_rank,
             proc.pid,
         )
+        for survivor_index, writer in enumerate(self.scheduler_early_stop_writers):
+            if survivor_index == index or writer is None:
+                continue
+            survivor_proc = self.scheduler_procs[survivor_index]
+            if not survivor_proc.is_alive():
+                continue
+            try:
+                writer.send(global_rank)
+                logger.info(
+                    "Sent NPU FT early-stop: dead_global_rank=%s "
+                    "survivor_global_rank=%s survivor_pid=%s",
+                    global_rank,
+                    self.scheduler_process_global_ranks[survivor_index],
+                    survivor_proc.pid,
+                )
+            except (BrokenPipeError, EOFError, OSError):
+                logger.exception(
+                    "Failed to send NPU FT early-stop: dead_global_rank=%s "
+                    "survivor_global_rank=%s",
+                    global_rank,
+                    self.scheduler_process_global_ranks[survivor_index],
+                )
         sock_send(
             self._get_watchdog_sender(),
             ProcessActiveRanksOutput(ranks=[global_rank], active=False),
@@ -818,6 +841,14 @@ class DataParallelController:
                     rank_port_args.instance_id = port_args.instance_id
 
                 reader, writer = mp.Pipe(duplex=False)
+                early_stop_reader = None
+                early_stop_writer = None
+                if (
+                    server_args.enable_fault_tolerance
+                    and server_args.device == "npu"
+                    and server_args.elastic_ep_backend == "mc2"
+                ):
+                    early_stop_reader, early_stop_writer = mp.Pipe(duplex=False)
                 gpu_id = (
                     server_args.base_gpu_id
                     + base_gpu_id
@@ -871,6 +902,7 @@ class DataParallelController:
                             display_tp_rank,
                             display_dp_rank,
                             display_moe_ep_rank,
+                            early_stop_reader,
                         ),
                     )
                     with (
@@ -879,6 +911,7 @@ class DataParallelController:
                     ):
                         proc.start()
                 self.scheduler_procs.append(proc)
+                self.scheduler_early_stop_writers.append(early_stop_writer)
                 if server_args.enable_fault_tolerance:
                     self.scheduler_process_dp_ranks.append(dp_rank)
                     rank_offset = (

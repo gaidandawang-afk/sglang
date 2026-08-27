@@ -19,6 +19,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from array import array
 from collections import deque
@@ -1599,6 +1600,23 @@ class Scheduler(
             self._check_ft_pause_deadline()
             if self._engine_paused and not ft_reqs:
                 time.sleep(0.01)
+
+    def _run_npu_fault_tolerance_early_stop_sentinel(self, pipe_reader) -> None:
+        while True:
+            try:
+                dead_rank = pipe_reader.recv()
+            except (EOFError, OSError):
+                return
+            try:
+                self.tp_worker.model_runner.stop_npu_device_for_fault_tolerance_early_pause(
+                    dead_rank
+                )
+            except Exception:
+                logger.exception(
+                    "NPU FT early-stop failed: dead_global_rank=%s dp_rank=%s",
+                    dead_rank,
+                    self.ps.dp_rank,
+                )
 
     def _ft_discard_inflight_window(self, reason) -> bool:
         window_batches = [
@@ -4878,6 +4896,7 @@ def run_scheduler_process(
     display_tp_rank: Optional[int] = None,
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
+    npu_ft_early_stop_reader=None,
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
@@ -4924,6 +4943,13 @@ def run_scheduler_process(
             moe_dp_rank,
             dp_rank,
         )
+        if npu_ft_early_stop_reader is not None:
+            threading.Thread(
+                target=scheduler._run_npu_fault_tolerance_early_stop_sentinel,
+                args=(npu_ft_early_stop_reader,),
+                daemon=True,
+                name="NPUFTEarlyStopSentinel",
+            ).start()
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())

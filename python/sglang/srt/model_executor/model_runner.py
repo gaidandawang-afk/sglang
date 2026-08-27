@@ -18,6 +18,8 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -1912,16 +1914,74 @@ class ModelRunner:
             )
         return output
 
+    def stop_npu_device_for_fault_tolerance_early_pause(self, dead_rank: int) -> None:
+        import torch_npu
+
+        device_id = self.gpu_id
+        torch.npu.set_device(torch.device("npu", device_id))
+        bound_device = torch_npu.npu.current_device()
+        logger.info(
+            "NPU FT early-stop begin: dead_rank=%s dp_rank=%s configured_device=%s "
+            "bound_device=%s thread=%s "
+            "ASCEND_RT_VISIBLE_DEVICES=%s NPU_VISIBLE_DEVICES=%s",
+            dead_rank,
+            self.ps.dp_rank,
+            device_id,
+            bound_device,
+            threading.current_thread().name,
+            os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
+            os.environ.get("NPU_VISIBLE_DEVICES"),
+        )
+        result = torch_npu.npu.stop_device(device_id)
+        logger.info(
+            "NPU FT early-stop complete: dead_rank=%s dp_rank=%s device_id=%s "
+            "result=%s",
+            dead_rank,
+            self.ps.dp_rank,
+            device_id,
+            result,
+        )
+
     def recover_npu_device_for_fault_tolerance_scale_down(self) -> None:
         import torch_npu
 
-        device_id = torch_npu.npu.current_device()
+        device_id = self.gpu_id
+        torch.npu.set_device(torch.device("npu", device_id))
+        bound_device = torch_npu.npu.current_device()
         logger.info(
-            "Recovering NPU device %s for fault-tolerance scale-down", device_id
+            "Recovering NPU for fault-tolerance scale-down: dp_rank=%s "
+            "configured_device=%s bound_device=%s thread=%s",
+            self.ps.dp_rank,
+            device_id,
+            bound_device,
+            threading.current_thread().name,
         )
-        torch_npu.npu.stop_device(device_id)
-        torch_npu.npu.restart_device(device_id)
+        stop_result = torch_npu.npu.stop_device(device_id)
+        logger.info(
+            "NPU FT scale-down stop complete: dp_rank=%s device_id=%s result=%s",
+            self.ps.dp_rank,
+            device_id,
+            stop_result,
+        )
+        restart_result = torch_npu.npu.restart_device(device_id)
+        logger.info(
+            "NPU FT scale-down restart complete: dp_rank=%s device_id=%s result=%s",
+            self.ps.dp_rank,
+            device_id,
+            restart_result,
+        )
         torch_npu.distributed.reinit_process_group(None, False)
+        logger.info(
+            "NPU FT scale-down process-group reinit complete: dp_rank=%s device_id=%s",
+            self.ps.dp_rank,
+            device_id,
+        )
+        torch.npu.synchronize()
+        logger.info(
+            "NPU FT scale-down synchronize complete: dp_rank=%s device_id=%s",
+            self.ps.dp_rank,
+            device_id,
+        )
 
     def apply_fault_tolerance_scale_down(self, active_mask: list[bool]) -> None:
         state = ElasticEPStateManager.instance()
