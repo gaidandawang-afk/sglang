@@ -1610,7 +1610,7 @@ class Scheduler(
                             )
                         except Exception:
                             logger.exception(
-                                "NPU FT failed to stop device after scheduler "
+                                "NPU FT failed to reset device after scheduler "
                                 "exception: dp_rank=%s",
                                 self.ps.dp_rank,
                             )

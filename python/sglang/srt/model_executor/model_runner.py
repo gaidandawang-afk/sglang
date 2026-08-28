@@ -1957,6 +1957,46 @@ class ModelRunner:
             device_id,
             result,
         )
+        logger.info(
+            "NPU FT pause step=early_restart_device phase=begin dp_rank=%s "
+            "device_id=%s",
+            self.ps.dp_rank,
+            device_id,
+        )
+        restart_result = torch_npu.npu.restart_device(device_id)
+        logger.info(
+            "NPU FT pause step=early_restart_device phase=complete dp_rank=%s "
+            "device_id=%s result=%s",
+            self.ps.dp_rank,
+            device_id,
+            restart_result,
+        )
+        logger.info(
+            "NPU FT pause step=early_reinit_process_group phase=begin dp_rank=%s "
+            "device_id=%s rebuild_link=false",
+            self.ps.dp_rank,
+            device_id,
+        )
+        torch_npu.distributed.reinit_process_group(None, False)
+        logger.info(
+            "NPU FT pause step=early_reinit_process_group phase=complete "
+            "dp_rank=%s device_id=%s rebuild_link=false",
+            self.ps.dp_rank,
+            device_id,
+        )
+        logger.info(
+            "NPU FT pause step=early_synchronize phase=begin dp_rank=%s "
+            "device_id=%s",
+            self.ps.dp_rank,
+            device_id,
+        )
+        torch.npu.synchronize()
+        logger.info(
+            "NPU FT pause step=early_synchronize phase=complete dp_rank=%s "
+            "device_id=%s quarantine=enabled",
+            self.ps.dp_rank,
+            device_id,
+        )
 
     def recover_npu_device_for_fault_tolerance_scale_down(self) -> None:
         import torch_npu
@@ -2020,14 +2060,14 @@ class ModelRunner:
         )
         logger.info(
             "NPU FT device recovery step=reinit_process_group phase=begin "
-            "dp_rank=%s device_id=%s rebuild_all_resources=false",
+            "dp_rank=%s device_id=%s rebuild_link=false",
             self.ps.dp_rank,
             device_id,
         )
         torch_npu.distributed.reinit_process_group(None, False)
         logger.info(
             "NPU FT device recovery step=reinit_process_group phase=complete "
-            "dp_rank=%s device_id=%s rebuild_all_resources=false",
+            "dp_rank=%s device_id=%s rebuild_link=false",
             self.ps.dp_rank,
             device_id,
         )
@@ -2118,6 +2158,17 @@ class ModelRunner:
             self.ps.dp_rank,
             output.can_run_graph,
         )
+        state = ElasticEPStateManager.instance()
+        if (
+            state.npu_mc2_elastic_info is not None
+            and state.npu_mc2_elastic_info.dispatch_validation_pending
+        ):
+            logger.warning(
+                "NPU FT MC2 dispatch step=validate_expert_ids phase=skipped "
+                "dp_rank=%s reason=graph_replay_or_no_mc2_dispatch",
+                self.ps.dp_rank,
+            )
+            state.npu_mc2_elastic_info.consume_dispatch_validation()
 
     def synchronize_npu_fault_tolerance_health_gate(self) -> None:
         logger.info(
@@ -2178,9 +2229,81 @@ class ModelRunner:
                 self.ps.dp_rank,
             )
             state.update_npu_mc2_elastic_info()
+            from sglang.srt.elastic_ep.npu_mc2 import (
+                build_mc2_elastic_info,
+                validate_mc2_scale_down_routing,
+            )
+
+            mc2_info = state.npu_mc2_elastic_info
+            actual_elastic_info = mc2_info.tensor.detach().cpu()
+            expected_elastic_info = build_mc2_elastic_info(
+                active_mask,
+                original_ep_size=mc2_info.original_ep_size,
+                num_local_physical_experts=mc2_info.num_local_physical_experts,
+            )
             logger.info(
                 "NPU FT elastic step=update_mc2_elastic_info phase=complete "
-                "dp_rank=%s original_hccl_group=reused",
+                "dp_rank=%s original_hccl_group=reused elastic_info=%s "
+                "expected_elastic_info=%s",
+                self.ps.dp_rank,
+                actual_elastic_info.tolist(),
+                expected_elastic_info.tolist(),
+            )
+            if not torch.equal(actual_elastic_info, expected_elastic_info):
+                logger.error(
+                    "NPU FT elastic step=update_mc2_elastic_info phase=failed "
+                    "dp_rank=%s reason=payload_mismatch",
+                    self.ps.dp_rank,
+                )
+                raise RuntimeError(
+                    "NPU FT MC2 elastic_info does not match active ranks: "
+                    f"actual={actual_elastic_info.tolist()} "
+                    f"expected={expected_elastic_info.tolist()}"
+                )
+
+            expert_location = get_global_expert_location_metadata()
+            logger.info(
+                "NPU FT elastic step=validate_mc2_routing phase=begin "
+                "dp_rank=%s ep_dispatch_algorithm=%s",
+                self.ps.dp_rank,
+                self.server_args.ep_dispatch_algorithm,
+            )
+            try:
+                routing_summary = validate_mc2_scale_down_routing(
+                    active_mask,
+                    original_ep_size=mc2_info.original_ep_size,
+                    num_local_physical_experts=(
+                        mc2_info.num_local_physical_experts
+                    ),
+                    ep_dispatch_algorithm=self.server_args.ep_dispatch_algorithm,
+                    logical_to_all_physical_map=(
+                        expert_location.logical_to_all_physical_map
+                    ),
+                    logical_to_all_physical_map_num_valid=(
+                        expert_location.logical_to_all_physical_map_num_valid
+                    ),
+                    logical_to_rank_dispatch_physical_map=(
+                        expert_location.logical_to_rank_dispatch_physical_map
+                    ),
+                )
+            except Exception as exc:
+                logger.error(
+                    "NPU FT elastic step=validate_mc2_routing phase=failed "
+                    "dp_rank=%s error=%s",
+                    self.ps.dp_rank,
+                    exc,
+                )
+                raise
+            logger.info(
+                "NPU FT elastic step=validate_mc2_routing phase=complete "
+                "dp_rank=%s summary=%s",
+                self.ps.dp_rank,
+                routing_summary,
+            )
+            mc2_info.arm_dispatch_validation()
+            logger.info(
+                "NPU FT MC2 dispatch step=validate_expert_ids phase=armed "
+                "dp_rank=%s",
                 self.ps.dp_rank,
             )
         else:
