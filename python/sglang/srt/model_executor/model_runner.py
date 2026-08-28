@@ -1992,6 +1992,19 @@ class ModelRunner:
             stop_result,
         )
         logger.info(
+            "NPU FT device recovery step=recover_torch_npu_stream_pool "
+            "phase=begin dp_rank=%s device_id=%s",
+            self.ps.dp_rank,
+            device_id,
+        )
+        torch_npu._C._recovery_all_npu_stream(device_id)
+        logger.info(
+            "NPU FT device recovery step=recover_torch_npu_stream_pool "
+            "phase=complete dp_rank=%s device_id=%s",
+            self.ps.dp_rank,
+            device_id,
+        )
+        logger.info(
             "NPU FT device recovery step=restart_device phase=begin dp_rank=%s "
             "device_id=%s",
             self.ps.dp_rank,

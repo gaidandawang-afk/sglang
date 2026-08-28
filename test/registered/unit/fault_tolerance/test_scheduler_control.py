@@ -897,6 +897,11 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         )
         torch_npu = ModuleType("torch_npu")
         torch_npu.npu = npu
+        torch_npu._C = SimpleNamespace(
+            _recovery_all_npu_stream=lambda device_id: calls.append(
+                ("recover_stream_pool", device_id)
+            )
+        )
         torch_npu.distributed = SimpleNamespace(
             reinit_process_group=lambda *args: calls.append(("reinit", *args))
         )
@@ -913,6 +918,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             [
                 ("set", ("npu", 3)),
                 ("stop", 3),
+                ("recover_stream_pool", 3),
                 ("restart", 3),
                 ("reinit", None, False),
                 ("synchronize",),
@@ -924,6 +930,8 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             "step=bind_device phase=complete",
             "step=stop_device phase=begin",
             "step=stop_device phase=complete",
+            "step=recover_torch_npu_stream_pool phase=begin",
+            "step=recover_torch_npu_stream_pool phase=complete",
             "step=restart_device phase=begin",
             "step=restart_device phase=complete",
             "step=reinit_process_group phase=begin",
