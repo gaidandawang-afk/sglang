@@ -335,15 +335,15 @@ class BaseRunner(ABC):
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
         )
 
-    def _dummy_run(
+    def _prepare_dummy_forward_batch(
         self,
         batch_size: int,
-        run_ctx=None,
         forward_mode_override: Optional[ForwardMode] = None,
         *,
         buffers,
+        active_mask: Optional[list[bool]] = None,
     ):
-        """Run a dummy forward pass for warmup/profiling.
+        """Build a dummy ForwardBatch without choosing its execution path.
 
         forward_mode_override forces EXTEND/DECODE regardless of
         is_generation (used by the PP-parallel DeepGEMM warmup).
@@ -463,6 +463,7 @@ class BaseRunner(ABC):
             extend_prefix_lens = None
             extend_start_loc = None
 
+        pp_proxy_tensors = None
         if mr.server_args.pp_size > 1:
             # PP0 already cp-split hidden_states before send.
             pp_hidden_tokens = num_tokens
@@ -483,7 +484,16 @@ class BaseRunner(ABC):
             assert require_mlp_tp_gather_ or require_attn_tp_gather_
 
         if require_mlp_tp_gather_:
-            global_num_tokens_cpu = [num_tokens] * mr.server_args.dp_size
+            if active_mask is None:
+                global_num_tokens_cpu = [num_tokens] * mr.server_args.dp_size
+            else:
+                if len(active_mask) != mr.server_args.dp_size:
+                    raise ValueError(
+                        "dummy active_mask size does not match data parallel size"
+                    )
+                global_num_tokens_cpu = [
+                    num_tokens if active else 0 for active in active_mask
+                ]
         elif require_attn_tp_gather_:
             global_num_tokens_cpu = [num_tokens]
         else:
@@ -549,6 +559,7 @@ class BaseRunner(ABC):
             extend_start_loc=extend_start_loc,
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
+            original_global_num_tokens_cpu=global_num_tokens_cpu,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_cpu=global_num_tokens_cpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
@@ -560,6 +571,7 @@ class BaseRunner(ABC):
             capture_hidden_mode=capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=capture_forward_mode,
+            can_run_dp_cuda_graph=True,
             lora_ids=lora_ids,
         )
 
@@ -571,6 +583,69 @@ class BaseRunner(ABC):
             mr.lora_manager.prepare_lora_batch(forward_batch)
 
         forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
+        return (
+            forward_batch,
+            pp_proxy_tensors,
+            global_dp_buffer_len,
+            num_tokens,
+            global_num_tokens_cpu,
+        )
+
+    def run_dummy_via_model_runner(
+        self,
+        batch_size: int,
+        active_mask: Optional[list[bool]] = None,
+    ):
+        """Run a dummy decode through ModelRunner's normal graph/eager dispatch."""
+        mr = self.model_runner
+        buffers = self._alloc_dummy_decode_buffers(batch_size)
+        (
+            forward_batch,
+            pp_proxy_tensors,
+            global_dp_buffer_len,
+            num_tokens,
+            global_num_tokens_cpu,
+        ) = self._prepare_dummy_forward_batch(
+            batch_size,
+            buffers=buffers,
+            active_mask=active_mask,
+        )
+
+        forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+        set_dp_buffer_len(
+            global_dp_buffer_len,
+            num_tokens,
+            forward_batch.dp_padding_mode.is_max_len(),
+            global_num_tokens_cpu,
+        )
+        set_is_extend_in_batch(False)
+        with torch.inference_mode():
+            return mr.forward(
+                forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+
+    def _dummy_run(
+        self,
+        batch_size: int,
+        run_ctx=None,
+        forward_mode_override: Optional[ForwardMode] = None,
+        *,
+        buffers,
+    ):
+        """Run a direct dummy forward pass for warmup/profiling."""
+        mr = self.model_runner
+        (
+            forward_batch,
+            pp_proxy_tensors,
+            global_dp_buffer_len,
+            num_tokens,
+            global_num_tokens_cpu,
+        ) = self._prepare_dummy_forward_batch(
+            batch_size,
+            forward_mode_override=forward_mode_override,
+            buffers=buffers,
+        )
         mr.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
@@ -588,8 +663,9 @@ class BaseRunner(ABC):
 
             kwargs = {}
             if (
-                mr.server_args.pp_size > 1
-                and "pp_proxy_tensors" in inspect.signature(mr.model.forward).parameters
+                pp_proxy_tensors is not None
+                and "pp_proxy_tensors"
+                in inspect.signature(mr.model.forward).parameters
             ):
                 kwargs["pp_proxy_tensors"] = PPProxyTensors(
                     {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
@@ -598,7 +674,7 @@ class BaseRunner(ABC):
                 kwargs["get_embedding"] = True
 
             logits_output_or_pp_proxy_tensors = mr.model.forward(
-                input_ids,
+                forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
                 **kwargs,

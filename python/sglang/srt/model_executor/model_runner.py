@@ -1922,44 +1922,193 @@ class ModelRunner:
             )
         return output
 
-    def recover_npu_device_for_fault_tolerance_scale_down(self) -> None:
+    def stop_npu_device_after_scheduler_exception(self, reason: Exception) -> None:
         import torch_npu
 
         device_id = self.gpu_id
+        logger.info(
+            "NPU FT pause step=bind_device phase=begin dp_rank=%s device_id=%s",
+            self.ps.dp_rank,
+            device_id,
+        )
         torch.npu.set_device(torch.device("npu", device_id))
         bound_device = torch_npu.npu.current_device()
         logger.info(
-            "Recovering NPU for fault-tolerance scale-down: dp_rank=%s "
+            "NPU FT pause step=bind_device phase=complete dp_rank=%s "
             "configured_device=%s bound_device=%s",
             self.ps.dp_rank,
             device_id,
             bound_device,
         )
+        logger.info(
+            "NPU FT pause step=early_stop_device phase=begin reason=%s "
+            "dp_rank=%s device_id=%s",
+            reason,
+            self.ps.dp_rank,
+            device_id,
+        )
+        result = torch_npu.npu.stop_device(device_id)
+        if result != 0:
+            raise RuntimeError(f"stop_device({device_id}) returned {result}")
+        logger.info(
+            "NPU FT pause step=early_stop_device phase=complete dp_rank=%s "
+            "device_id=%s result=%s",
+            self.ps.dp_rank,
+            device_id,
+            result,
+        )
+
+    def recover_npu_device_for_fault_tolerance_scale_down(self) -> None:
+        import torch_npu
+
+        device_id = self.gpu_id
+        logger.info(
+            "NPU FT device recovery step=bind_device phase=begin dp_rank=%s "
+            "device_id=%s",
+            self.ps.dp_rank,
+            device_id,
+        )
+        torch.npu.set_device(torch.device("npu", device_id))
+        bound_device = torch_npu.npu.current_device()
+        logger.info(
+            "NPU FT device recovery step=bind_device phase=complete dp_rank=%s "
+            "configured_device=%s bound_device=%s",
+            self.ps.dp_rank,
+            device_id,
+            bound_device,
+        )
+        logger.info(
+            "NPU FT device recovery step=stop_device phase=begin dp_rank=%s "
+            "device_id=%s",
+            self.ps.dp_rank,
+            device_id,
+        )
         stop_result = torch_npu.npu.stop_device(device_id)
         logger.info(
-            "NPU FT scale-down stop complete: dp_rank=%s device_id=%s result=%s",
+            "NPU FT device recovery step=stop_device phase=complete dp_rank=%s "
+            "device_id=%s result=%s",
             self.ps.dp_rank,
             device_id,
             stop_result,
         )
+        logger.info(
+            "NPU FT device recovery step=restart_device phase=begin dp_rank=%s "
+            "device_id=%s",
+            self.ps.dp_rank,
+            device_id,
+        )
         restart_result = torch_npu.npu.restart_device(device_id)
         logger.info(
-            "NPU FT scale-down restart complete: dp_rank=%s device_id=%s result=%s",
+            "NPU FT device recovery step=restart_device phase=complete dp_rank=%s "
+            "device_id=%s result=%s",
             self.ps.dp_rank,
             device_id,
             restart_result,
         )
+        logger.info(
+            "NPU FT device recovery step=reinit_process_group phase=begin "
+            "dp_rank=%s device_id=%s rebuild_all_resources=false",
+            self.ps.dp_rank,
+            device_id,
+        )
         torch_npu.distributed.reinit_process_group(None, False)
         logger.info(
-            "NPU FT scale-down process-group reinit complete: dp_rank=%s device_id=%s",
+            "NPU FT device recovery step=reinit_process_group phase=complete "
+            "dp_rank=%s device_id=%s rebuild_all_resources=false",
+            self.ps.dp_rank,
+            device_id,
+        )
+        logger.info(
+            "NPU FT device recovery step=post_reinit_synchronize phase=begin "
+            "dp_rank=%s device_id=%s",
             self.ps.dp_rank,
             device_id,
         )
         torch.npu.synchronize()
         logger.info(
-            "NPU FT scale-down synchronize complete: dp_rank=%s device_id=%s",
+            "NPU FT device recovery step=post_reinit_synchronize phase=complete "
+            "dp_rank=%s device_id=%s",
             self.ps.dp_rank,
             device_id,
+        )
+
+    def run_npu_fault_tolerance_device_probe(self, recovery_stream) -> None:
+        device_module = torch.get_device_module(self.device)
+        with device_module.stream(recovery_stream):
+            logger.info(
+                "NPU FT device probe step=minimal_kernel phase=begin dp_rank=%s "
+                "stream=%s",
+                self.ps.dp_rank,
+                getattr(recovery_stream, "stream_id", None),
+            )
+            probe = torch.ones((1,), dtype=torch.float32, device=self.device)
+            probe_result = probe + 1
+            logger.info(
+                "NPU FT device probe step=minimal_kernel phase=complete dp_rank=%s "
+                "stream=%s",
+                self.ps.dp_rank,
+                getattr(recovery_stream, "stream_id", None),
+            )
+            logger.info(
+                "NPU FT device probe step=d2h_copy phase=begin dp_rank=%s "
+                "stream=%s",
+                self.ps.dp_rank,
+                getattr(recovery_stream, "stream_id", None),
+            )
+            probe_cpu = probe_result.cpu()
+            logger.info(
+                "NPU FT device probe step=d2h_copy phase=complete dp_rank=%s "
+                "stream=%s",
+                self.ps.dp_rank,
+                getattr(recovery_stream, "stream_id", None),
+            )
+        logger.info(
+            "NPU FT device probe step=stream_synchronize phase=begin dp_rank=%s "
+            "stream=%s",
+            self.ps.dp_rank,
+            getattr(recovery_stream, "stream_id", None),
+        )
+        recovery_stream.synchronize()
+        logger.info(
+            "NPU FT device probe step=stream_synchronize phase=complete dp_rank=%s "
+            "stream=%s",
+            self.ps.dp_rank,
+            getattr(recovery_stream, "stream_id", None),
+        )
+        if probe_cpu.item() != 2:
+            raise RuntimeError("NPU FT device probe returned an unexpected value")
+        logger.info(
+            "NPU FT device probe step=validate_result phase=complete dp_rank=%s",
+            self.ps.dp_rank,
+        )
+
+    def run_npu_fault_tolerance_dummy_batch(self, active_mask: list[bool]) -> None:
+        logger.info(
+            "NPU FT dummy step=model_runner_forward phase=begin dp_rank=%s "
+            "active_mask=%s",
+            self.ps.dp_rank,
+            active_mask,
+        )
+        output = self.eager_runner.run_dummy_via_model_runner(
+            batch_size=1,
+            active_mask=active_mask,
+        )
+        logger.info(
+            "NPU FT dummy step=model_runner_forward phase=complete dp_rank=%s "
+            "graph_replayed=%s",
+            self.ps.dp_rank,
+            output.can_run_graph,
+        )
+
+    def synchronize_npu_fault_tolerance_health_gate(self) -> None:
+        logger.info(
+            "NPU FT health gate step=device_synchronize phase=begin dp_rank=%s",
+            self.ps.dp_rank,
+        )
+        torch.get_device_module(self.device).synchronize()
+        logger.info(
+            "NPU FT health gate step=device_synchronize phase=complete dp_rank=%s",
+            self.ps.dp_rank,
         )
 
     def apply_fault_tolerance_scale_down(self, active_mask: list[bool]) -> None:
@@ -1970,7 +2119,22 @@ class ModelRunner:
                 get_npu_ft_communication,
             )
 
+            logger.info(
+                "NPU FT elastic step=rebuild_mlp_sync_group phase=begin "
+                "dp_rank=%s active_mask=%s",
+                self.ps.dp_rank,
+                active_mask,
+            )
             get_npu_ft_communication().rebuild_mlp_sync_group(active_mask)
+            logger.info(
+                "NPU FT elastic step=rebuild_mlp_sync_group phase=complete "
+                "dp_rank=%s",
+                self.ps.dp_rank,
+            )
+        logger.info(
+            "NPU FT elastic step=update_active_mask phase=begin dp_rank=%s",
+            self.ps.dp_rank,
+        )
         mask = torch.as_tensor(
             active_mask,
             dtype=state.active_ranks.dtype,
@@ -1978,16 +2142,40 @@ class ModelRunner:
         )
         state.active_ranks.copy_(mask)
         state.active_ranks_cpu.copy_(mask.detach().cpu())
+        logger.info(
+            "NPU FT elastic step=update_active_mask phase=complete dp_rank=%s "
+            "active_mask=%s",
+            self.ps.dp_rank,
+            active_mask,
+        )
         if is_npu_ft_mc2:
             logger.info(
                 "Skipping NPU EPLB during fault-tolerance scale-down; "
                 "the original MC2 HCCL group will be reused with elastic info"
             )
+            logger.info(
+                "NPU FT elastic step=update_mc2_elastic_info phase=begin "
+                "dp_rank=%s",
+                self.ps.dp_rank,
+            )
             state.update_npu_mc2_elastic_info()
+            logger.info(
+                "NPU FT elastic step=update_mc2_elastic_info phase=complete "
+                "dp_rank=%s original_hccl_group=reused",
+                self.ps.dp_rank,
+            )
         else:
             for _ in self.eplb_manager.rebalance(force=True):
                 pass
+        logger.info(
+            "NPU FT elastic step=snapshot_active_mask phase=begin dp_rank=%s",
+            self.ps.dp_rank,
+        )
         state.snapshot_active_to_last()
+        logger.info(
+            "NPU FT elastic step=snapshot_active_mask phase=complete dp_rank=%s",
+            self.ps.dp_rank,
+        )
 
     def update_model_fields(
         self,

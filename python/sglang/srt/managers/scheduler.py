@@ -1554,22 +1554,30 @@ class Scheduler(
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
-        with self.device_module.StreamContext(self.schedule_stream):
-            if self.server_args.enable_fault_tolerance:
-                self._run_event_loop_fault_tolerance()
-            else:
+        if self.server_args.enable_fault_tolerance:
+            self._run_event_loop_fault_tolerance()
+        else:
+            with self.device_module.StreamContext(self.schedule_stream):
                 dispatch_event_loop(self)
 
     def _run_event_loop_fault_tolerance(self) -> None:
         while True:
             try:
-                dispatch_event_loop(self)
+                with self.device_module.StreamContext(self.schedule_stream):
+                    dispatch_event_loop(self)
                 return
             except Exception as exc:
                 defer_discard = (
                     _is_npu and self.server_args.elastic_ep_backend == "mc2"
                 )
                 if defer_discard:
+                    logger.warning(
+                        "NPU FT pause step=exit_faulted_schedule_stream "
+                        "phase=complete dp_rank=%s schedule_stream=%s error=%s",
+                        self.ps.dp_rank,
+                        getattr(self.schedule_stream, "stream_id", None),
+                        exc,
+                    )
                     self._ft_pending_discard_reason = str(exc)
                     recovered = False
                     logger.warning(
@@ -1589,6 +1597,23 @@ class Scheduler(
                         time.monotonic()
                         + self.server_args.fault_tolerance_pause_timeout
                     )
+                    if defer_discard:
+                        logger.info(
+                            "NPU FT pause step=self_pause phase=complete "
+                            "dp_rank=%s deadline=%s",
+                            self.ps.dp_rank,
+                            self._ft_pause_deadline,
+                        )
+                        try:
+                            self.tp_worker.model_runner.stop_npu_device_after_scheduler_exception(
+                                exc
+                            )
+                        except Exception:
+                            logger.exception(
+                                "NPU FT failed to stop device after scheduler "
+                                "exception: dp_rank=%s",
+                                self.ps.dp_rank,
+                            )
                 self.ipc_channels.send_to_tokenizer.send_output(
                     FaultToleranceRankFaultOutput(
                         rank=self.ps.dp_rank,
@@ -1597,6 +1622,36 @@ class Scheduler(
                 )
                 if should_continue:
                     continue
+                self._run_fault_tolerance_control_loop()
+
+    def _run_fault_tolerance_control_loop(self) -> None:
+        logger.info(
+            "NPU FT control step=host_control_loop phase=begin dp_rank=%s",
+            self.ps.dp_rank,
+        )
+        while self._engine_paused:
+            recv_reqs = self.request_receiver.recv_requests()
+            ft_reqs = [
+                recv_req
+                for recv_req in recv_reqs
+                if isinstance(recv_req, FaultToleranceCommandReqInput)
+            ]
+            dropped_count = len(recv_reqs) - len(ft_reqs)
+            if dropped_count:
+                logger.warning(
+                    "FT paused scheduler ignored %d non-control request(s): dp_rank=%s",
+                    dropped_count,
+                    self.ps.dp_rank,
+                )
+            if ft_reqs:
+                self.process_input_requests(ft_reqs)
+            self._check_ft_pause_deadline()
+            if self._engine_paused and not ft_reqs:
+                time.sleep(0.01)
+        logger.info(
+            "NPU FT control step=host_control_loop phase=complete dp_rank=%s",
+            self.ps.dp_rank,
+        )
 
     def _ft_discard_inflight_window(self, reason) -> bool:
         window_batches = [
@@ -4588,6 +4643,205 @@ class Scheduler(
             self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
         self._engine_paused = False
 
+    def _rebuild_npu_fault_tolerance_control_runtime(self) -> None:
+        logger.info(
+            "NPU FT recovery step=rebuild_copy_stream phase=begin dp_rank=%s",
+            self.ps.dp_rank,
+        )
+        self.copy_stream = self.device_module.Stream()
+        self.copy_stream_ctx = self.device_module.stream(self.copy_stream)
+        logger.info(
+            "NPU FT recovery step=rebuild_copy_stream phase=complete "
+            "dp_rank=%s copy_stream=%s",
+            self.ps.dp_rank,
+            getattr(self.copy_stream, "stream_id", None),
+        )
+        logger.info(
+            "NPU FT recovery step=rebuild_schedule_stream phase=begin dp_rank=%s",
+            self.ps.dp_rank,
+        )
+        self.schedule_stream = self.device_module.Stream(priority=0)
+        logger.info(
+            "NPU FT recovery step=rebuild_schedule_stream phase=complete "
+            "dp_rank=%s schedule_stream=%s",
+            self.ps.dp_rank,
+            getattr(self.schedule_stream, "stream_id", None),
+        )
+
+        # Per-forward result events are owned by result_queue and are cleared by
+        # the pending failed-batch discard. Clear the remaining long-lived
+        # readiness events; they will be recreated lazily without replacing the
+        # model forward stream or any captured graph runner.
+        logger.info(
+            "NPU FT recovery step=reset_readiness_events phase=begin dp_rank=%s",
+            self.ps.dp_rank,
+        )
+        self.model_worker.war_fastpath_runner.war_fastpath_read_done_event = None
+        self.future_map.publish_ready = None
+        self.future_map._publish_fresh = False
+        logger.info(
+            "NPU FT recovery step=reset_readiness_events phase=complete "
+            "dp_rank=%s schedule_stream=%s copy_stream=%s forward_stream=%s "
+            "graphs=preserved",
+            self.ps.dp_rank,
+            getattr(self.schedule_stream, "stream_id", None),
+            getattr(self.copy_stream, "stream_id", None),
+            getattr(self.forward_stream, "stream_id", None),
+        )
+
+    def _recover_npu_fault_tolerance_scale_down(
+        self, active_mask: list[bool], request_id: str
+    ) -> None:
+        model_runner = self.tp_worker.model_runner
+        logger.info(
+            "NPU FT recovery step=recover_device phase=begin request_id=%s "
+            "dp_rank=%s",
+            request_id,
+            self.ps.dp_rank,
+        )
+        model_runner.recover_npu_device_for_fault_tolerance_scale_down()
+        logger.info(
+            "NPU FT recovery step=recover_device phase=complete request_id=%s "
+            "dp_rank=%s",
+            request_id,
+            self.ps.dp_rank,
+        )
+
+        logger.info(
+            "NPU FT recovery step=rebuild_control_runtime phase=begin "
+            "request_id=%s dp_rank=%s",
+            request_id,
+            self.ps.dp_rank,
+        )
+        self._rebuild_npu_fault_tolerance_control_runtime()
+        logger.info(
+            "NPU FT recovery step=rebuild_control_runtime phase=complete "
+            "request_id=%s dp_rank=%s",
+            request_id,
+            self.ps.dp_rank,
+        )
+
+        with self.device_module.StreamContext(self.schedule_stream):
+            pending_reason = self._ft_pending_discard_reason
+            if pending_reason is not None:
+                logger.info(
+                    "NPU FT recovery step=discard_inflight phase=begin "
+                    "request_id=%s dp_rank=%s reason=%s",
+                    request_id,
+                    self.ps.dp_rank,
+                    pending_reason,
+                )
+                if not self._ft_discard_inflight_window(pending_reason):
+                    raise RuntimeError(
+                        "NPU FT failed to release in-flight request state after "
+                        "device recovery"
+                    )
+                self._ft_pending_discard_reason = None
+                logger.info(
+                    "NPU FT recovery step=discard_inflight phase=complete "
+                    "request_id=%s dp_rank=%s",
+                    request_id,
+                    self.ps.dp_rank,
+                )
+            else:
+                logger.info(
+                    "NPU FT recovery step=discard_inflight phase=complete "
+                    "request_id=%s dp_rank=%s skipped=true",
+                    request_id,
+                    self.ps.dp_rank,
+                )
+
+            logger.info(
+                "NPU FT recovery step=apply_elastic_scale_down phase=begin "
+                "request_id=%s dp_rank=%s active_mask=%s",
+                request_id,
+                self.ps.dp_rank,
+                active_mask,
+            )
+            model_runner.apply_fault_tolerance_scale_down(active_mask)
+            logger.info(
+                "NPU FT recovery step=apply_elastic_scale_down phase=complete "
+                "request_id=%s dp_rank=%s",
+                request_id,
+                self.ps.dp_rank,
+            )
+
+        logger.info(
+            "NPU FT recovery step=schedule_stream_synchronize phase=begin "
+            "request_id=%s dp_rank=%s schedule_stream=%s",
+            request_id,
+            self.ps.dp_rank,
+            getattr(self.schedule_stream, "stream_id", None),
+        )
+        self.schedule_stream.synchronize()
+        logger.info(
+            "NPU FT recovery step=schedule_stream_synchronize phase=complete "
+            "request_id=%s dp_rank=%s",
+            request_id,
+            self.ps.dp_rank,
+        )
+
+        logger.info(
+            "NPU FT recovery step=device_probe phase=begin request_id=%s "
+            "dp_rank=%s",
+            request_id,
+            self.ps.dp_rank,
+        )
+        model_runner.run_npu_fault_tolerance_device_probe(self.schedule_stream)
+        logger.info(
+            "NPU FT recovery step=device_probe phase=complete request_id=%s "
+            "dp_rank=%s",
+            request_id,
+            self.ps.dp_rank,
+        )
+
+        # Use the ordinary ModelRunner dispatch under the existing forward
+        # stream. With graphs enabled this must replay the captured decode graph;
+        # with graphs disabled the same call naturally dispatches to eager.
+        logger.info(
+            "NPU FT recovery step=forward_stream_handoff phase=begin "
+            "request_id=%s dp_rank=%s forward_stream=%s schedule_stream=%s",
+            request_id,
+            self.ps.dp_rank,
+            getattr(self.forward_stream, "stream_id", None),
+            getattr(self.schedule_stream, "stream_id", None),
+        )
+        self.forward_stream.wait_stream(self.schedule_stream)
+        logger.info(
+            "NPU FT recovery step=forward_stream_handoff phase=complete "
+            "request_id=%s dp_rank=%s",
+            request_id,
+            self.ps.dp_rank,
+        )
+        with self.forward_stream_ctx:
+            logger.info(
+                "NPU FT recovery step=dummy_forward phase=begin request_id=%s "
+                "dp_rank=%s",
+                request_id,
+                self.ps.dp_rank,
+            )
+            model_runner.run_npu_fault_tolerance_dummy_batch(active_mask)
+            logger.info(
+                "NPU FT recovery step=dummy_forward phase=complete request_id=%s "
+                "dp_rank=%s",
+                request_id,
+                self.ps.dp_rank,
+            )
+
+        logger.info(
+            "NPU FT recovery step=final_device_synchronize phase=begin "
+            "request_id=%s dp_rank=%s",
+            request_id,
+            self.ps.dp_rank,
+        )
+        model_runner.synchronize_npu_fault_tolerance_health_gate()
+        logger.info(
+            "NPU FT recovery step=final_device_synchronize phase=complete "
+            "request_id=%s dp_rank=%s",
+            request_id,
+            self.ps.dp_rank,
+        )
+
     def handle_fault_tolerance_command(
         self, recv_req: FaultToleranceCommandReqInput
     ) -> Optional[FaultToleranceCommandReqOutput]:
@@ -4605,25 +4859,37 @@ class Scheduler(
         elif recv_req.command == "scale_down":
             model_runner = self.tp_worker.model_runner
             if _is_npu and self.server_args.elastic_ep_backend == "mc2":
-                model_runner.recover_npu_device_for_fault_tolerance_scale_down()
-                pending_reason = self._ft_pending_discard_reason
-                if pending_reason is not None:
-                    if not self._ft_discard_inflight_window(pending_reason):
-                        message = (
-                            "NPU FT failed to release in-flight request state after "
-                            "device recovery"
-                        )
-                        logger.error("%s: dp_rank=%s", message, rank)
-                        if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:
-                            return None
-                        return FaultToleranceCommandReqOutput(
-                            request_id=recv_req.request_id,
-                            rank=rank,
-                            success=False,
-                            message=message,
-                        )
-                    self._ft_pending_discard_reason = None
-            model_runner.apply_fault_tolerance_scale_down(recv_req.active_mask)
+                logger.info(
+                    "NPU FT recovery step=receive_scale_down phase=complete "
+                    "request_id=%s dp_rank=%s active_mask=%s",
+                    recv_req.request_id,
+                    rank,
+                    recv_req.active_mask,
+                )
+                try:
+                    self._recover_npu_fault_tolerance_scale_down(
+                        recv_req.active_mask, recv_req.request_id
+                    )
+                except Exception as exc:
+                    message = f"NPU FT scale-down recovery failed: {exc}"
+                    logger.exception(
+                        "NPU FT recovery phase=failed request_id=%s dp_rank=%s "
+                        "error=%s",
+                        recv_req.request_id,
+                        rank,
+                        exc,
+                    )
+                    self._engine_paused = True
+                    if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:
+                        return None
+                    return FaultToleranceCommandReqOutput(
+                        request_id=recv_req.request_id,
+                        rank=rank,
+                        success=False,
+                        message=message,
+                    )
+            else:
+                model_runner.apply_fault_tolerance_scale_down(recv_req.active_mask)
             message = "scaled down"
         else:
             logger.warning(
@@ -4631,11 +4897,32 @@ class Scheduler(
             )
             return None
 
+        if recv_req.command == "scale_down" and _is_npu:
+            logger.info(
+                "NPU FT recovery step=commit_unpause phase=begin request_id=%s "
+                "dp_rank=%s",
+                recv_req.request_id,
+                rank,
+            )
         self._engine_paused = False
         self._ft_pause_deadline = None
+        if recv_req.command == "scale_down" and _is_npu:
+            logger.info(
+                "NPU FT recovery step=commit_unpause phase=complete request_id=%s "
+                "dp_rank=%s",
+                recv_req.request_id,
+                rank,
+            )
 
         if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:
             return None
+        if recv_req.command == "scale_down" and _is_npu:
+            logger.info(
+                "NPU FT recovery step=ack_ready phase=complete request_id=%s "
+                "dp_rank=%s success=true",
+                recv_req.request_id,
+                rank,
+            )
         return FaultToleranceCommandReqOutput(
             request_id=recv_req.request_id,
             rank=rank,

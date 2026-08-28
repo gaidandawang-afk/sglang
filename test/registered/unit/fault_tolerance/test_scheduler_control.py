@@ -1,5 +1,6 @@
 import ast
 from collections import deque
+from contextlib import nullcontext
 from http import HTTPStatus
 import logging
 import os
@@ -148,6 +149,9 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             "Scheduler",
             {
                 "_run_event_loop_fault_tolerance",
+                "_run_fault_tolerance_control_loop",
+                "_rebuild_npu_fault_tolerance_control_runtime",
+                "_recover_npu_fault_tolerance_scale_down",
                 "handle_fault_tolerance_command",
                 "_check_ft_pause_deadline",
                 "_ft_discard_inflight_window",
@@ -171,6 +175,15 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             },
         )
         cls.run_ft_loop = staticmethod(scheduler["_run_event_loop_fault_tolerance"])
+        cls.run_ft_control_loop = staticmethod(
+            scheduler["_run_fault_tolerance_control_loop"]
+        )
+        cls.rebuild_streams = staticmethod(
+            scheduler["_rebuild_npu_fault_tolerance_control_runtime"]
+        )
+        cls.recover_scale_down = staticmethod(
+            scheduler["_recover_npu_fault_tolerance_scale_down"]
+        )
         cls.handle_command = staticmethod(scheduler["handle_fault_tolerance_command"])
         cls.check_deadline = staticmethod(scheduler["_check_ft_pause_deadline"])
         cls.discard = staticmethod(scheduler["_ft_discard_inflight_window"])
@@ -235,7 +248,11 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         model_runner = load_class_methods(
             REPO_ROOT / "python/sglang/srt/model_executor/model_runner.py",
             "ModelRunner",
-            {"recover_npu_device_for_fault_tolerance_scale_down"},
+            {
+                "recover_npu_device_for_fault_tolerance_scale_down",
+                "run_npu_fault_tolerance_dummy_batch",
+                "stop_npu_device_after_scheduler_exception",
+            },
             {
                 "logger": logging.getLogger(__name__),
                 "torch": cls.fake_torch,
@@ -244,13 +261,43 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         cls.recover_npu = staticmethod(
             model_runner["recover_npu_device_for_fault_tolerance_scale_down"]
         )
+        cls.run_npu_dummy = staticmethod(
+            model_runner["run_npu_fault_tolerance_dummy_batch"]
+        )
+        cls.stop_npu_after_exception = staticmethod(
+            model_runner["stop_npu_device_after_scheduler_exception"]
+        )
+
+        base_runner = load_class_methods(
+            REPO_ROOT / "python/sglang/srt/model_executor/runner/base_runner.py",
+            "BaseRunner",
+            {"run_dummy_via_model_runner"},
+            {
+                "Optional": Optional,
+                "set_dp_buffer_len": Mock(),
+                "set_is_extend_in_batch": Mock(),
+                "torch": SimpleNamespace(inference_mode=lambda: nullcontext()),
+            },
+        )
+        cls.run_dummy_dispatch = staticmethod(
+            base_runner["run_dummy_via_model_runner"]
+        )
 
     def make_scheduler(self, *, leader=True):
+        forward_stream = SimpleNamespace(
+            stream_id=10, synchronize=Mock(), wait_stream=Mock()
+        )
+        schedule_stream = SimpleNamespace(stream_id=11, synchronize=Mock())
+        copy_stream = SimpleNamespace(stream_id=12, synchronize=Mock())
+        old_schedule_stream = SimpleNamespace(stream_id=9, synchronize=Mock())
         model_runner = SimpleNamespace(
             apply_fault_tolerance_scale_down=Mock(),
             recover_npu_device_for_fault_tolerance_scale_down=Mock(),
+            run_npu_fault_tolerance_device_probe=Mock(),
+            run_npu_fault_tolerance_dummy_batch=Mock(),
+            synchronize_npu_fault_tolerance_health_gate=Mock(),
         )
-        return SimpleNamespace(
+        scheduler = SimpleNamespace(
             ps=SimpleNamespace(
                 dp_rank=1,
                 attn_tp_rank=0 if leader else 1,
@@ -258,11 +305,35 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             ),
             tp_worker=SimpleNamespace(model_runner=model_runner),
             server_args=SimpleNamespace(elastic_ep_backend="mc2"),
+            device_module=SimpleNamespace(
+                Stream=Mock(side_effect=[copy_stream, schedule_stream]),
+                stream=lambda stream: nullcontext(),
+                StreamContext=lambda stream: nullcontext(),
+            ),
+            forward_stream=forward_stream,
+            forward_stream_ctx=nullcontext(),
+            copy_stream=object(),
+            schedule_stream=old_schedule_stream,
+            model_worker=SimpleNamespace(
+                war_fastpath_runner=SimpleNamespace(
+                    war_fastpath_read_done_event=object()
+                )
+            ),
+            future_map=SimpleNamespace(publish_ready=object(), _publish_fresh=True),
             _engine_paused=True,
             _ft_pause_deadline=130.0,
             _ft_pending_discard_reason=None,
             _ft_discard_inflight_window=Mock(return_value=True),
         )
+        scheduler._rebuild_npu_fault_tolerance_control_runtime = lambda: (
+            self.rebuild_streams(scheduler)
+        )
+        scheduler._recover_npu_fault_tolerance_scale_down = (
+            lambda active_mask, request_id: self.recover_scale_down(
+                scheduler, active_mask, request_id
+            )
+        )
+        return scheduler
 
     def test_retry_restores_last_mask_without_replacing_tensors(self):
         state = SimpleNamespace(
@@ -318,6 +389,24 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         model_runner.recover_npu_device_for_fault_tolerance_scale_down.side_effect = (
             lambda: events.append("recover_device")
         )
+        model_runner.run_npu_fault_tolerance_device_probe.side_effect = lambda stream: (
+            events.append("device_probe")
+        )
+        model_runner.run_npu_fault_tolerance_dummy_batch.side_effect = (
+            lambda active_mask: events.append(("dummy_batch", active_mask))
+        )
+        model_runner.synchronize_npu_fault_tolerance_health_gate.side_effect = (
+            lambda: events.append("health_sync")
+        )
+        scheduler._rebuild_npu_fault_tolerance_control_runtime = lambda: (
+            events.append("rebuild_control_runtime")
+        )
+        scheduler.forward_stream.wait_stream.side_effect = lambda stream: events.append(
+            "forward_wait"
+        )
+        scheduler.schedule_stream.synchronize.side_effect = lambda: events.append(
+            "schedule_sync"
+        )
         model_runner.apply_fault_tolerance_scale_down.side_effect = lambda mask: (
             events.append(("scale_down", mask))
         )
@@ -334,7 +423,8 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         self.handle_command.__globals__["_is_npu"] = True
         try:
-            output = self.handle_command(scheduler, request)
+            with self.assertLogs(__name__, level="INFO") as captured:
+                output = self.handle_command(scheduler, request)
         finally:
             self.handle_command.__globals__["_is_npu"] = False
 
@@ -342,12 +432,45 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             events,
             [
                 "recover_device",
+                "rebuild_control_runtime",
                 ("discard", "mlp-sync failed"),
                 ("scale_down", [True, False]),
+                "schedule_sync",
+                "device_probe",
+                "forward_wait",
+                ("dummy_batch", [True, False]),
+                "health_sync",
             ],
         )
         self.assertIsNone(scheduler._ft_pending_discard_reason)
         self.assertEqual(output.message, "scaled down")
+        log_text = "\n".join(captured.output)
+        expected_log_steps = [
+            "step=receive_scale_down phase=complete",
+            "step=recover_device phase=begin",
+            "step=recover_device phase=complete",
+            "step=rebuild_control_runtime phase=begin",
+            "step=rebuild_control_runtime phase=complete",
+            "step=discard_inflight phase=begin",
+            "step=discard_inflight phase=complete",
+            "step=apply_elastic_scale_down phase=begin",
+            "step=apply_elastic_scale_down phase=complete",
+            "step=schedule_stream_synchronize phase=begin",
+            "step=schedule_stream_synchronize phase=complete",
+            "step=device_probe phase=begin",
+            "step=device_probe phase=complete",
+            "step=forward_stream_handoff phase=begin",
+            "step=forward_stream_handoff phase=complete",
+            "step=dummy_forward phase=begin",
+            "step=dummy_forward phase=complete",
+            "step=final_device_synchronize phase=begin",
+            "step=final_device_synchronize phase=complete",
+            "step=commit_unpause phase=begin",
+            "step=commit_unpause phase=complete",
+            "step=ack_ready phase=complete",
+        ]
+        positions = [log_text.index(step) for step in expected_log_steps]
+        self.assertEqual(positions, sorted(positions))
 
     def test_retry_does_not_recover_device(self):
         state = SimpleNamespace(
@@ -401,6 +524,29 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             scheduler.tp_worker.model_runner.apply_fault_tolerance_scale_down
         )
         apply_scale_down.assert_not_called()
+        scheduler.tp_worker.model_runner.run_npu_fault_tolerance_dummy_batch.assert_not_called()
+
+    def test_npu_scale_down_returns_failed_ack_when_dummy_batch_fails(self):
+        scheduler = self.make_scheduler()
+        scheduler.tp_worker.model_runner.run_npu_fault_tolerance_dummy_batch.side_effect = (
+            RuntimeError("507015")
+        )
+        request = FaultToleranceCommandReqInput(
+            request_id="s",
+            command="scale_down",
+            target_ranks=[1],
+            active_mask=[True, False],
+        )
+
+        self.handle_command.__globals__["_is_npu"] = True
+        try:
+            output = self.handle_command(scheduler, request)
+        finally:
+            self.handle_command.__globals__["_is_npu"] = False
+
+        self.assertFalse(output.success)
+        self.assertIn("507015", output.message)
+        self.assertTrue(scheduler._engine_paused)
 
     def test_nonleader_executes_without_ack(self):
         scheduler = self.make_scheduler(leader=False)
@@ -431,10 +577,11 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             _ft_discard_inflight_window=lambda exc: events.append("discarded") or True,
             ipc_channels=SimpleNamespace(send_to_tokenizer=sender),
             ps=SimpleNamespace(dp_rank=0),
-            request_receiver=SimpleNamespace(
-                recv_requests=lambda: (_ for _ in ()).throw(KeyboardInterrupt())
+            device_module=SimpleNamespace(StreamContext=lambda stream: nullcontext()),
+            schedule_stream=object(),
+            _run_fault_tolerance_control_loop=lambda: (_ for _ in ()).throw(
+                KeyboardInterrupt()
             ),
-            _check_ft_pause_deadline=Mock(),
             server_args=SimpleNamespace(
                 fault_tolerance_on_error_strategy="pause",
                 fault_tolerance_pause_timeout=30,
@@ -467,6 +614,8 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 )
             ),
             ps=SimpleNamespace(dp_rank=0),
+            device_module=SimpleNamespace(StreamContext=lambda stream: nullcontext()),
+            schedule_stream=object(),
             server_args=SimpleNamespace(
                 fault_tolerance_on_error_strategy="continue",
                 fault_tolerance_pause_timeout=30,
@@ -482,10 +631,20 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
     def test_npu_mc2_defers_discard_until_scale_down(self):
         events = []
+        dispatched = False
+
+        class RecordingContext:
+            def __enter__(self):
+                events.append("enter_stream")
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("exit_stream")
 
         def dispatch(_):
-            if events:
+            nonlocal dispatched
+            if dispatched:
                 raise KeyboardInterrupt()
+            dispatched = True
             events.append("fault")
             raise RuntimeError("mlp-sync failed")
 
@@ -499,10 +658,20 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 )
             ),
             ps=SimpleNamespace(dp_rank=0),
-            request_receiver=SimpleNamespace(
-                recv_requests=lambda: (_ for _ in ()).throw(KeyboardInterrupt())
+            device_module=SimpleNamespace(
+                StreamContext=lambda stream: RecordingContext()
             ),
-            _check_ft_pause_deadline=Mock(),
+            schedule_stream=object(),
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    stop_npu_device_after_scheduler_exception=lambda exc: events.append(
+                        "stop_device"
+                    )
+                )
+            ),
+            _run_fault_tolerance_control_loop=lambda: (_ for _ in ()).throw(
+                KeyboardInterrupt()
+            ),
             server_args=SimpleNamespace(
                 elastic_ep_backend="mc2",
                 fault_tolerance_on_error_strategy="pause",
@@ -519,7 +688,16 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         finally:
             self.run_ft_loop.__globals__["_is_npu"] = False
 
-        self.assertEqual(events, ["fault", "report"])
+        self.assertEqual(
+            events,
+            [
+                "enter_stream",
+                "fault",
+                "exit_stream",
+                "stop_device",
+                "report",
+            ],
+        )
         self.assertEqual(scheduler._ft_pending_discard_reason, "mlp-sync failed")
 
     def test_npu_continue_strategy_is_normalized_during_startup(self):
@@ -546,6 +724,107 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         self.assertEqual(server_args.fault_tolerance_on_error_strategy, "pause")
 
+    def test_fault_control_starts_after_faulted_stream_context_exits(self):
+        events = []
+
+        class RecordingContext:
+            def __enter__(self):
+                events.append("enter_stream")
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("exit_stream")
+
+        def dispatch(_):
+            events.append("fault")
+            raise RuntimeError("boom")
+
+        self.run_ft_loop.__globals__["dispatch_event_loop"] = dispatch
+        scheduler = SimpleNamespace(
+            _ft_discard_inflight_window=lambda exc: events.append("discarded") or True,
+            _run_fault_tolerance_control_loop=lambda: events.append("control"),
+            ipc_channels=SimpleNamespace(
+                send_to_tokenizer=SimpleNamespace(
+                    send_output=lambda *_: events.append("report")
+                )
+            ),
+            ps=SimpleNamespace(dp_rank=0),
+            device_module=SimpleNamespace(
+                StreamContext=lambda stream: RecordingContext()
+            ),
+            schedule_stream=object(),
+            server_args=SimpleNamespace(
+                fault_tolerance_on_error_strategy="pause",
+                fault_tolerance_pause_timeout=30,
+            ),
+            _engine_paused=False,
+            _ft_pause_deadline=None,
+        )
+
+        self.run_ft_loop.__globals__["_is_npu"] = False
+        calls = 0
+
+        def control_once():
+            nonlocal calls
+            calls += 1
+            events.append("control")
+            raise KeyboardInterrupt()
+
+        scheduler._run_fault_tolerance_control_loop = control_once
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_ft_loop(scheduler)
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(
+            events,
+            [
+                "enter_stream",
+                "fault",
+                "exit_stream",
+                "discarded",
+                "report",
+                "control",
+            ],
+        )
+
+    def test_fault_tolerance_control_loop_only_handles_ft_commands(self):
+        ordinary_request = object()
+        request = FaultToleranceCommandReqInput(command="retry")
+        processed = []
+        scheduler = SimpleNamespace(
+            ps=SimpleNamespace(dp_rank=1),
+            _engine_paused=True,
+            request_receiver=SimpleNamespace(
+                recv_requests=lambda: [ordinary_request, request]
+            ),
+            process_input_requests=lambda reqs: (
+                processed.append(reqs),
+                setattr(scheduler, "_engine_paused", False),
+            ),
+            _check_ft_pause_deadline=Mock(),
+        )
+
+        self.run_ft_control_loop(scheduler)
+
+        self.assertEqual(processed, [[request]])
+        scheduler._check_ft_pause_deadline.assert_called_once()
+
+    def test_rebuilds_control_streams_and_preserves_forward_stream(self):
+        scheduler = self.make_scheduler()
+        old_schedule_stream = scheduler.schedule_stream
+        old_copy_stream = scheduler.copy_stream
+        old_forward_stream = scheduler.forward_stream
+
+        self.rebuild_streams(scheduler)
+
+        self.assertIsNot(scheduler.schedule_stream, old_schedule_stream)
+        self.assertIsNot(scheduler.copy_stream, old_copy_stream)
+        self.assertIs(scheduler.forward_stream, old_forward_stream)
+        self.assertIsNone(
+            scheduler.model_worker.war_fastpath_runner.war_fastpath_read_done_event
+        )
+        self.assertIsNone(scheduler.future_map.publish_ready)
+        self.assertFalse(scheduler.future_map._publish_fresh)
+
     def test_npu_scale_down_restarts_without_artificial_delay(self):
         calls = []
         npu = SimpleNamespace(
@@ -563,7 +842,8 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.fake_torch.npu.synchronize = lambda: calls.append(("synchronize",))
 
         with patch.dict(sys.modules, {"torch_npu": torch_npu}):
-            self.recover_npu(runner)
+            with self.assertLogs(__name__, level="INFO") as captured:
+                self.recover_npu(runner)
 
         self.assertEqual(
             calls,
@@ -575,6 +855,99 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 ("synchronize",),
             ],
         )
+        log_text = "\n".join(captured.output)
+        expected_log_steps = [
+            "step=bind_device phase=begin",
+            "step=bind_device phase=complete",
+            "step=stop_device phase=begin",
+            "step=stop_device phase=complete",
+            "step=restart_device phase=begin",
+            "step=restart_device phase=complete",
+            "step=reinit_process_group phase=begin",
+            "step=reinit_process_group phase=complete",
+            "step=post_reinit_synchronize phase=begin",
+            "step=post_reinit_synchronize phase=complete",
+        ]
+        positions = [log_text.index(step) for step in expected_log_steps]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_npu_stop_after_exception_uses_configured_device(self):
+        calls = []
+        npu = SimpleNamespace(
+            current_device=lambda: 3,
+            stop_device=lambda device_id: calls.append(("stop", device_id)) or 0,
+        )
+        torch_npu = ModuleType("torch_npu")
+        torch_npu.npu = npu
+        runner = SimpleNamespace(gpu_id=3, ps=SimpleNamespace(dp_rank=3))
+        self.fake_torch.npu.set_device = lambda device: calls.append(("set", device))
+
+        with patch.dict(sys.modules, {"torch_npu": torch_npu}):
+            self.stop_npu_after_exception(runner, RuntimeError("507046"))
+
+        self.assertEqual(calls, [("set", ("npu", 3)), ("stop", 3)])
+
+    def test_npu_dummy_uses_normal_model_runner_dispatch(self):
+        output = SimpleNamespace(can_run_graph=True)
+        decode_graph = object()
+        prefill_graph = object()
+        eager_runner = SimpleNamespace(
+            run_dummy_via_model_runner=Mock(return_value=output)
+        )
+        runner = SimpleNamespace(
+            ps=SimpleNamespace(dp_rank=1),
+            eager_runner=eager_runner,
+            decode_cuda_graph_runner=decode_graph,
+            prefill_cuda_graph_runner=prefill_graph,
+        )
+
+        self.run_npu_dummy(runner, [False, True, True, True])
+
+        eager_runner.run_dummy_via_model_runner.assert_called_once_with(
+            batch_size=1,
+            active_mask=[False, True, True, True],
+        )
+        self.assertIs(runner.decode_cuda_graph_runner, decode_graph)
+        self.assertIs(runner.prefill_cuda_graph_runner, prefill_graph)
+
+    def test_dummy_dispatch_calls_model_runner_forward(self):
+        forward_batch = SimpleNamespace(
+            dp_local_start_pos=object(),
+            dp_local_num_tokens=object(),
+            dp_padding_mode=SimpleNamespace(is_max_len=lambda: False),
+        )
+        pp_proxy_tensors = object()
+        output = SimpleNamespace(can_run_graph=True)
+        decode_graph = object()
+        prefill_graph = object()
+        model_runner = SimpleNamespace(
+            forward=Mock(return_value=output),
+            decode_cuda_graph_runner=decode_graph,
+            prefill_cuda_graph_runner=prefill_graph,
+        )
+        buffers = object()
+        runner = SimpleNamespace(
+            model_runner=model_runner,
+            _alloc_dummy_decode_buffers=Mock(return_value=buffers),
+            _prepare_dummy_forward_batch=Mock(
+                return_value=(forward_batch, pp_proxy_tensors, 3, 1, [0, 1, 1, 1])
+            ),
+        )
+
+        result = self.run_dummy_dispatch(runner, 1, [False, True, True, True])
+
+        self.assertIs(result, output)
+        model_runner.forward.assert_called_once_with(
+            forward_batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+        runner._prepare_dummy_forward_batch.assert_called_once_with(
+            1,
+            buffers=buffers,
+            active_mask=[False, True, True, True],
+        )
+        self.assertIs(model_runner.decode_cuda_graph_runner, decode_graph)
+        self.assertIs(model_runner.prefill_cuda_graph_runner, prefill_graph)
 
     def test_pause_deadline_notifies_node_main_once(self):
         notify = self.check_deadline.__globals__["notify_node_main_process_failure"]
