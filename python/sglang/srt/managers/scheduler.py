@@ -1038,6 +1038,7 @@ class Scheduler(
         self.forward_sleep_time = None
         self._engine_paused = False
         self._ft_pause_deadline: Optional[float] = None
+        self._ft_pending_discard_reason: Optional[str] = None
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1566,7 +1567,19 @@ class Scheduler(
                     dispatch_event_loop(self)
                 return
             except Exception as exc:
-                recovered = self._ft_discard_inflight_window(exc)
+                defer_discard = (
+                    _is_npu and self.server_args.elastic_ep_backend == "mc2"
+                )
+                if defer_discard:
+                    self._ft_pending_discard_reason = str(exc)
+                    recovered = False
+                    logger.warning(
+                        "Deferring NPU FT in-flight request discard until device "
+                        "recovery during scale-down: %s",
+                        exc,
+                    )
+                else:
+                    recovered = self._ft_discard_inflight_window(exc)
                 should_continue = (
                     self.server_args.fault_tolerance_on_error_strategy == "continue"
                     and recovered
@@ -1615,10 +1628,45 @@ class Scheduler(
             if batch is None:
                 continue
             for req in batch.reqs:
-                if not req.finished():
+                if (
+                    not req.finished()
+                    or getattr(req, "req_pool_idx", None) is not None
+                    or getattr(req, "kv", None) is not None
+                ):
                     discarded_by_rid.setdefault(req.rid, req)
-        if self.chunked_req is not None and not self.chunked_req.finished():
-            discarded_by_rid.setdefault(self.chunked_req.rid, self.chunked_req)
+        if self.chunked_req is not None:
+            req = self.chunked_req
+            if (
+                not req.finished()
+                or getattr(req, "req_pool_idx", None) is not None
+                or getattr(req, "kv", None) is not None
+            ):
+                discarded_by_rid.setdefault(req.rid, req)
+
+        allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        req_pool = getattr(self, "req_to_token_pool", None)
+        available_before = (
+            allocator.available_size() if allocator is not None else None
+        )
+        req_slots_before = req_pool.available_size() if req_pool is not None else None
+        free_group_was_open = bool(
+            allocator is not None
+            and not getattr(allocator, "is_not_in_free_group", True)
+        )
+        pending_free_group_entries = (
+            len(getattr(allocator, "free_group", ())) if free_group_was_open else 0
+        )
+        logger.warning(
+            "NPU FT KV release check before discard: dp_rank=%s requests=%s "
+            "available=%s req_slots=%s free_group_open=%s "
+            "free_group_entries=%s",
+            self.ps.dp_rank,
+            sorted(discarded_by_rid),
+            available_before,
+            req_slots_before,
+            free_group_was_open,
+            pending_free_group_entries,
+        )
 
         success = True
         for req in discarded_by_rid.values():
@@ -1650,6 +1698,23 @@ class Scheduler(
                 logger.exception("FT failed to discard request state")
                 success = False
 
+        unreleased_rids = [
+            req.rid
+            for req in discarded_by_rid.values()
+            if getattr(req, "req_pool_idx", None) is not None
+            or getattr(req, "kv", None) is not None
+        ]
+        if unreleased_rids:
+            logger.error(
+                "NPU FT KV release left request-owned state: dp_rank=%s rids=%s",
+                self.ps.dp_rank,
+                sorted(unreleased_rids),
+            )
+            success = False
+
+        if not success:
+            return False
+
         self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
         if self.chunked_req is not None and self.chunked_req.rid in discarded_by_rid:
             self.chunked_req = None
@@ -1657,12 +1722,40 @@ class Scheduler(
             result_queue.clear()
         self.cur_batch_for_debug = None
         self.last_batch = None
+
+        available_after = allocator.available_size() if allocator is not None else None
+        req_slots_after = req_pool.available_size() if req_pool is not None else None
+        has_leak = False
+        leak_messages = []
+        invariant_checker = getattr(self, "invariant_checker", None)
+        pool_stats_observer = getattr(self, "pool_stats_observer", None)
+        if invariant_checker is not None and pool_stats_observer is not None:
+            has_leak, leak_messages = invariant_checker._check_all_pools(
+                pool_stats_observer.get_pool_stats()
+            )
+            if has_leak:
+                logger.error(
+                    "NPU FT KV release invariant failed after discard: dp_rank=%s %s",
+                    self.ps.dp_rank,
+                    " | ".join(leak_messages),
+                )
+
+        logger.warning(
+            "NPU FT KV release check after discard: dp_rank=%s available=%s->%s "
+            "req_slots=%s->%s invariant_ok=%s",
+            self.ps.dp_rank,
+            available_before,
+            available_after,
+            req_slots_before,
+            req_slots_after,
+            not has_leak,
+        )
         logger.warning(
             "FT discarded %d in-flight request(s) during recovery: %s",
             len(discarded_by_rid),
             reason,
         )
-        return success
+        return not has_leak
 
     def _process_next_overlap_result(self) -> None:
         batch, result = self.result_queue[0]
@@ -4528,6 +4621,23 @@ class Scheduler(
             model_runner = self.tp_worker.model_runner
             if _is_npu and self.server_args.elastic_ep_backend == "mc2":
                 model_runner.recover_npu_device_for_fault_tolerance_scale_down()
+                pending_reason = self._ft_pending_discard_reason
+                if pending_reason is not None:
+                    if not self._ft_discard_inflight_window(pending_reason):
+                        message = (
+                            "NPU FT failed to release in-flight request state after "
+                            "device recovery"
+                        )
+                        logger.error("%s: dp_rank=%s", message, rank)
+                        if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:
+                            return None
+                        return FaultToleranceCommandReqOutput(
+                            request_id=recv_req.request_id,
+                            rank=rank,
+                            success=False,
+                            message=message,
+                        )
+                    self._ft_pending_discard_reason = None
                 schedule_stream = self.device_module.Stream(priority=0)
                 with self.device_module.StreamContext(schedule_stream):
                     model_runner.apply_fault_tolerance_scale_down(recv_req.active_mask)
