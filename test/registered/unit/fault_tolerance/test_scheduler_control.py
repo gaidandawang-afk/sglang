@@ -541,6 +541,8 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 self.assertEqual(os.environ["TASK_QUEUE_ENABLE"], "0")
                 self.assertEqual(os.environ["HCCL_EVENT_TIMEOUT"], "10")
                 self.assertEqual(os.environ["HCCL_EXEC_TIMEOUT"], "9")
+                self.assertEqual(os.environ["ACL_DEVICE_SYNC_TIMEOUT"], "10")
+                self.assertEqual(os.environ["ACL_STREAM_TIMEOUT"], "10000")
 
         self.assertEqual(server_args.fault_tolerance_on_error_strategy, "pause")
 

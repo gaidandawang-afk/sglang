@@ -3822,6 +3822,8 @@ class ServerArgs:
             if abort_timeout > 0:
                 os.environ.setdefault("HCCL_EVENT_TIMEOUT", str(abort_timeout))
                 os.environ.setdefault("HCCL_EXEC_TIMEOUT", str(abort_timeout - 1))
+                os.environ.setdefault("ACL_DEVICE_SYNC_TIMEOUT", str(abort_timeout))
+                os.environ.setdefault("ACL_STREAM_TIMEOUT", str(abort_timeout * 1000))
                 if int(os.environ["HCCL_EVENT_TIMEOUT"]) <= int(
                     os.environ["HCCL_EXEC_TIMEOUT"]
                 ):
