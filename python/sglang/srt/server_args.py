@@ -1043,6 +1043,11 @@ class ServerArgs:
         "Timeout in seconds for fault-tolerance control commands.",
         NS("parallel"),
     ] = 60
+    fault_tolerance_communication_abort_timeout: A[
+        int,
+        "NPU communication abort timeout in seconds; 0 disables timeout setup.",
+        NS("parallel"),
+    ] = 10
     fault_tolerance_pause_timeout: A[
         float,
         "Fail-stop timeout in seconds for an unattended fault-tolerance pause.",
@@ -3805,6 +3810,24 @@ class ServerArgs:
                 "using pause instead"
             )
             self.fault_tolerance_on_error_strategy = "pause"
+
+        if is_npu() and self.elastic_ep_backend == "mc2":
+            os.environ["TASK_QUEUE_ENABLE"] = "0"
+            abort_timeout = self.fault_tolerance_communication_abort_timeout
+            if abort_timeout != 0 and abort_timeout < 2:
+                raise ValueError(
+                    "fault_tolerance_communication_abort_timeout must be 0 or "
+                    f"at least 2 seconds, got {abort_timeout}"
+                )
+            if abort_timeout > 0:
+                os.environ.setdefault("HCCL_EVENT_TIMEOUT", str(abort_timeout))
+                os.environ.setdefault("HCCL_EXEC_TIMEOUT", str(abort_timeout - 1))
+                if int(os.environ["HCCL_EVENT_TIMEOUT"]) <= int(
+                    os.environ["HCCL_EXEC_TIMEOUT"]
+                ):
+                    raise ValueError(
+                        "HCCL_EVENT_TIMEOUT must be greater than HCCL_EXEC_TIMEOUT"
+                    )
 
         from sglang.srt.fault_tolerance.controller import is_ft_supported_config
 

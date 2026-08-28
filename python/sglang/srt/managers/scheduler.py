@@ -1554,17 +1554,16 @@ class Scheduler(
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
-        if self.server_args.enable_fault_tolerance:
-            self._run_event_loop_fault_tolerance()
-        else:
-            with self.device_module.StreamContext(self.schedule_stream):
+        with self.device_module.StreamContext(self.schedule_stream):
+            if self.server_args.enable_fault_tolerance:
+                self._run_event_loop_fault_tolerance()
+            else:
                 dispatch_event_loop(self)
 
     def _run_event_loop_fault_tolerance(self) -> None:
         while True:
             try:
-                with self.device_module.StreamContext(self.schedule_stream):
-                    dispatch_event_loop(self)
+                dispatch_event_loop(self)
                 return
             except Exception as exc:
                 defer_discard = (
@@ -1584,6 +1583,12 @@ class Scheduler(
                     self.server_args.fault_tolerance_on_error_strategy == "continue"
                     and recovered
                 )
+                if not should_continue:
+                    self._engine_paused = True
+                    self._ft_pause_deadline = (
+                        time.monotonic()
+                        + self.server_args.fault_tolerance_pause_timeout
+                    )
                 self.ipc_channels.send_to_tokenizer.send_output(
                     FaultToleranceRankFaultOutput(
                         rank=self.ps.dp_rank,
@@ -1592,26 +1597,6 @@ class Scheduler(
                 )
                 if should_continue:
                     continue
-                self._engine_paused = True
-                self._ft_pause_deadline = (
-                    time.monotonic() + self.server_args.fault_tolerance_pause_timeout
-                )
-
-            self._run_fault_tolerance_control_loop()
-
-    def _run_fault_tolerance_control_loop(self) -> None:
-        while self._engine_paused:
-            recv_reqs = self.request_receiver.recv_requests()
-            ft_reqs = [
-                recv_req
-                for recv_req in recv_reqs
-                if isinstance(recv_req, FaultToleranceCommandReqInput)
-            ]
-            if ft_reqs:
-                self.process_input_requests(ft_reqs)
-            self._check_ft_pause_deadline()
-            if self._engine_paused and not ft_reqs:
-                time.sleep(0.01)
 
     def _ft_discard_inflight_window(self, reason) -> bool:
         window_batches = [
@@ -4638,13 +4623,7 @@ class Scheduler(
                             message=message,
                         )
                     self._ft_pending_discard_reason = None
-                schedule_stream = self.device_module.Stream(priority=0)
-                with self.device_module.StreamContext(schedule_stream):
-                    model_runner.apply_fault_tolerance_scale_down(recv_req.active_mask)
-                self.schedule_stream = schedule_stream
-            else:
-                with self.device_module.StreamContext(self.schedule_stream):
-                    model_runner.apply_fault_tolerance_scale_down(recv_req.active_mask)
+            model_runner.apply_fault_tolerance_scale_down(recv_req.active_mask)
             message = "scaled down"
         else:
             logger.warning(

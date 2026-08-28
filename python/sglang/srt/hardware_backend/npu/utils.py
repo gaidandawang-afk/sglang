@@ -200,32 +200,6 @@ def npu_format_cast(
     return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
 
 
-def copy_npu_formatted_tensor_(
-    destination: torch.Tensor, source: torch.Tensor
-) -> torch.Tensor:
-    import torch_npu
-
-    def make_offset_zero_alias(tensor: torch.Tensor) -> torch.Tensor:
-        alias = torch_npu.empty_with_format(
-            tuple(tensor.shape),
-            dtype=tensor.dtype,
-            device=tensor.device,
-            acl_format=torch_npu.get_npu_format(tensor),
-        )
-        torch_npu.npu_change_data_ptr(alias, tensor, int(tensor.storage_offset()))
-        return alias
-
-    return torch.ops.npu.copy_memory_(
-        make_offset_zero_alias(destination), make_offset_zero_alias(source), False
-    )
-
-
-def is_npu_internal_format_tensor(tensor: torch.Tensor) -> bool:
-    import torch_npu
-
-    return torch_npu.get_npu_format(tensor) != int(NPUACLFormat.ACL_FORMAT_ND)
-
-
 def get_indexer_weight_stream():
     global indexer_weight_stream
     if indexer_weight_stream is None:

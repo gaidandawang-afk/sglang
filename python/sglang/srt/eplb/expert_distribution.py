@@ -29,7 +29,6 @@ import torch
 import torch.distributed
 
 from sglang.srt.environ import envs
-from sglang.srt.eplb.process_group_context import get_eplb_process_group_context
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
@@ -906,7 +905,6 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         self._global_physical_count_of_buffered_step.reset()
 
     def dump(self, output_mode: _OutputMode):
-        process_group_context = get_eplb_process_group_context()
         logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
             self._global_physical_count_of_buffered_step.get_all(),
             num_layers=self._expert_location_metadata.num_layers,
@@ -919,9 +917,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             torch.get_device_module().empty_cache()
 
         torch.distributed.all_reduce(
-            logical_count_of_buffered_step,
-            op=torch.distributed.ReduceOp.SUM,
-            group=process_group_context.group,
+            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
         )
 
         output = dict(
@@ -931,7 +927,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         )
 
         if output_mode == "file":
-            if process_group_context.is_group_root(self._rank):
+            if self._rank == 0:
                 _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
         elif output_mode == "object":
             return output
@@ -944,8 +940,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         ):
             return None
 
-        process_group_context = get_eplb_process_group_context()
-        if process_group_context.is_group_root(self._rank):
+        if self._rank == 0:
             utilization_mean_rates = self._history.mean()
             window_index = self.window_sizes[-1]
             average_utilization_rate_over_window = (
@@ -957,25 +952,11 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device=(
-                    self._server_args.device
-                    if process_group_context.group is not None
-                    else "cuda"
-                ),
+                device="cuda",
             )
         else:
-            avg_rate_tensor = torch.empty(
-                1,
-                dtype=torch.float32,
-                device=(
-                    self._server_args.device
-                    if process_group_context.group is not None
-                    else "cuda"
-                ),
-            )
-        torch.distributed.broadcast(
-            avg_rate_tensor, src=0, group=process_group_context.group
-        )
+            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
+        torch.distributed.broadcast(avg_rate_tensor, src=0)
         return avg_rate_tensor.item()
 
 

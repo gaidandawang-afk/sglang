@@ -18,7 +18,6 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
-import threading
 import time
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -336,6 +335,16 @@ class ModelRunner:
                 f"Context: {self.device=} {ps.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {ps.tp_rank=} {ps.tp_size=}"
             )
             raise
+
+        if (
+            _is_npu
+            and server_args.enable_fault_tolerance
+            and server_args.elastic_ep_backend == "mc2"
+            and server_args.fault_tolerance_communication_abort_timeout > 0
+        ):
+            torch.npu.set_op_timeout_ms(
+                server_args.fault_tolerance_communication_abort_timeout * 1000
+            )
 
         # Initialize MooncakeTransferEngine BEFORE init_torch_distributed so
         # that the shared TE can be passed to the Mooncake PG backend (avoids
@@ -1921,11 +1930,10 @@ class ModelRunner:
         bound_device = torch_npu.npu.current_device()
         logger.info(
             "Recovering NPU for fault-tolerance scale-down: dp_rank=%s "
-            "configured_device=%s bound_device=%s thread=%s",
+            "configured_device=%s bound_device=%s",
             self.ps.dp_rank,
             device_id,
             bound_device,
-            threading.current_thread().name,
         )
         stop_result = torch_npu.npu.stop_device(device_id)
         logger.info(
