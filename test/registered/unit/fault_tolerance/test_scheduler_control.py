@@ -287,10 +287,14 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         forward_stream = SimpleNamespace(
             stream_id=10, synchronize=Mock(), wait_stream=Mock()
         )
+        new_forward_stream = SimpleNamespace(
+            stream_id=13, synchronize=Mock(), wait_stream=Mock()
+        )
         schedule_stream = SimpleNamespace(stream_id=11, synchronize=Mock())
         copy_stream = SimpleNamespace(stream_id=12, synchronize=Mock())
         old_schedule_stream = SimpleNamespace(stream_id=9, synchronize=Mock())
         model_runner = SimpleNamespace(
+            forward_stream=forward_stream,
             apply_fault_tolerance_scale_down=Mock(),
             recover_npu_device_for_fault_tolerance_scale_down=Mock(),
             run_npu_fault_tolerance_device_probe=Mock(),
@@ -306,7 +310,9 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             tp_worker=SimpleNamespace(model_runner=model_runner),
             server_args=SimpleNamespace(elastic_ep_backend="mc2"),
             device_module=SimpleNamespace(
-                Stream=Mock(side_effect=[copy_stream, schedule_stream]),
+                Stream=Mock(
+                    side_effect=[new_forward_stream, copy_stream, schedule_stream]
+                ),
                 stream=lambda stream: nullcontext(),
                 StreamContext=lambda stream: nullcontext(),
             ),
@@ -319,6 +325,8 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                     war_fastpath_read_done_event=object()
                 )
             ),
+            hisparse_coordinator=None,
+            enable_unified_memory=False,
             future_map=SimpleNamespace(publish_ready=object(), _publish_fresh=True),
             _engine_paused=True,
             _ft_pause_deadline=130.0,
@@ -808,22 +816,77 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertEqual(processed, [[request]])
         scheduler._check_ft_pause_deadline.assert_called_once()
 
-    def test_rebuilds_control_streams_and_preserves_forward_stream(self):
+    def test_rebuilds_runtime_streams_and_preserves_graphs(self):
         scheduler = self.make_scheduler()
         old_schedule_stream = scheduler.schedule_stream
         old_copy_stream = scheduler.copy_stream
         old_forward_stream = scheduler.forward_stream
+        decode_graph_runner = object()
+        prefill_graph_runner = object()
+        scheduler.tp_worker.model_runner.decode_cuda_graph_runner = decode_graph_runner
+        scheduler.tp_worker.model_runner.prefill_cuda_graph_runner = (
+            prefill_graph_runner
+        )
 
-        self.rebuild_streams(scheduler)
+        with self.assertLogs(__name__, level="INFO") as captured:
+            self.rebuild_streams(scheduler)
 
         self.assertIsNot(scheduler.schedule_stream, old_schedule_stream)
         self.assertIsNot(scheduler.copy_stream, old_copy_stream)
-        self.assertIs(scheduler.forward_stream, old_forward_stream)
+        self.assertIsNot(scheduler.forward_stream, old_forward_stream)
+        self.assertIs(
+            scheduler.tp_worker.model_runner.forward_stream,
+            scheduler.forward_stream,
+        )
+        self.assertIs(
+            scheduler.tp_worker.model_runner.decode_cuda_graph_runner,
+            decode_graph_runner,
+        )
+        self.assertIs(
+            scheduler.tp_worker.model_runner.prefill_cuda_graph_runner,
+            prefill_graph_runner,
+        )
         self.assertIsNone(
             scheduler.model_worker.war_fastpath_runner.war_fastpath_read_done_event
         )
         self.assertIsNone(scheduler.future_map.publish_ready)
         self.assertFalse(scheduler.future_map._publish_fresh)
+        log_text = "\n".join(captured.output)
+        self.assertIn("step=rebuild_forward_stream phase=begin", log_text)
+        self.assertIn("step=rebuild_forward_stream phase=complete", log_text)
+        self.assertIn("old_forward_stream=10", log_text)
+        self.assertIn("forward_stream=13", log_text)
+        self.assertIn("graphs=preserved", log_text)
+
+    def test_rebuild_forward_stream_refreshes_long_lived_consumers(self):
+        scheduler = self.make_scheduler()
+        old_forward_stream = scheduler.forward_stream
+        hisparse_coordinator = SimpleNamespace(set_decode_producer_stream=Mock())
+        allocator = SimpleNamespace(
+            forward_stream=old_forward_stream,
+            full_attn_allocator=SimpleNamespace(forward_stream=old_forward_stream),
+            mamba_allocator=SimpleNamespace(forward_stream=old_forward_stream),
+            swa_attn_allocator=SimpleNamespace(forward_stream=old_forward_stream),
+        )
+        scheduler.hisparse_coordinator = hisparse_coordinator
+        scheduler.enable_unified_memory = True
+        scheduler.token_to_kv_pool_allocator = allocator
+
+        self.rebuild_streams(scheduler)
+
+        hisparse_coordinator.set_decode_producer_stream.assert_called_once_with(
+            scheduler.forward_stream
+        )
+        self.assertIs(allocator.forward_stream, scheduler.forward_stream)
+        self.assertIs(
+            allocator.full_attn_allocator.forward_stream, scheduler.forward_stream
+        )
+        self.assertIs(
+            allocator.mamba_allocator.forward_stream, scheduler.forward_stream
+        )
+        self.assertIs(
+            allocator.swa_attn_allocator.forward_stream, scheduler.forward_stream
+        )
 
     def test_npu_scale_down_restarts_without_artificial_delay(self):
         calls = []

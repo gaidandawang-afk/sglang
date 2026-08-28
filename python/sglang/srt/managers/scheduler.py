@@ -4644,6 +4644,42 @@ class Scheduler(
         self._engine_paused = False
 
     def _rebuild_npu_fault_tolerance_control_runtime(self) -> None:
+        old_forward_stream = self.forward_stream
+        logger.info(
+            "NPU FT recovery step=rebuild_forward_stream phase=begin "
+            "dp_rank=%s old_forward_stream=%s graphs=preserved",
+            self.ps.dp_rank,
+            getattr(old_forward_stream, "stream_id", None),
+        )
+        self.forward_stream = self.device_module.Stream()
+        self.forward_stream_ctx = self.device_module.stream(self.forward_stream)
+        self.tp_worker.model_runner.forward_stream = self.forward_stream
+
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+        if self.enable_unified_memory:
+            allocator = self.token_to_kv_pool_allocator
+            allocator_stream_holders = (
+                allocator,
+                getattr(allocator, "full_attn_allocator", None),
+                getattr(allocator, "mamba_allocator", None),
+                getattr(allocator, "swa_attn_allocator", None),
+            )
+            for stream_holder in allocator_stream_holders:
+                if stream_holder is not None and hasattr(
+                    stream_holder, "forward_stream"
+                ):
+                    stream_holder.forward_stream = self.forward_stream
+
+        logger.info(
+            "NPU FT recovery step=rebuild_forward_stream phase=complete "
+            "dp_rank=%s old_forward_stream=%s forward_stream=%s "
+            "graphs=preserved",
+            self.ps.dp_rank,
+            getattr(old_forward_stream, "stream_id", None),
+            getattr(self.forward_stream, "stream_id", None),
+        )
         logger.info(
             "NPU FT recovery step=rebuild_copy_stream phase=begin dp_rank=%s",
             self.ps.dp_rank,
@@ -4670,8 +4706,8 @@ class Scheduler(
 
         # Per-forward result events are owned by result_queue and are cleared by
         # the pending failed-batch discard. Clear the remaining long-lived
-        # readiness events; they will be recreated lazily without replacing the
-        # model forward stream or any captured graph runner.
+        # readiness events; they will be recreated lazily without replacing any
+        # captured graph runner.
         logger.info(
             "NPU FT recovery step=reset_readiness_events phase=begin dp_rank=%s",
             self.ps.dp_rank,
