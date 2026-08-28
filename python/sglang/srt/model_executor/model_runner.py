@@ -2084,6 +2084,12 @@ class ModelRunner:
 
     def run_npu_fault_tolerance_dummy_batch(self, active_mask: list[bool]) -> None:
         logger.info(
+            "NPU FT dummy step=prepare_metadata phase=complete dp_rank=%s "
+            "batch_size=1 query_len=1 seq_len=1 reserved_req_pool_index=0 "
+            "reserved_kv_page=0",
+            self.ps.dp_rank,
+        )
+        logger.info(
             "NPU FT dummy step=model_runner_forward phase=begin dp_rank=%s "
             "active_mask=%s",
             self.ps.dp_rank,

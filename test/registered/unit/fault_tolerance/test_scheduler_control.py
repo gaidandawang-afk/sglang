@@ -911,6 +911,16 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertIs(runner.prefill_cuda_graph_runner, prefill_graph)
 
     def test_dummy_dispatch_calls_model_runner_forward(self):
+        class FillableBuffer:
+            def __init__(self):
+                self.value = None
+
+            def __getitem__(self, _key):
+                return self
+
+            def fill_(self, value):
+                self.value = value
+
         forward_batch = SimpleNamespace(
             dp_local_start_pos=object(),
             dp_local_num_tokens=object(),
@@ -925,7 +935,12 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             decode_cuda_graph_runner=decode_graph,
             prefill_cuda_graph_runner=prefill_graph,
         )
-        buffers = object()
+        seq_lens = FillableBuffer()
+        seq_lens_cpu = FillableBuffer()
+        buffers = SimpleNamespace(
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+        )
         runner = SimpleNamespace(
             model_runner=model_runner,
             _alloc_dummy_decode_buffers=Mock(return_value=buffers),
@@ -937,6 +952,8 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         result = self.run_dummy_dispatch(runner, 1, [False, True, True, True])
 
         self.assertIs(result, output)
+        self.assertEqual(seq_lens.value, 1)
+        self.assertEqual(seq_lens_cpu.value, 1)
         model_runner.forward.assert_called_once_with(
             forward_batch,
             pp_proxy_tensors=pp_proxy_tensors,

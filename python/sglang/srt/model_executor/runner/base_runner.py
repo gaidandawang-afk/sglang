@@ -599,6 +599,10 @@ class BaseRunner(ABC):
         """Run a dummy decode through ModelRunner's normal graph/eager dispatch."""
         mr = self.model_runner
         buffers = self._alloc_dummy_decode_buffers(batch_size)
+        # Ascend PagedAttention requires a non-empty context. Mirror vLLM's
+        # one-token dummy request while keeping reserved request row 0 / KV page 0.
+        buffers.seq_lens[:batch_size].fill_(1)
+        buffers.seq_lens_cpu[:batch_size].fill_(1)
         (
             forward_batch,
             pp_proxy_tensors,
