@@ -986,21 +986,16 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             )
         )
 
-    def test_npu_stop_after_exception_resets_device_before_quarantine(self):
+    def test_npu_stop_after_exception_defers_recovery_until_scale_down(self):
         calls = []
         npu = SimpleNamespace(
             current_device=lambda: 3,
             stop_device=lambda device_id: calls.append(("stop", device_id)) or 0,
-            restart_device=lambda device_id: calls.append(("restart", device_id)),
         )
         torch_npu = ModuleType("torch_npu")
         torch_npu.npu = npu
-        torch_npu.distributed = SimpleNamespace(
-            reinit_process_group=lambda *args: calls.append(("reinit", *args))
-        )
         runner = SimpleNamespace(gpu_id=3, ps=SimpleNamespace(dp_rank=3))
         self.fake_torch.npu.set_device = lambda device: calls.append(("set", device))
-        self.fake_torch.npu.synchronize = lambda: calls.append(("synchronize",))
 
         with patch.dict(sys.modules, {"torch_npu": torch_npu}):
             with self.assertLogs(__name__, level="INFO") as captured:
@@ -1011,21 +1006,15 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             [
                 ("set", ("npu", 3)),
                 ("stop", 3),
-                ("restart", 3),
-                ("reinit", None, False),
-                ("synchronize",),
             ],
         )
         log_text = "\n".join(captured.output)
         expected_log_steps = [
             "step=early_stop_device phase=begin",
             "step=early_stop_device phase=complete",
-            "step=early_restart_device phase=begin",
-            "step=early_restart_device phase=complete",
-            "step=early_reinit_process_group phase=begin",
-            "step=early_reinit_process_group phase=complete",
-            "step=early_synchronize phase=begin",
-            "step=early_synchronize phase=complete",
+            "step=early_restart_device phase=skipped",
+            "step=early_reinit_process_group phase=skipped",
+            "step=early_synchronize phase=skipped",
         ]
         positions = [log_text.index(step) for step in expected_log_steps]
         self.assertEqual(positions, sorted(positions))

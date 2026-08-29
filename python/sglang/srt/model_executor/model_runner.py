@@ -1958,42 +1958,20 @@ class ModelRunner:
             result,
         )
         logger.info(
-            "NPU FT pause step=early_restart_device phase=begin dp_rank=%s "
-            "device_id=%s",
-            self.ps.dp_rank,
-            device_id,
-        )
-        restart_result = torch_npu.npu.restart_device(device_id)
-        logger.info(
-            "NPU FT pause step=early_restart_device phase=complete dp_rank=%s "
-            "device_id=%s result=%s",
-            self.ps.dp_rank,
-            device_id,
-            restart_result,
-        )
-        logger.info(
-            "NPU FT pause step=early_reinit_process_group phase=begin dp_rank=%s "
-            "device_id=%s rebuild_link=false",
-            self.ps.dp_rank,
-            device_id,
-        )
-        torch_npu.distributed.reinit_process_group(None, False)
-        logger.info(
-            "NPU FT pause step=early_reinit_process_group phase=complete "
-            "dp_rank=%s device_id=%s rebuild_link=false",
+            "NPU FT pause step=early_restart_device phase=skipped dp_rank=%s "
+            "device_id=%s reason=ablation",
             self.ps.dp_rank,
             device_id,
         )
         logger.info(
-            "NPU FT pause step=early_synchronize phase=begin dp_rank=%s "
-            "device_id=%s",
+            "NPU FT pause step=early_reinit_process_group phase=skipped "
+            "dp_rank=%s device_id=%s rebuild_link=false reason=ablation",
             self.ps.dp_rank,
             device_id,
         )
-        torch.npu.synchronize()
         logger.info(
-            "NPU FT pause step=early_synchronize phase=complete dp_rank=%s "
-            "device_id=%s quarantine=enabled",
+            "NPU FT pause step=early_synchronize phase=skipped dp_rank=%s "
+            "device_id=%s reason=ablation quarantine=enabled",
             self.ps.dp_rank,
             device_id,
         )
