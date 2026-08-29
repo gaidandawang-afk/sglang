@@ -4674,21 +4674,10 @@ class Scheduler(
             getattr(self.schedule_stream, "stream_id", None),
         )
 
-        # Per-forward result events are owned by result_queue and are cleared by
-        # the pending failed-batch discard. Clear the remaining long-lived
-        # readiness events; they will be recreated lazily without replacing any
-        # captured graph runner.
         logger.info(
-            "NPU FT recovery step=reset_readiness_events phase=begin dp_rank=%s",
-            self.ps.dp_rank,
-        )
-        self.model_worker.war_fastpath_runner.war_fastpath_read_done_event = None
-        self.future_map.publish_ready = None
-        self.future_map._publish_fresh = False
-        logger.info(
-            "NPU FT recovery step=reset_readiness_events phase=complete "
+            "NPU FT recovery step=reset_readiness_events phase=skipped "
             "dp_rank=%s schedule_stream=%s copy_stream=%s forward_stream=%s "
-            "graphs=preserved",
+            "graphs=preserved reason=ablation",
             self.ps.dp_rank,
             getattr(self.schedule_stream, "stream_id", None),
             getattr(self.copy_stream, "stream_id", None),

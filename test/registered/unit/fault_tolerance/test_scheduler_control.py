@@ -814,6 +814,10 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         old_copy_stream = scheduler.copy_stream
         old_forward_stream = scheduler.forward_stream
         old_forward_stream_ctx = scheduler.forward_stream_ctx
+        old_war_event = (
+            scheduler.model_worker.war_fastpath_runner.war_fastpath_read_done_event
+        )
+        old_publish_event = scheduler.future_map.publish_ready
         decode_graph_runner = object()
         prefill_graph_runner = object()
         scheduler.tp_worker.model_runner.decode_cuda_graph_runner = decode_graph_runner
@@ -839,14 +843,16 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             scheduler.tp_worker.model_runner.prefill_cuda_graph_runner,
             prefill_graph_runner,
         )
-        self.assertIsNone(
-            scheduler.model_worker.war_fastpath_runner.war_fastpath_read_done_event
+        self.assertIs(
+            scheduler.model_worker.war_fastpath_runner.war_fastpath_read_done_event,
+            old_war_event,
         )
-        self.assertIsNone(scheduler.future_map.publish_ready)
-        self.assertFalse(scheduler.future_map._publish_fresh)
+        self.assertIs(scheduler.future_map.publish_ready, old_publish_event)
+        self.assertTrue(scheduler.future_map._publish_fresh)
         log_text = "\n".join(captured.output)
         self.assertIn("step=rebuild_forward_stream phase=skipped", log_text)
         self.assertIn("forward_stream=10", log_text)
+        self.assertIn("step=reset_readiness_events phase=skipped", log_text)
         self.assertIn("reason=ablation", log_text)
         self.assertIn("graphs=preserved", log_text)
 
