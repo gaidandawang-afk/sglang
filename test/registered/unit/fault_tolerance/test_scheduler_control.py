@@ -945,6 +945,56 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         positions = [log_text.index(step) for step in expected_log_steps]
         self.assertEqual(positions, sorted(positions))
 
+    def test_npu_scale_down_rebalances_before_updating_mc2_elastic_info(self):
+        path = REPO_ROOT / "python/sglang/srt/model_executor/model_runner.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        model_runner = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "ModelRunner"
+        )
+        method = next(
+            node
+            for node in model_runner.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "apply_fault_tolerance_scale_down"
+        )
+        npu_branch = next(
+            node
+            for node in method.body
+            if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "is_npu_ft_mc2"
+            and "update_npu_mc2_elastic_info" in ast.unparse(node)
+        )
+        branch_calls = [
+            node
+            for statement in npu_branch.body
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Call)
+        ]
+        rebalance = next(
+            call
+            for call in branch_calls
+            if isinstance(call.func, ast.Attribute)
+            and call.func.attr == "rebalance"
+        )
+        update_elastic_info = next(
+            call
+            for call in branch_calls
+            if isinstance(call.func, ast.Attribute)
+            and call.func.attr == "update_npu_mc2_elastic_info"
+        )
+
+        self.assertLess(rebalance.lineno, update_elastic_info.lineno)
+        self.assertTrue(
+            any(
+                keyword.arg == "force"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is True
+                for keyword in rebalance.keywords
+            )
+        )
+
     def test_npu_stop_after_exception_resets_device_before_quarantine(self):
         calls = []
         npu = SimpleNamespace(

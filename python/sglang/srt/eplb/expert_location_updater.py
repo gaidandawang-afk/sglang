@@ -149,7 +149,9 @@ def _update_expert_weights_raw(
 
     world_size = torch.distributed.get_world_size()
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
-    num_gpu_per_node = world_size // nnodes
+    original_world_size = old_expert_location_metadata.ep_size
+    assert original_world_size % nnodes == 0
+    num_gpu_per_node = original_world_size // nnodes
 
     missing_logical_experts_by_layers: Dict[int, List[int]] = {}
 
@@ -419,6 +421,14 @@ def update_expert_weights_single_layer(
                 if old_physical_to_logical_map[x] == logical_expert_id
             ]
         )
+        elastic_ep_state = ElasticEPStateManager.instance()
+        if elastic_ep_state is not None:
+            active_src_ranks = [
+                src_rank
+                for src_rank in all_src_ranks
+                if elastic_ep_state.active_ranks_cpu[src_rank]
+            ]
+            all_src_ranks = active_src_ranks or all_src_ranks
         all_src_nodes = [x // num_gpu_per_node for x in all_src_ranks]
         self_node_src_ranks = [
             x for x in all_src_ranks if x // num_gpu_per_node == self_node_id

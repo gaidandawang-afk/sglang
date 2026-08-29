@@ -2220,8 +2220,16 @@ class ModelRunner:
         )
         if is_npu_ft_mc2:
             logger.info(
-                "Skipping NPU EPLB during fault-tolerance scale-down; "
-                "the original MC2 HCCL group will be reused with elastic info"
+                "NPU FT elastic step=rebalance_experts phase=begin dp_rank=%s "
+                "original_mc2_hccl_group=reused",
+                self.ps.dp_rank,
+            )
+            for _ in self.eplb_manager.rebalance(force=True):
+                pass
+            logger.info(
+                "NPU FT elastic step=rebalance_experts phase=complete dp_rank=%s "
+                "original_mc2_hccl_group=reused",
+                self.ps.dp_rank,
             )
             logger.info(
                 "NPU FT elastic step=update_mc2_elastic_info phase=begin "
