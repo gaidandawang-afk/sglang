@@ -290,7 +290,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         forward_stream = SimpleNamespace(
             stream_id=10, synchronize=Mock(), wait_stream=Mock()
         )
-        schedule_stream = SimpleNamespace(stream_id=11, synchronize=Mock())
         old_copy_stream = SimpleNamespace(stream_id=8, synchronize=Mock())
         old_schedule_stream = SimpleNamespace(stream_id=9, synchronize=Mock())
         model_runner = SimpleNamespace(
@@ -309,7 +308,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             tp_worker=SimpleNamespace(model_runner=model_runner),
             server_args=SimpleNamespace(elastic_ep_backend="mc2"),
             device_module=SimpleNamespace(
-                Stream=Mock(return_value=schedule_stream),
+                Stream=Mock(),
                 stream=lambda stream: nullcontext(),
                 StreamContext=lambda stream: nullcontext(),
             ),
@@ -809,7 +808,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertEqual(processed, [[request]])
         scheduler._check_ft_pause_deadline.assert_called_once()
 
-    def test_rebuilds_control_streams_and_preserves_forward_runtime(self):
+    def test_control_runtime_rebuild_preserves_streams_and_events(self):
         scheduler = self.make_scheduler()
         old_schedule_stream = scheduler.schedule_stream
         old_copy_stream = scheduler.copy_stream
@@ -830,7 +829,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         with self.assertLogs(__name__, level="INFO") as captured:
             self.rebuild_streams(scheduler)
 
-        self.assertIsNot(scheduler.schedule_stream, old_schedule_stream)
+        self.assertIs(scheduler.schedule_stream, old_schedule_stream)
         self.assertIs(scheduler.copy_stream, old_copy_stream)
         self.assertIs(scheduler.copy_stream_ctx, old_copy_stream_ctx)
         self.assertIs(scheduler.forward_stream, old_forward_stream)
@@ -852,9 +851,11 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         )
         self.assertIs(scheduler.future_map.publish_ready, old_publish_event)
         self.assertTrue(scheduler.future_map._publish_fresh)
+        scheduler.device_module.Stream.assert_not_called()
         log_text = "\n".join(captured.output)
         self.assertIn("step=rebuild_forward_stream phase=skipped", log_text)
         self.assertIn("step=rebuild_copy_stream phase=skipped", log_text)
+        self.assertIn("step=rebuild_schedule_stream phase=skipped", log_text)
         self.assertIn("forward_stream=10", log_text)
         self.assertIn("step=reset_readiness_events phase=skipped", log_text)
         self.assertIn("reason=ablation", log_text)
