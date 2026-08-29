@@ -291,7 +291,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             stream_id=10, synchronize=Mock(), wait_stream=Mock()
         )
         schedule_stream = SimpleNamespace(stream_id=11, synchronize=Mock())
-        copy_stream = SimpleNamespace(stream_id=12, synchronize=Mock())
+        old_copy_stream = SimpleNamespace(stream_id=8, synchronize=Mock())
         old_schedule_stream = SimpleNamespace(stream_id=9, synchronize=Mock())
         model_runner = SimpleNamespace(
             forward_stream=forward_stream,
@@ -309,13 +309,14 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             tp_worker=SimpleNamespace(model_runner=model_runner),
             server_args=SimpleNamespace(elastic_ep_backend="mc2"),
             device_module=SimpleNamespace(
-                Stream=Mock(side_effect=[copy_stream, schedule_stream]),
+                Stream=Mock(return_value=schedule_stream),
                 stream=lambda stream: nullcontext(),
                 StreamContext=lambda stream: nullcontext(),
             ),
             forward_stream=forward_stream,
             forward_stream_ctx=nullcontext(),
-            copy_stream=object(),
+            copy_stream=old_copy_stream,
+            copy_stream_ctx=nullcontext(),
             schedule_stream=old_schedule_stream,
             model_worker=SimpleNamespace(
                 war_fastpath_runner=SimpleNamespace(
@@ -812,6 +813,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         scheduler = self.make_scheduler()
         old_schedule_stream = scheduler.schedule_stream
         old_copy_stream = scheduler.copy_stream
+        old_copy_stream_ctx = scheduler.copy_stream_ctx
         old_forward_stream = scheduler.forward_stream
         old_forward_stream_ctx = scheduler.forward_stream_ctx
         old_war_event = (
@@ -829,7 +831,8 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             self.rebuild_streams(scheduler)
 
         self.assertIsNot(scheduler.schedule_stream, old_schedule_stream)
-        self.assertIsNot(scheduler.copy_stream, old_copy_stream)
+        self.assertIs(scheduler.copy_stream, old_copy_stream)
+        self.assertIs(scheduler.copy_stream_ctx, old_copy_stream_ctx)
         self.assertIs(scheduler.forward_stream, old_forward_stream)
         self.assertIs(scheduler.forward_stream_ctx, old_forward_stream_ctx)
         self.assertIs(
@@ -851,6 +854,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertTrue(scheduler.future_map._publish_fresh)
         log_text = "\n".join(captured.output)
         self.assertIn("step=rebuild_forward_stream phase=skipped", log_text)
+        self.assertIn("step=rebuild_copy_stream phase=skipped", log_text)
         self.assertIn("forward_stream=10", log_text)
         self.assertIn("step=reset_readiness_events phase=skipped", log_text)
         self.assertIn("reason=ablation", log_text)

@@ -4651,14 +4651,8 @@ class Scheduler(
             getattr(self.forward_stream, "stream_id", None),
         )
         logger.info(
-            "NPU FT recovery step=rebuild_copy_stream phase=begin dp_rank=%s",
-            self.ps.dp_rank,
-        )
-        self.copy_stream = self.device_module.Stream()
-        self.copy_stream_ctx = self.device_module.stream(self.copy_stream)
-        logger.info(
-            "NPU FT recovery step=rebuild_copy_stream phase=complete "
-            "dp_rank=%s copy_stream=%s",
+            "NPU FT recovery step=rebuild_copy_stream phase=skipped "
+            "dp_rank=%s copy_stream=%s reason=ablation",
             self.ps.dp_rank,
             getattr(self.copy_stream, "stream_id", None),
         )
