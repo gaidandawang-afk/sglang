@@ -290,9 +290,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         forward_stream = SimpleNamespace(
             stream_id=10, synchronize=Mock(), wait_stream=Mock()
         )
-        new_forward_stream = SimpleNamespace(
-            stream_id=13, synchronize=Mock(), wait_stream=Mock()
-        )
         schedule_stream = SimpleNamespace(stream_id=11, synchronize=Mock())
         copy_stream = SimpleNamespace(stream_id=12, synchronize=Mock())
         old_schedule_stream = SimpleNamespace(stream_id=9, synchronize=Mock())
@@ -313,9 +310,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             tp_worker=SimpleNamespace(model_runner=model_runner),
             server_args=SimpleNamespace(elastic_ep_backend="mc2"),
             device_module=SimpleNamespace(
-                Stream=Mock(
-                    side_effect=[new_forward_stream, copy_stream, schedule_stream]
-                ),
+                Stream=Mock(side_effect=[copy_stream, schedule_stream]),
                 stream=lambda stream: nullcontext(),
                 StreamContext=lambda stream: nullcontext(),
             ),
@@ -819,11 +814,12 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertEqual(processed, [[request]])
         scheduler._check_ft_pause_deadline.assert_called_once()
 
-    def test_rebuilds_runtime_streams_and_preserves_graphs(self):
+    def test_rebuilds_control_streams_and_preserves_forward_runtime(self):
         scheduler = self.make_scheduler()
         old_schedule_stream = scheduler.schedule_stream
         old_copy_stream = scheduler.copy_stream
         old_forward_stream = scheduler.forward_stream
+        old_forward_stream_ctx = scheduler.forward_stream_ctx
         decode_graph_runner = object()
         prefill_graph_runner = object()
         scheduler.tp_worker.model_runner.decode_cuda_graph_runner = decode_graph_runner
@@ -836,10 +832,10 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         self.assertIsNot(scheduler.schedule_stream, old_schedule_stream)
         self.assertIsNot(scheduler.copy_stream, old_copy_stream)
-        self.assertIsNot(scheduler.forward_stream, old_forward_stream)
+        self.assertIs(scheduler.forward_stream, old_forward_stream)
+        self.assertIs(scheduler.forward_stream_ctx, old_forward_stream_ctx)
         self.assertIs(
-            scheduler.tp_worker.model_runner.forward_stream,
-            scheduler.forward_stream,
+            scheduler.tp_worker.model_runner.forward_stream, old_forward_stream
         )
         self.assertIs(
             scheduler.tp_worker.model_runner.decode_cuda_graph_runner,
@@ -855,13 +851,12 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertIsNone(scheduler.future_map.publish_ready)
         self.assertFalse(scheduler.future_map._publish_fresh)
         log_text = "\n".join(captured.output)
-        self.assertIn("step=rebuild_forward_stream phase=begin", log_text)
-        self.assertIn("step=rebuild_forward_stream phase=complete", log_text)
-        self.assertIn("old_forward_stream=10", log_text)
-        self.assertIn("forward_stream=13", log_text)
+        self.assertIn("step=rebuild_forward_stream phase=skipped", log_text)
+        self.assertIn("forward_stream=10", log_text)
+        self.assertIn("reason=ablation", log_text)
         self.assertIn("graphs=preserved", log_text)
 
-    def test_rebuild_forward_stream_refreshes_long_lived_consumers(self):
+    def test_rebuild_preserves_long_lived_forward_stream_consumers(self):
         scheduler = self.make_scheduler()
         old_forward_stream = scheduler.forward_stream
         hisparse_coordinator = SimpleNamespace(set_decode_producer_stream=Mock())
@@ -877,18 +872,20 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         self.rebuild_streams(scheduler)
 
-        hisparse_coordinator.set_decode_producer_stream.assert_called_once_with(
-            scheduler.forward_stream
-        )
-        self.assertIs(allocator.forward_stream, scheduler.forward_stream)
+        hisparse_coordinator.set_decode_producer_stream.assert_not_called()
+        self.assertIs(scheduler.forward_stream, old_forward_stream)
         self.assertIs(
-            allocator.full_attn_allocator.forward_stream, scheduler.forward_stream
+            scheduler.tp_worker.model_runner.forward_stream, old_forward_stream
+        )
+        self.assertIs(allocator.forward_stream, old_forward_stream)
+        self.assertIs(
+            allocator.full_attn_allocator.forward_stream, old_forward_stream
         )
         self.assertIs(
-            allocator.mamba_allocator.forward_stream, scheduler.forward_stream
+            allocator.mamba_allocator.forward_stream, old_forward_stream
         )
         self.assertIs(
-            allocator.swa_attn_allocator.forward_stream, scheduler.forward_stream
+            allocator.swa_attn_allocator.forward_stream, old_forward_stream
         )
 
     def test_npu_scale_down_restarts_without_artificial_delay(self):
