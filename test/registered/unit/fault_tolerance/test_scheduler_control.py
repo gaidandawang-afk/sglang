@@ -149,7 +149,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             "Scheduler",
             {
                 "_run_event_loop_fault_tolerance",
-                "_run_fault_tolerance_control_loop",
                 "_rebuild_npu_fault_tolerance_control_runtime",
                 "_recover_npu_fault_tolerance_scale_down",
                 "handle_fault_tolerance_command",
@@ -175,9 +174,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             },
         )
         cls.run_ft_loop = staticmethod(scheduler["_run_event_loop_fault_tolerance"])
-        cls.run_ft_control_loop = staticmethod(
-            scheduler["_run_fault_tolerance_control_loop"]
-        )
         cls.rebuild_streams = staticmethod(
             scheduler["_rebuild_npu_fault_tolerance_control_runtime"]
         )
@@ -573,11 +569,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             _ft_discard_inflight_window=lambda exc: events.append("discarded") or True,
             ipc_channels=SimpleNamespace(send_to_tokenizer=sender),
             ps=SimpleNamespace(dp_rank=0),
-            device_module=SimpleNamespace(StreamContext=lambda stream: nullcontext()),
-            schedule_stream=object(),
-            _run_fault_tolerance_control_loop=lambda: (_ for _ in ()).throw(
-                KeyboardInterrupt()
-            ),
             server_args=SimpleNamespace(
                 fault_tolerance_on_error_strategy="pause",
                 fault_tolerance_pause_timeout=30,
@@ -610,8 +601,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 )
             ),
             ps=SimpleNamespace(dp_rank=0),
-            device_module=SimpleNamespace(StreamContext=lambda stream: nullcontext()),
-            schedule_stream=object(),
             server_args=SimpleNamespace(
                 fault_tolerance_on_error_strategy="continue",
                 fault_tolerance_pause_timeout=30,
@@ -628,13 +617,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
     def test_npu_mc2_defers_discard_until_scale_down(self):
         events = []
         dispatched = False
-
-        class RecordingContext:
-            def __enter__(self):
-                events.append("enter_stream")
-
-            def __exit__(self, exc_type, exc, traceback):
-                events.append("exit_stream")
 
         def dispatch(_):
             nonlocal dispatched
@@ -654,13 +636,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 )
             ),
             ps=SimpleNamespace(dp_rank=0),
-            device_module=SimpleNamespace(
-                StreamContext=lambda stream: RecordingContext()
-            ),
             schedule_stream=object(),
-            _run_fault_tolerance_control_loop=lambda: (_ for _ in ()).throw(
-                KeyboardInterrupt()
-            ),
             server_args=SimpleNamespace(
                 elastic_ep_backend="mc2",
                 fault_tolerance_on_error_strategy="pause",
@@ -681,9 +657,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                "enter_stream",
                 "fault",
-                "exit_stream",
                 "report",
             ],
         )
@@ -716,34 +690,28 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         self.assertEqual(server_args.fault_tolerance_on_error_strategy, "pause")
 
-    def test_fault_control_starts_after_faulted_stream_context_exits(self):
+    def test_fault_tolerance_reenters_shared_dispatch_loop(self):
         events = []
-
-        class RecordingContext:
-            def __enter__(self):
-                events.append("enter_stream")
-
-            def __exit__(self, exc_type, exc, traceback):
-                events.append("exit_stream")
+        dispatched = False
 
         def dispatch(_):
-            events.append("fault")
-            raise RuntimeError("boom")
+            nonlocal dispatched
+            if not dispatched:
+                dispatched = True
+                events.append("fault")
+                raise RuntimeError("boom")
+            events.append("shared_dispatch")
+            raise KeyboardInterrupt()
 
         self.run_ft_loop.__globals__["dispatch_event_loop"] = dispatch
         scheduler = SimpleNamespace(
             _ft_discard_inflight_window=lambda exc: events.append("discarded") or True,
-            _run_fault_tolerance_control_loop=lambda: events.append("control"),
             ipc_channels=SimpleNamespace(
                 send_to_tokenizer=SimpleNamespace(
                     send_output=lambda *_: events.append("report")
                 )
             ),
             ps=SimpleNamespace(dp_rank=0),
-            device_module=SimpleNamespace(
-                StreamContext=lambda stream: RecordingContext()
-            ),
-            schedule_stream=object(),
             server_args=SimpleNamespace(
                 fault_tolerance_on_error_strategy="pause",
                 fault_tolerance_pause_timeout=30,
@@ -753,52 +721,18 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         )
 
         self.run_ft_loop.__globals__["_is_npu"] = False
-        calls = 0
-
-        def control_once():
-            nonlocal calls
-            calls += 1
-            events.append("control")
-            raise KeyboardInterrupt()
-
-        scheduler._run_fault_tolerance_control_loop = control_once
         with self.assertRaises(KeyboardInterrupt):
             self.run_ft_loop(scheduler)
 
-        self.assertEqual(calls, 1)
         self.assertEqual(
             events,
             [
-                "enter_stream",
                 "fault",
-                "exit_stream",
                 "discarded",
                 "report",
-                "control",
+                "shared_dispatch",
             ],
         )
-
-    def test_fault_tolerance_control_loop_only_handles_ft_commands(self):
-        ordinary_request = object()
-        request = FaultToleranceCommandReqInput(command="retry")
-        processed = []
-        scheduler = SimpleNamespace(
-            ps=SimpleNamespace(dp_rank=1),
-            _engine_paused=True,
-            request_receiver=SimpleNamespace(
-                recv_requests=lambda: [ordinary_request, request]
-            ),
-            process_input_requests=lambda reqs: (
-                processed.append(reqs),
-                setattr(scheduler, "_engine_paused", False),
-            ),
-            _check_ft_pause_deadline=Mock(),
-        )
-
-        self.run_ft_control_loop(scheduler)
-
-        self.assertEqual(processed, [[request]])
-        scheduler._check_ft_pause_deadline.assert_called_once()
 
     def test_control_runtime_rebuild_preserves_streams_and_events(self):
         scheduler = self.make_scheduler()

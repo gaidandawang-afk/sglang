@@ -1554,17 +1554,16 @@ class Scheduler(
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
-        if self.server_args.enable_fault_tolerance:
-            self._run_event_loop_fault_tolerance()
-        else:
-            with self.device_module.StreamContext(self.schedule_stream):
+        with self.device_module.StreamContext(self.schedule_stream):
+            if self.server_args.enable_fault_tolerance:
+                self._run_event_loop_fault_tolerance()
+            else:
                 dispatch_event_loop(self)
 
     def _run_event_loop_fault_tolerance(self) -> None:
         while True:
             try:
-                with self.device_module.StreamContext(self.schedule_stream):
-                    dispatch_event_loop(self)
+                dispatch_event_loop(self)
                 return
             except Exception as exc:
                 defer_discard = (
@@ -1573,7 +1572,8 @@ class Scheduler(
                 if defer_discard:
                     logger.warning(
                         "NPU FT pause step=exit_faulted_schedule_stream "
-                        "phase=complete dp_rank=%s schedule_stream=%s error=%s",
+                        "phase=skipped dp_rank=%s schedule_stream=%s "
+                        "reason=ablation error=%s",
                         self.ps.dp_rank,
                         getattr(self.schedule_stream, "stream_id", None),
                         exc,
@@ -1617,36 +1617,6 @@ class Scheduler(
                 )
                 if should_continue:
                     continue
-                self._run_fault_tolerance_control_loop()
-
-    def _run_fault_tolerance_control_loop(self) -> None:
-        logger.info(
-            "NPU FT control step=host_control_loop phase=begin dp_rank=%s",
-            self.ps.dp_rank,
-        )
-        while self._engine_paused:
-            recv_reqs = self.request_receiver.recv_requests()
-            ft_reqs = [
-                recv_req
-                for recv_req in recv_reqs
-                if isinstance(recv_req, FaultToleranceCommandReqInput)
-            ]
-            dropped_count = len(recv_reqs) - len(ft_reqs)
-            if dropped_count:
-                logger.warning(
-                    "FT paused scheduler ignored %d non-control request(s): dp_rank=%s",
-                    dropped_count,
-                    self.ps.dp_rank,
-                )
-            if ft_reqs:
-                self.process_input_requests(ft_reqs)
-            self._check_ft_pause_deadline()
-            if self._engine_paused and not ft_reqs:
-                time.sleep(0.01)
-        logger.info(
-            "NPU FT control step=host_control_loop phase=complete dp_rank=%s",
-            self.ps.dp_rank,
-        )
 
     def _ft_discard_inflight_window(self, reason) -> bool:
         window_batches = [
