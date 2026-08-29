@@ -251,7 +251,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             {
                 "recover_npu_device_for_fault_tolerance_scale_down",
                 "run_npu_fault_tolerance_dummy_batch",
-                "stop_npu_device_after_scheduler_exception",
             },
             {
                 "ElasticEPStateManager": SimpleNamespace(
@@ -266,9 +265,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         )
         cls.run_npu_dummy = staticmethod(
             model_runner["run_npu_fault_tolerance_dummy_batch"]
-        )
-        cls.stop_npu_after_exception = staticmethod(
-            model_runner["stop_npu_device_after_scheduler_exception"]
         )
 
         base_runner = load_class_methods(
@@ -662,13 +658,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 StreamContext=lambda stream: RecordingContext()
             ),
             schedule_stream=object(),
-            tp_worker=SimpleNamespace(
-                model_runner=SimpleNamespace(
-                    stop_npu_device_after_scheduler_exception=lambda exc: events.append(
-                        "stop_device"
-                    )
-                )
-            ),
             _run_fault_tolerance_control_loop=lambda: (_ for _ in ()).throw(
                 KeyboardInterrupt()
             ),
@@ -683,8 +672,9 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         )
 
         try:
-            with self.assertRaises(KeyboardInterrupt):
-                self.run_ft_loop(scheduler)
+            with self.assertLogs(__name__, level="INFO") as captured:
+                with self.assertRaises(KeyboardInterrupt):
+                    self.run_ft_loop(scheduler)
         finally:
             self.run_ft_loop.__globals__["_is_npu"] = False
 
@@ -694,9 +684,11 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 "enter_stream",
                 "fault",
                 "exit_stream",
-                "stop_device",
                 "report",
             ],
+        )
+        self.assertIn(
+            "step=early_stop_device phase=skipped", "\n".join(captured.output)
         )
         self.assertEqual(scheduler._ft_pending_discard_reason, "mlp-sync failed")
 
@@ -990,39 +982,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 for keyword in rebalance.keywords
             )
         )
-
-    def test_npu_stop_after_exception_defers_recovery_until_scale_down(self):
-        calls = []
-        npu = SimpleNamespace(
-            current_device=lambda: 3,
-            stop_device=lambda device_id: calls.append(("stop", device_id)) or 0,
-        )
-        torch_npu = ModuleType("torch_npu")
-        torch_npu.npu = npu
-        runner = SimpleNamespace(gpu_id=3, ps=SimpleNamespace(dp_rank=3))
-        self.fake_torch.npu.set_device = lambda device: calls.append(("set", device))
-
-        with patch.dict(sys.modules, {"torch_npu": torch_npu}):
-            with self.assertLogs(__name__, level="INFO") as captured:
-                self.stop_npu_after_exception(runner, RuntimeError("507046"))
-
-        self.assertEqual(
-            calls,
-            [
-                ("set", ("npu", 3)),
-                ("stop", 3),
-            ],
-        )
-        log_text = "\n".join(captured.output)
-        expected_log_steps = [
-            "step=early_stop_device phase=begin",
-            "step=early_stop_device phase=complete",
-            "step=early_restart_device phase=skipped",
-            "step=early_reinit_process_group phase=skipped",
-            "step=early_synchronize phase=skipped",
-        ]
-        positions = [log_text.index(step) for step in expected_log_steps]
-        self.assertEqual(positions, sorted(positions))
 
     def test_npu_dummy_uses_normal_model_runner_dispatch(self):
         output = SimpleNamespace(can_run_graph=True)

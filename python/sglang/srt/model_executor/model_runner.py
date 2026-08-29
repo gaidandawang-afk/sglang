@@ -1922,60 +1922,6 @@ class ModelRunner:
             )
         return output
 
-    def stop_npu_device_after_scheduler_exception(self, reason: Exception) -> None:
-        import torch_npu
-
-        device_id = self.gpu_id
-        logger.info(
-            "NPU FT pause step=bind_device phase=begin dp_rank=%s device_id=%s",
-            self.ps.dp_rank,
-            device_id,
-        )
-        torch.npu.set_device(torch.device("npu", device_id))
-        bound_device = torch_npu.npu.current_device()
-        logger.info(
-            "NPU FT pause step=bind_device phase=complete dp_rank=%s "
-            "configured_device=%s bound_device=%s",
-            self.ps.dp_rank,
-            device_id,
-            bound_device,
-        )
-        logger.info(
-            "NPU FT pause step=early_stop_device phase=begin reason=%s "
-            "dp_rank=%s device_id=%s",
-            reason,
-            self.ps.dp_rank,
-            device_id,
-        )
-        result = torch_npu.npu.stop_device(device_id)
-        if result != 0:
-            raise RuntimeError(f"stop_device({device_id}) returned {result}")
-        logger.info(
-            "NPU FT pause step=early_stop_device phase=complete dp_rank=%s "
-            "device_id=%s result=%s",
-            self.ps.dp_rank,
-            device_id,
-            result,
-        )
-        logger.info(
-            "NPU FT pause step=early_restart_device phase=skipped dp_rank=%s "
-            "device_id=%s reason=ablation",
-            self.ps.dp_rank,
-            device_id,
-        )
-        logger.info(
-            "NPU FT pause step=early_reinit_process_group phase=skipped "
-            "dp_rank=%s device_id=%s rebuild_link=false reason=ablation",
-            self.ps.dp_rank,
-            device_id,
-        )
-        logger.info(
-            "NPU FT pause step=early_synchronize phase=skipped dp_rank=%s "
-            "device_id=%s reason=ablation quarantine=enabled",
-            self.ps.dp_rank,
-            device_id,
-        )
-
     def recover_npu_device_for_fault_tolerance_scale_down(self) -> None:
         import torch_npu
 

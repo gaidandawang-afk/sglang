@@ -1604,16 +1604,11 @@ class Scheduler(
                             self.ps.dp_rank,
                             self._ft_pause_deadline,
                         )
-                        try:
-                            self.tp_worker.model_runner.stop_npu_device_after_scheduler_exception(
-                                exc
-                            )
-                        except Exception:
-                            logger.exception(
-                                "NPU FT failed to reset device after scheduler "
-                                "exception: dp_rank=%s",
-                                self.ps.dp_rank,
-                            )
+                        logger.info(
+                            "NPU FT pause step=early_stop_device phase=skipped "
+                            "dp_rank=%s reason=ablation",
+                            self.ps.dp_rank,
+                        )
                 self.ipc_channels.send_to_tokenizer.send_output(
                     FaultToleranceRankFaultOutput(
                         rank=self.ps.dp_rank,
