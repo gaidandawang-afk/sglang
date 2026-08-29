@@ -279,7 +279,7 @@ def update_expert_weights_single_layer(
 
         _handle_recv(buffer2weight_copy_infos, p2p_op_infos)
         _create_isend_ops(p2p_op_infos)
-        if process_group_context.group is None:
+        if process_group_context.active_original_ranks is None:
             _filter_p2p_ops(p2p_op_infos)
         _execute_p2p_ops(p2p_op_infos)
         _execute_buffer2weight_copies(buffer2weight_copy_infos)
@@ -351,7 +351,7 @@ def update_expert_weights_single_layer(
         )
 
         if (
-            process_group_context.group is not None
+            process_group_context.active_original_ranks is not None
             and not same_node_mapping.chunk_values
             and not cross_node_mapping.chunk_values
         ):
@@ -475,7 +475,7 @@ def update_expert_weights_single_layer(
                 if old_physical_to_logical_map[x] == logical_expert_id
             ]
         )
-        if process_group_context.group is not None:
+        if process_group_context.active_original_ranks is not None:
             all_src_ranks = [
                 src_rank
                 for src_rank in all_src_ranks
@@ -501,7 +501,7 @@ def update_expert_weights_single_layer(
                 and x // num_local_physical_experts not in all_src_ranks
             ]
         )
-        if process_group_context.group is not None:
+        if process_group_context.active_original_ranks is not None:
             need_comm_dst_ranks = [
                 dst_rank
                 for dst_rank in need_comm_dst_ranks
@@ -554,11 +554,12 @@ def update_expert_weights_single_layer(
                         p2p_op_infos[i] = (logical_expert_id, [])
 
     def _p2p_peer_kwargs(original_rank: int):
-        if process_group_context.group is None:
+        if process_group_context.device_group is None:
             return {"peer": original_rank}
+        # The reused device group keeps its startup rank namespace.
         return {
-            "peer": process_group_context.to_group_rank(original_rank),
-            "group": process_group_context.group,
+            "peer": original_rank,
+            "group": process_group_context.device_group,
         }
 
     def _execute_p2p_ops(p2p_op_infos):
@@ -582,7 +583,7 @@ def update_expert_weights_single_layer(
                     batch_ops.extend(ops_by_expert[eid])
             if batch_ops:
                 recv_copy_infos = []
-                if process_group_context.group is not None:
+                if process_group_context.device_group is not None:
                     batch_ops, recv_copy_infos = _stage_npu_p2p_ops(batch_ops)
                 reqs = torch.distributed.batch_isend_irecv(batch_ops)
                 for req in reqs:

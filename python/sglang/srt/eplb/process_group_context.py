@@ -8,8 +8,12 @@ import torch.distributed
 
 @dataclass(frozen=True)
 class EPLBProcessGroupContext:
-    group: Optional[torch.distributed.ProcessGroup] = None
+    """Communication planes used by EPLB after membership changes."""
+
+    control_group: Optional[torch.distributed.ProcessGroup] = None
+    device_group: Optional[torch.distributed.ProcessGroup] = None
     active_original_ranks: Optional[tuple[int, ...]] = None
+    control_group_uses_cpu: bool = False
 
     def is_active(self, original_rank: int) -> bool:
         return (
@@ -17,12 +21,12 @@ class EPLBProcessGroupContext:
             or original_rank in self.active_original_ranks
         )
 
-    def to_group_rank(self, original_rank: int) -> int:
+    def to_control_group_rank(self, original_rank: int) -> int:
         if self.active_original_ranks is None:
             return original_rank
         return self.active_original_ranks.index(original_rank)
 
-    def is_group_root(self, original_rank: int) -> bool:
+    def is_control_group_root(self, original_rank: int) -> bool:
         if self.active_original_ranks is None:
             return original_rank == 0
         return original_rank == self.active_original_ranks[0]
