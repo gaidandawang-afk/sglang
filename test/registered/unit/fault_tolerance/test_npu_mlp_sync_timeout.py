@@ -57,8 +57,7 @@ class TestNpuMLPSyncTimeout(unittest.TestCase):
         self.assertEqual(init_group.call_args_list[0].kwargs["backend"], "gloo")
         self.assertEqual(init_group.call_args_list[1].kwargs["backend"], "hccl")
         barrier.assert_called_once_with(group=mlp_sync_group)
-        all_reduce.assert_called_once()
-        self.assertIs(all_reduce.call_args.kwargs["group"], eplb_group)
+        all_reduce.assert_not_called()
         context = set_context.call_args.args[0]
         self.assertIs(context.group, eplb_group)
         self.assertEqual(context.active_original_ranks, (1, 2, 3))

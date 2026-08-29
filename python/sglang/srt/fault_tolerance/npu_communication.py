@@ -160,17 +160,8 @@ class NpuFTCommunication:
             compact_rank,
         )
         logger.info(
-            "NPU FT groups step=eplb_warmup phase=begin original_rank=%s "
-            "compact_rank=%s device=%s",
-            self.original_rank,
-            compact_rank,
-            device,
-        )
-        warmup = torch.zeros(1, dtype=torch.int32, device=device)
-        dist.all_reduce(warmup, group=eplb_group)
-        logger.info(
-            "NPU FT groups step=eplb_warmup phase=complete original_rank=%s "
-            "compact_rank=%s device=%s",
+            "NPU FT groups step=eplb_warmup phase=skipped original_rank=%s "
+            "compact_rank=%s device=%s reason=ablation",
             self.original_rank,
             compact_rank,
             device,
