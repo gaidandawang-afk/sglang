@@ -51,15 +51,6 @@ class NpuFTCommunication:
         self.trace_epoch += 1
         self.trace_forward_mode = local_forward_mode
         self.trace_num_tokens = num_tokens
-        logger.info(
-            "NPU_FT_TRACE mlp_sync_complete epoch=%d original_rank=%d "
-            "forward_mode=%s num_tokens=%d active_original_ranks=%s",
-            self.trace_epoch,
-            self.original_rank,
-            local_forward_mode,
-            num_tokens,
-            self.active_original_ranks,
-        )
 
     def record_device_dispatch_enter(self) -> None:
         if self.trace_dispatch_enter_epoch == self.trace_epoch:

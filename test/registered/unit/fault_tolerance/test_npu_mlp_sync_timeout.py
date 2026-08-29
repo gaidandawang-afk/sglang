@@ -85,11 +85,10 @@ class TestNpuMLPSyncTimeout(unittest.TestCase):
             communication.record_device_dispatch_host_return()
             communication.record_device_dispatch_host_return()
 
-        self.assertEqual(len(logs.output), 3)
-        self.assertIn("mlp_sync_complete epoch=1", logs.output[0])
-        self.assertIn("device_dispatch_enter epoch=1", logs.output[1])
-        self.assertIn("forward_mode=DECODE", logs.output[1])
-        self.assertIn("device_dispatch_host_return epoch=1", logs.output[2])
+        self.assertEqual(len(logs.output), 2)
+        self.assertIn("device_dispatch_enter epoch=1", logs.output[0])
+        self.assertIn("forward_mode=DECODE", logs.output[0])
+        self.assertIn("device_dispatch_host_return epoch=1", logs.output[1])
 
     def test_mlp_sync_gather_has_bounded_wait(self):
         work = Mock()
