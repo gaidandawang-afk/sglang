@@ -2190,14 +2190,17 @@ class ModelRunner:
             )
 
             logger.info(
-                "NPU FT elastic step=rebuild_mlp_sync_group phase=begin "
+                "NPU FT elastic step=rebuild_survivor_groups phase=begin "
                 "dp_rank=%s active_mask=%s",
                 self.ps.dp_rank,
                 active_mask,
             )
-            get_npu_ft_communication().rebuild_mlp_sync_group(active_mask)
+            get_npu_ft_communication().rebuild_survivor_groups(
+                active_mask,
+                torch.device("npu", self.gpu_id),
+            )
             logger.info(
-                "NPU FT elastic step=rebuild_mlp_sync_group phase=complete "
+                "NPU FT elastic step=rebuild_survivor_groups phase=complete "
                 "dp_rank=%s",
                 self.ps.dp_rank,
             )

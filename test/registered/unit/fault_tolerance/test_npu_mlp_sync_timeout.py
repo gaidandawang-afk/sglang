@@ -11,6 +11,59 @@ from sglang.srt.fault_tolerance.npu_communication import (
 
 
 class TestNpuMLPSyncTimeout(unittest.TestCase):
+    def test_rebuild_survivor_groups_uses_compact_rank_view(self):
+        communication = NpuFTCommunication(
+            store=Mock(),
+            original_rank=2,
+            timeout_sec=5,
+            mlp_sync_group=Mock(),
+            active_original_ranks=(0, 1, 2, 3),
+        )
+        mlp_sync_group = object()
+        eplb_group = object()
+
+        with (
+            patch(
+                "sglang.srt.utils.init_custom_process_group",
+                side_effect=[mlp_sync_group, eplb_group],
+            ) as init_group,
+            patch(
+                "sglang.srt.distributed.parallel_state.get_torch_distributed_pg_options",
+                return_value="hccl-options",
+            ),
+            patch(
+                "sglang.srt.fault_tolerance.npu_communication.PrefixStore",
+                side_effect=lambda prefix, store: (prefix, store),
+            ),
+            patch(
+                "sglang.srt.fault_tolerance.npu_communication.dist.barrier"
+            ) as barrier,
+            patch(
+                "sglang.srt.fault_tolerance.npu_communication.dist.all_reduce"
+            ) as all_reduce,
+            patch(
+                "sglang.srt.fault_tolerance.npu_communication.set_eplb_process_group_context"
+            ) as set_context,
+        ):
+            communication.rebuild_survivor_groups(
+                [False, True, True, True],
+                "cpu",
+            )
+
+        self.assertEqual(init_group.call_count, 2)
+        for call in init_group.call_args_list:
+            self.assertEqual(call.kwargs["world_size"], 3)
+            self.assertEqual(call.kwargs["rank"], 1)
+        self.assertEqual(init_group.call_args_list[0].kwargs["backend"], "gloo")
+        self.assertEqual(init_group.call_args_list[1].kwargs["backend"], "hccl")
+        barrier.assert_called_once_with(group=mlp_sync_group)
+        all_reduce.assert_called_once()
+        self.assertIs(all_reduce.call_args.kwargs["group"], eplb_group)
+        context = set_context.call_args.args[0]
+        self.assertIs(context.group, eplb_group)
+        self.assertEqual(context.active_original_ranks, (1, 2, 3))
+        self.assertEqual(communication.active_original_ranks, (1, 2, 3))
+
     def test_trace_correlates_mlp_sync_with_first_device_dispatch(self):
         communication = NpuFTCommunication(
             store=Mock(),

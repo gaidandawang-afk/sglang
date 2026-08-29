@@ -7,6 +7,7 @@ from sglang.srt.eplb.expert_location_updater import (
     _update_expert_weights_raw,
     update_expert_weights_single_layer,
 )
+from sglang.srt.eplb.process_group_context import EPLBProcessGroupContext
 
 
 def test_gpu_per_node_uses_original_ep_size_after_rank_failure():
@@ -81,3 +82,55 @@ def test_expert_copy_prefers_a_live_source_rank():
 
     assert any("chosen_src_rank=2" in line for line in logs)
     assert all(op.peer != 0 for op in fake_ops)
+
+
+def test_expert_p2p_maps_original_rank_to_compact_survivor_rank():
+    survivor_group = object()
+    context = EPLBProcessGroupContext(
+        group=survivor_group,
+        active_original_ranks=(1, 2, 3),
+    )
+    fake_ops = []
+
+    def fake_p2p_op(op, tensor, peer, group=None, tag=0):
+        result = SimpleNamespace(
+            op=op,
+            tensor=tensor,
+            peer=peer,
+            group=group,
+            tag=tag,
+        )
+        fake_ops.append(result)
+        return result
+
+    with (
+        patch(
+            "sglang.srt.eplb.expert_location_updater.get_eplb_process_group_context",
+            return_value=context,
+        ),
+        patch(
+            "sglang.srt.eplb.expert_location_updater.P2POp",
+            side_effect=fake_p2p_op,
+        ),
+        patch(
+            "torch.distributed.batch_isend_irecv",
+            return_value=[SimpleNamespace(wait=lambda: None)],
+        ),
+    ):
+        logs = update_expert_weights_single_layer(
+            routed_experts_weights=[torch.zeros(1)],
+            temp_buffers=[torch.zeros(1)],
+            old_physical_to_logical_map=[7, 0, 7, 1],
+            new_physical_to_logical_map=[7, 7, 7, 1],
+            num_local_physical_experts=1,
+            num_gpu_per_node=1,
+            rank=1,
+            world_size=4,
+            missing_logical_experts_info=[],
+            debug=True,
+        )
+
+    assert any("chosen_src_rank=2" in line for line in logs)
+    assert fake_ops
+    assert all(op.peer == 1 for op in fake_ops)
+    assert all(op.group is survivor_group for op in fake_ops)
