@@ -745,14 +745,16 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             num_gpu=self._expert_location_metadata.ep_size,
         )
         gpu_physical_count = gpu_physical_count.to(self._server_args.device)
+        if process_group_context.control_group_uses_cpu:
+            gpu_physical_count = gpu_physical_count.cpu()
         torch.distributed.reduce(
             gpu_physical_count,
             dst=0,
             op=torch.distributed.ReduceOp.SUM,
-            group=process_group_context.group,
+            group=process_group_context.control_group,
         )
 
-        if process_group_context.is_group_root(self._rank):
+        if process_group_context.is_control_group_root(self._rank):
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
             utilization_rate_gpu = torch.mean(
@@ -922,10 +924,12 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             self._first_dump = False
             torch.get_device_module().empty_cache()
 
+        if process_group_context.control_group_uses_cpu:
+            logical_count_of_buffered_step = logical_count_of_buffered_step.cpu()
         torch.distributed.all_reduce(
             logical_count_of_buffered_step,
             op=torch.distributed.ReduceOp.SUM,
-            group=process_group_context.group,
+            group=process_group_context.control_group,
         )
 
         output = dict(
@@ -935,7 +939,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         )
 
         if output_mode == "file":
-            if process_group_context.is_group_root(self._rank):
+            if process_group_context.is_control_group_root(self._rank):
                 _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
         elif output_mode == "object":
             return output
@@ -949,7 +953,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             return None
 
         process_group_context = get_eplb_process_group_context()
-        if process_group_context.is_group_root(self._rank):
+        if process_group_context.is_control_group_root(self._rank):
             utilization_mean_rates = self._history.mean()
             window_index = self.window_sizes[-1]
             average_utilization_rate_over_window = (
@@ -961,18 +965,26 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device=self._server_args.device,
+                device=(
+                    "cpu"
+                    if process_group_context.control_group_uses_cpu
+                    else self._server_args.device
+                ),
             )
         else:
             avg_rate_tensor = torch.empty(
                 1,
                 dtype=torch.float32,
-                device=self._server_args.device,
+                device=(
+                    "cpu"
+                    if process_group_context.control_group_uses_cpu
+                    else self._server_args.device
+                ),
             )
         torch.distributed.broadcast(
             avg_rate_tensor,
             src=0,
-            group=process_group_context.group,
+            group=process_group_context.control_group,
         )
         return avg_rate_tensor.item()
 

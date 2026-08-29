@@ -92,9 +92,7 @@ class NpuFTCommunication:
         prefix = f"npu-ft/{membership}/{generation}"
         timeout = timedelta(seconds=self.timeout_sec)
 
-        from sglang.srt.distributed.parallel_state import (
-            get_torch_distributed_pg_options,
-        )
+        from sglang.srt.distributed.parallel_state import get_moe_ep_group
         from sglang.srt.utils import init_custom_process_group
 
         logger.info(
@@ -119,31 +117,15 @@ class NpuFTCommunication:
             compact_rank,
             active_ranks,
         )
+        original_eplb_device_group = get_moe_ep_group().device_group
         logger.info(
-            "NPU FT groups step=create_eplb_group phase=begin "
-            "original_rank=%s compact_rank=%s active_original_ranks=%s",
+            "NPU FT groups step=reuse_eplb_device_group phase=complete "
+            "original_rank=%s compact_rank=%s active_original_ranks=%s "
+            "device=%s",
             self.original_rank,
             compact_rank,
             active_ranks,
-        )
-        eplb_group = init_custom_process_group(
-            backend="hccl",
-            store=PrefixStore(f"{prefix}/eplb", self.store),
-            timeout=timeout,
-            world_size=len(active_ranks),
-            rank=compact_rank,
-            group_name=f"npu_ft_eplb_{membership}_{generation}",
-            pg_options=get_torch_distributed_pg_options(
-                "moe_npu_ft_eplb_survivors"
-            ),
-            device_id=torch.device(device),
-        )
-        logger.info(
-            "NPU FT groups step=create_eplb_group phase=complete "
-            "original_rank=%s compact_rank=%s active_original_ranks=%s",
-            self.original_rank,
-            compact_rank,
-            active_ranks,
+            device,
         )
 
         logger.info(
@@ -159,21 +141,15 @@ class NpuFTCommunication:
             self.original_rank,
             compact_rank,
         )
-        logger.info(
-            "NPU FT groups step=eplb_warmup phase=skipped original_rank=%s "
-            "compact_rank=%s device=%s reason=ablation",
-            self.original_rank,
-            compact_rank,
-            device,
-        )
-
         self.mlp_sync_group = mlp_sync_group
         self.active_original_ranks = active_ranks
         self.generation = generation
         set_eplb_process_group_context(
             EPLBProcessGroupContext(
-                group=eplb_group,
+                control_group=mlp_sync_group,
+                device_group=original_eplb_device_group,
                 active_original_ranks=active_ranks,
+                control_group_uses_cpu=True,
             )
         )
         logger.info(

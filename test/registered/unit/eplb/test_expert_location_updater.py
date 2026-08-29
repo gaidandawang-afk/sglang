@@ -84,11 +84,14 @@ def test_expert_copy_prefers_a_live_source_rank():
     assert all(op.peer != 0 for op in fake_ops)
 
 
-def test_expert_p2p_maps_original_rank_to_compact_survivor_rank():
-    survivor_group = object()
+def test_expert_p2p_reuses_original_device_group_and_rank_namespace():
+    survivor_control_group = object()
+    original_device_group = object()
     context = EPLBProcessGroupContext(
-        group=survivor_group,
+        control_group=survivor_control_group,
+        device_group=original_device_group,
         active_original_ranks=(1, 2, 3),
+        control_group_uses_cpu=True,
     )
     fake_ops = []
 
@@ -132,5 +135,5 @@ def test_expert_p2p_maps_original_rank_to_compact_survivor_rank():
 
     assert any("chosen_src_rank=2" in line for line in logs)
     assert fake_ops
-    assert all(op.peer == 1 for op in fake_ops)
-    assert all(op.group is survivor_group for op in fake_ops)
+    assert all(op.peer == 2 for op in fake_ops)
+    assert all(op.group is original_device_group for op in fake_ops)
