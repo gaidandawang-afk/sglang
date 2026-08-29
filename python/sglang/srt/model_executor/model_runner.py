@@ -2056,56 +2056,6 @@ class ModelRunner:
             device_id,
         )
 
-    def run_npu_fault_tolerance_device_probe(self, recovery_stream) -> None:
-        device_module = torch.get_device_module(self.device)
-        with device_module.stream(recovery_stream):
-            logger.info(
-                "NPU FT device probe step=minimal_kernel phase=begin dp_rank=%s "
-                "stream=%s",
-                self.ps.dp_rank,
-                getattr(recovery_stream, "stream_id", None),
-            )
-            probe = torch.ones((1,), dtype=torch.float32, device=self.device)
-            probe_result = probe + 1
-            logger.info(
-                "NPU FT device probe step=minimal_kernel phase=complete dp_rank=%s "
-                "stream=%s",
-                self.ps.dp_rank,
-                getattr(recovery_stream, "stream_id", None),
-            )
-            logger.info(
-                "NPU FT device probe step=d2h_copy phase=begin dp_rank=%s "
-                "stream=%s",
-                self.ps.dp_rank,
-                getattr(recovery_stream, "stream_id", None),
-            )
-            probe_cpu = probe_result.cpu()
-            logger.info(
-                "NPU FT device probe step=d2h_copy phase=complete dp_rank=%s "
-                "stream=%s",
-                self.ps.dp_rank,
-                getattr(recovery_stream, "stream_id", None),
-            )
-        logger.info(
-            "NPU FT device probe step=stream_synchronize phase=begin dp_rank=%s "
-            "stream=%s",
-            self.ps.dp_rank,
-            getattr(recovery_stream, "stream_id", None),
-        )
-        recovery_stream.synchronize()
-        logger.info(
-            "NPU FT device probe step=stream_synchronize phase=complete dp_rank=%s "
-            "stream=%s",
-            self.ps.dp_rank,
-            getattr(recovery_stream, "stream_id", None),
-        )
-        if probe_cpu.item() != 2:
-            raise RuntimeError("NPU FT device probe returned an unexpected value")
-        logger.info(
-            "NPU FT device probe step=validate_result phase=complete dp_rank=%s",
-            self.ps.dp_rank,
-        )
-
     def run_npu_fault_tolerance_dummy_batch(self, active_mask: list[bool]) -> None:
         logger.info(
             "NPU FT dummy step=prepare_metadata phase=complete dp_rank=%s "

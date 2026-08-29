@@ -297,7 +297,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             forward_stream=forward_stream,
             apply_fault_tolerance_scale_down=Mock(),
             recover_npu_device_for_fault_tolerance_scale_down=Mock(),
-            run_npu_fault_tolerance_device_probe=Mock(),
             run_npu_fault_tolerance_dummy_batch=Mock(),
             synchronize_npu_fault_tolerance_health_gate=Mock(),
         )
@@ -395,9 +394,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         model_runner.recover_npu_device_for_fault_tolerance_scale_down.side_effect = (
             lambda: events.append("recover_device")
         )
-        model_runner.run_npu_fault_tolerance_device_probe.side_effect = lambda stream: (
-            events.append("device_probe")
-        )
         model_runner.run_npu_fault_tolerance_dummy_batch.side_effect = (
             lambda active_mask: events.append(("dummy_batch", active_mask))
         )
@@ -442,7 +438,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 ("discard", "mlp-sync failed"),
                 ("scale_down", [True, False]),
                 "schedule_sync",
-                "device_probe",
                 "forward_wait",
                 ("dummy_batch", [True, False]),
                 "health_sync",
@@ -463,8 +458,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             "step=apply_elastic_scale_down phase=complete",
             "step=schedule_stream_synchronize phase=begin",
             "step=schedule_stream_synchronize phase=complete",
-            "step=device_probe phase=begin",
-            "step=device_probe phase=complete",
+            "step=device_probe phase=skipped",
             "step=forward_stream_handoff phase=begin",
             "step=forward_stream_handoff phase=complete",
             "step=dummy_forward phase=begin",

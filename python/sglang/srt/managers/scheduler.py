@@ -4788,15 +4788,8 @@ class Scheduler(
         )
 
         logger.info(
-            "NPU FT recovery step=device_probe phase=begin request_id=%s "
-            "dp_rank=%s",
-            request_id,
-            self.ps.dp_rank,
-        )
-        model_runner.run_npu_fault_tolerance_device_probe(self.schedule_stream)
-        logger.info(
-            "NPU FT recovery step=device_probe phase=complete request_id=%s "
-            "dp_rank=%s",
+            "NPU FT recovery step=device_probe phase=skipped request_id=%s "
+            "dp_rank=%s reason=ablation",
             request_id,
             self.ps.dp_rank,
         )
