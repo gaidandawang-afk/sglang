@@ -1566,27 +1566,7 @@ class Scheduler(
                 dispatch_event_loop(self)
                 return
             except Exception as exc:
-                defer_discard = (
-                    _is_npu and self.server_args.elastic_ep_backend == "mc2"
-                )
-                if defer_discard:
-                    logger.warning(
-                        "NPU FT pause step=exit_faulted_schedule_stream "
-                        "phase=skipped dp_rank=%s schedule_stream=%s "
-                        "reason=ablation error=%s",
-                        self.ps.dp_rank,
-                        getattr(self.schedule_stream, "stream_id", None),
-                        exc,
-                    )
-                    self._ft_pending_discard_reason = str(exc)
-                    recovered = False
-                    logger.warning(
-                        "Deferring NPU FT in-flight request discard until device "
-                        "recovery during scale-down: %s",
-                        exc,
-                    )
-                else:
-                    recovered = self._ft_discard_inflight_window(exc)
+                recovered = self._ft_discard_inflight_window(exc)
                 should_continue = (
                     self.server_args.fault_tolerance_on_error_strategy == "continue"
                     and recovered
@@ -1597,18 +1577,6 @@ class Scheduler(
                         time.monotonic()
                         + self.server_args.fault_tolerance_pause_timeout
                     )
-                    if defer_discard:
-                        logger.info(
-                            "NPU FT pause step=self_pause phase=complete "
-                            "dp_rank=%s deadline=%s",
-                            self.ps.dp_rank,
-                            self._ft_pause_deadline,
-                        )
-                        logger.info(
-                            "NPU FT pause step=early_stop_device phase=skipped "
-                            "dp_rank=%s reason=ablation",
-                            self.ps.dp_rank,
-                        )
                 self.ipc_channels.send_to_tokenizer.send_output(
                     FaultToleranceRankFaultOutput(
                         rank=self.ps.dp_rank,
