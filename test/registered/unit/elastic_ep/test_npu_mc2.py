@@ -131,3 +131,17 @@ def test_dispatch_diagnostic_accepts_effective_ids_and_is_one_shot():
         num_local_physical_experts=1,
         ids_are_compacted=True,
     )
+
+
+def test_dispatch_mapping_log_is_armed_independently_from_validation():
+    elastic_info = NpuMC2ElasticInfo.create(
+        [False, True, True, True],
+        original_ep_size=4,
+        num_physical_experts=4,
+        device="cpu",
+    )
+    elastic_info.arm_dispatch_mapping_log()
+
+    assert elastic_info.consume_dispatch_mapping_log()
+    assert not elastic_info.consume_dispatch_mapping_log()
+    assert not elastic_info.consume_dispatch_validation()

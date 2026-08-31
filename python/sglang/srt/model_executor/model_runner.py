@@ -2036,6 +2036,10 @@ class ModelRunner:
                 self.ps.dp_rank,
             )
             state.npu_mc2_elastic_info.consume_dispatch_validation()
+        if state.npu_mc2_elastic_info is not None:
+            # The diagnostic belongs to the first real request, not this
+            # recovery dummy forward.
+            state.npu_mc2_elastic_info.arm_dispatch_mapping_log()
 
     def synchronize_npu_fault_tolerance_health_gate(self) -> None:
         logger.info(

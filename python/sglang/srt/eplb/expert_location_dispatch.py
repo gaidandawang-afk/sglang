@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Optional
 
@@ -22,6 +23,8 @@ from sglang.srt.runtime_context import get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.elastic_ep.npu_mc2 import NpuMC2ElasticInfo
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -35,6 +38,7 @@ class ExpertLocationDispatchInfo:
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
     num_physical_experts: int
     npu_mc2_elastic_info: Optional["NpuMC2ElasticInfo"] = None
+    layer_id: Optional[int] = None
 
     @classmethod
     def init_new(cls, layer_id: int):
@@ -75,6 +79,7 @@ class ExpertLocationDispatchInfo:
             ],
             num_physical_experts=expert_location_metadata.num_physical_experts,
             npu_mc2_elastic_info=npu_mc2_elastic_info,
+            layer_id=layer_id,
         )
 
 
@@ -117,6 +122,7 @@ def topk_ids_logical_to_physical(
     if info.npu_mc2_elastic_info is not None:
         from sglang.srt.elastic_ep.npu_mc2 import compact_mc2_physical_expert_ids
 
+        original_physical_topk_ids = physical_topk_ids
         physical_topk_ids = compact_mc2_physical_expert_ids(
             physical_topk_ids,
             elastic_info=info.npu_mc2_elastic_info.tensor,
@@ -125,6 +131,22 @@ def topk_ids_logical_to_physical(
                 info.npu_mc2_elastic_info.num_local_physical_experts
             ),
         )
+        if info.npu_mc2_elastic_info.consume_dispatch_mapping_log():
+            sample_size = min(32, topk_ids.numel())
+            logger.info(
+                "NPU FT precision step=first_mc2_dispatch_mapping layer_id=%s "
+                "algorithm=%s logical_ids=%s original_physical_ids=%s "
+                "compact_physical_ids=%s elastic_info=%s",
+                info.layer_id,
+                info.ep_dispatch_algorithm,
+                topk_ids.flatten()[:sample_size].detach().cpu().tolist(),
+                original_physical_topk_ids.flatten()[:sample_size]
+                .detach()
+                .cpu()
+                .tolist(),
+                physical_topk_ids.flatten()[:sample_size].detach().cpu().tolist(),
+                info.npu_mc2_elastic_info.tensor.detach().cpu().tolist(),
+            )
     return physical_topk_ids
 
 

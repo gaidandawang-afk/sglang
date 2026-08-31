@@ -173,6 +173,7 @@ def _update_expert_weights_raw(
             world_size=world_size,
             missing_logical_experts_info=missing_logical_experts_info,
             log_metrics=log_metrics,
+            layer_id=layer_id,
         )
         if len(missing_logical_experts_info) > 0:
             missing_logical_experts_by_layers[layer_id] = missing_logical_experts_info
@@ -237,6 +238,7 @@ def update_expert_weights_single_layer(
     missing_logical_experts_info: Optional[List[int]] = None,
     debug: bool = False,
     log_metrics: bool = False,
+    layer_id: Optional[int] = None,
 ):
     assert all(
         tensor.shape[0] == num_local_physical_experts
@@ -271,6 +273,36 @@ def update_expert_weights_single_layer(
         (rank + 1) * num_local_physical_experts,
     )
 
+    local_changes = [
+        (
+            physical_location,
+            old_physical_to_logical_map[physical_location],
+            new_physical_to_logical_map[physical_location],
+        )
+        for physical_location in range(*local_expert_location_range)
+        if old_physical_to_logical_map[physical_location]
+        != new_physical_to_logical_map[physical_location]
+    ]
+
+    def _p2p_plan(p2p_op_infos):
+        return [
+            (
+                logical_expert_id,
+                "send" if ops[0].op == torch.distributed.isend else "recv",
+                sorted({op.peer for op in ops}),
+                [
+                    (
+                        tuple(op.tensor.shape),
+                        str(op.tensor.dtype),
+                        op.tensor.storage_offset(),
+                    )
+                    for op in ops
+                ],
+            )
+            for logical_expert_id, ops in p2p_op_infos
+            if ops
+        ]
+
     def _entrypoint():
         # List[Tuple[logical_expert_id, List[P2POp]]]
         p2p_op_infos: List[Tuple[int, List[P2POp]]] = []
@@ -281,8 +313,28 @@ def update_expert_weights_single_layer(
         _create_isend_ops(p2p_op_infos)
         if process_group_context.active_original_ranks is None:
             _filter_p2p_ops(p2p_op_infos)
+        if process_group_context.active_original_ranks is not None:
+            logger.info(
+                "NPU FT precision step=eplb_transfer_plan layer_id=%s "
+                "original_rank=%s active_original_ranks=%s local_changes=%s "
+                "p2p_plan=%s missing_logical_experts=%s",
+                layer_id,
+                rank,
+                process_group_context.active_original_ranks,
+                local_changes,
+                _p2p_plan(p2p_op_infos),
+                missing_logical_experts_info,
+            )
         _execute_p2p_ops(p2p_op_infos)
         _execute_buffer2weight_copies(buffer2weight_copy_infos)
+        if process_group_context.active_original_ranks is not None:
+            logger.info(
+                "NPU FT precision step=eplb_transfer_complete layer_id=%s "
+                "original_rank=%s local_changes=%s",
+                layer_id,
+                rank,
+                local_changes,
+            )
 
         if log_metrics:
             _log_p2p_op_metrics(

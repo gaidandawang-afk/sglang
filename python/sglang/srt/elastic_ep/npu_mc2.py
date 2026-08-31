@@ -248,6 +248,7 @@ class NpuMC2ElasticInfo:
     original_ep_size: int
     num_local_physical_experts: int
     _validate_next_dispatch: bool = False
+    _log_next_dispatch_mapping: bool = False
 
     @classmethod
     def create(
@@ -282,6 +283,14 @@ class NpuMC2ElasticInfo:
         validate = self._validate_next_dispatch
         self._validate_next_dispatch = False
         return validate
+
+    def arm_dispatch_mapping_log(self) -> None:
+        self._log_next_dispatch_mapping = True
+
+    def consume_dispatch_mapping_log(self) -> bool:
+        should_log = self._log_next_dispatch_mapping
+        self._log_next_dispatch_mapping = False
+        return should_log
 
     @property
     def dispatch_validation_pending(self) -> bool:
