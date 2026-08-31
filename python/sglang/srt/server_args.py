@@ -1043,6 +1043,11 @@ class ServerArgs:
         "Timeout in seconds for fault-tolerance control commands.",
         NS("parallel"),
     ] = 60
+    fault_tolerance_gloo_timeout: A[
+        int,
+        "Timeout in seconds for fault-tolerance Gloo operations.",
+        NS("parallel"),
+    ] = 30
     fault_tolerance_communication_abort_timeout: A[
         int,
         "NPU communication abort timeout in seconds; 0 disables timeout setup.",
@@ -3812,6 +3817,17 @@ class ServerArgs:
             self.fault_tolerance_on_error_strategy = "pause"
 
         if is_npu() and self.elastic_ep_backend == "mc2":
+            if not (
+                0
+                < self.fault_tolerance_gloo_timeout
+                < self.fault_tolerance_timeout
+            ):
+                raise ValueError(
+                    "fault_tolerance_gloo_timeout must be positive and less than "
+                    "fault_tolerance_timeout, got "
+                    f"{self.fault_tolerance_gloo_timeout} and "
+                    f"{self.fault_tolerance_timeout}"
+                )
             os.environ["TASK_QUEUE_ENABLE"] = "0"
             abort_timeout = self.fault_tolerance_communication_abort_timeout
             if abort_timeout != 0 and abort_timeout < 2:

@@ -15,7 +15,7 @@ class TestNpuMLPSyncTimeout(unittest.TestCase):
         communication = NpuFTCommunication(
             store=Mock(),
             original_rank=2,
-            timeout_sec=5,
+            gloo_timeout_sec=5,
             mlp_sync_group=Mock(),
             active_original_ranks=(0, 1, 2, 3),
         )
@@ -67,7 +67,7 @@ class TestNpuMLPSyncTimeout(unittest.TestCase):
         communication = NpuFTCommunication(
             store=Mock(),
             original_rank=2,
-            timeout_sec=5,
+            gloo_timeout_sec=5,
             mlp_sync_group=Mock(),
             active_original_ranks=(0, 1, 2, 3),
         )

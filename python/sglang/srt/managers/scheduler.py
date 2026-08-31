@@ -960,7 +960,7 @@ class Scheduler(
                 self.fault_tolerance_metadata_ipc_name,
                 original_rank=self.ps.dp_rank,
                 original_world_size=self.ps.dp_size,
-                timeout_sec=self.server_args.fault_tolerance_timeout,
+                gloo_timeout_sec=self.server_args.fault_tolerance_gloo_timeout,
                 mlp_sync_group=self.tp_cpu_group,
             )
 

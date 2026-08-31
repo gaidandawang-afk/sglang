@@ -155,7 +155,7 @@ class MLPSyncBatchInfo:
                 gathered.flatten(),
                 local_info_cpu,
                 group=npu_ft_comm.mlp_sync_group,
-                timeout_sec=npu_ft_comm.timeout_sec,
+                timeout_sec=npu_ft_comm.gloo_timeout_sec,
             )
             npu_ft_comm.record_mlp_sync_complete(
                 local_forward_mode=ForwardMode(self.local_forward_mode).name,

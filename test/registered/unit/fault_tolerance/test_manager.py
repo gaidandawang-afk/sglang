@@ -38,6 +38,19 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
             with suppress(asyncio.CancelledError):
                 await task
 
+    async def test_npu_command_timeout_must_exceed_gloo_timeout(self):
+        manager = make_manager()
+        manager.server_args.device = "npu"
+        manager.server_args.elastic_ep_backend = "mc2"
+        manager.server_args.fault_tolerance_gloo_timeout = 30
+
+        status, response = await manager.apply(
+            {"instruction": "retry", "params": {"timeout": 30}}
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn("greater than fault_tolerance_gloo_timeout", response["message"])
+
     async def test_retry_is_maskless_and_uses_expected_topology(self):
         manager = make_manager(dp_size=4)
         manager.state.expected_dp_mask = [True, True, False, True]

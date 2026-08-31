@@ -32,7 +32,7 @@ def create_npu_ft_store(endpoint: str) -> TCPStore:
 class NpuFTCommunication:
     store: TCPStore
     original_rank: int
-    timeout_sec: float
+    gloo_timeout_sec: float
     mlp_sync_group: Any
     active_original_ranks: tuple[int, ...]
     generation: int = 0
@@ -90,7 +90,7 @@ class NpuFTCommunication:
         generation = self.generation + 1
         membership = "".join("1" if active else "0" for active in active_mask)
         prefix = f"npu-ft/{membership}/{generation}"
-        timeout = timedelta(seconds=self.timeout_sec)
+        timeout = timedelta(seconds=self.gloo_timeout_sec)
 
         from sglang.srt.distributed.parallel_state import get_moe_ep_group
         from sglang.srt.utils import init_custom_process_group
@@ -194,7 +194,7 @@ def init_npu_ft_communication(
     *,
     original_rank: int,
     original_world_size: int,
-    timeout_sec: float,
+    gloo_timeout_sec: float,
     mlp_sync_group,
 ) -> NpuFTCommunication:
     global _communication
@@ -207,7 +207,7 @@ def init_npu_ft_communication(
             wait_for_workers=False,
         ),
         original_rank=original_rank,
-        timeout_sec=timeout_sec,
+        gloo_timeout_sec=gloo_timeout_sec,
         mlp_sync_group=mlp_sync_group,
         active_original_ranks=tuple(range(original_world_size)),
     )
