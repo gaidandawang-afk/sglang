@@ -614,7 +614,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         self.assertEqual(events, ["fault", "discarded", "report"])
 
-    def test_npu_mc2_discards_inflight_window_on_exception(self):
+    def test_npu_mc2_defers_discard_until_scale_down(self):
         events = []
         dispatched = False
 
@@ -648,8 +648,9 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         )
 
         try:
-            with self.assertRaises(KeyboardInterrupt):
-                self.run_ft_loop(scheduler)
+            with self.assertLogs(__name__, level="INFO") as captured:
+                with self.assertRaises(KeyboardInterrupt):
+                    self.run_ft_loop(scheduler)
         finally:
             self.run_ft_loop.__globals__["_is_npu"] = False
 
@@ -657,11 +658,13 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             events,
             [
                 "fault",
-                "discarded",
                 "report",
             ],
         )
-        self.assertIsNone(scheduler._ft_pending_discard_reason)
+        self.assertIn(
+            "step=early_stop_device phase=skipped", "\n".join(captured.output)
+        )
+        self.assertEqual(scheduler._ft_pending_discard_reason, "mlp-sync failed")
 
     def test_npu_continue_strategy_is_normalized_during_startup(self):
         module = ModuleType("sglang.srt.fault_tolerance.controller")
