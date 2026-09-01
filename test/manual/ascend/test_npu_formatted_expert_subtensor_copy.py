@@ -5,6 +5,7 @@ import torch_npu
 
 from sglang.srt.hardware_backend.npu.utils import (
     copy_npu_formatted_tensor_,
+    copy_to_npu_formatted_tensor_,
     npu_format_cast,
 )
 
@@ -37,6 +38,34 @@ def main() -> None:
             raise AssertionError(
                 f"formatted expert copy mismatch at slot={slot}: "
                 f"offset={original_storage_offset}"
+            )
+
+        nd_replacement_cpu = torch.full(
+            shape[1:], fill_value=2000 + slot, dtype=torch.bfloat16
+        )
+        nd_replacement = nd_replacement_cpu.to(device)
+        copy_to_npu_formatted_tensor_(destination, nd_replacement)
+        torch_npu.npu.synchronize()
+        if not torch.equal(destination.cpu(), nd_replacement_cpu):
+            raise AssertionError(
+                f"ND-to-formatted expert copy mismatch at slot={slot}: "
+                f"offset={original_storage_offset}"
+            )
+
+        half_destination = destination.narrow(0, shape[1] // 2, shape[1] // 2)
+        half_replacement_cpu = torch.full(
+            half_destination.shape,
+            fill_value=3000 + slot,
+            dtype=torch.bfloat16,
+        )
+        copy_to_npu_formatted_tensor_(
+            half_destination, half_replacement_cpu.to(device)
+        )
+        torch_npu.npu.synchronize()
+        if not torch.equal(half_destination.cpu(), half_replacement_cpu):
+            raise AssertionError(
+                f"ND-to-formatted narrowed copy mismatch at slot={slot}: "
+                f"offset={half_destination.storage_offset()}"
             )
 
     print(

@@ -26,6 +26,7 @@ PLAN_RE = re.compile(
 RECOVERY_FILTER_MARKER = "[Elastic EP] Missing expert recovery filter"
 RECOVERY_FILTER_RE = re.compile(
     r"\[Elastic EP\] Missing expert recovery filter rank=(?P<rank>\d+) "
+    r"mode=(?P<mode>\S+) "
     r"checked=(?P<checked>\d+) matched=(?P<matched>\d+) "
     r"matched_samples=(?P<samples>\[.*\])"
 )
@@ -319,6 +320,7 @@ def main():
                             missing_recovery_filter_stats[
                                 (migration_epoch_by_rank[rank], rank)
                             ] = {
+                                "mode": match.group("mode"),
                                 "checked": int(match.group("checked")),
                                 "matched": int(match.group("matched")),
                                 "matched_samples": samples,

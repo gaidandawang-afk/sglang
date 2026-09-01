@@ -304,11 +304,13 @@ def update_expert_location_with_recovery(
 
         # Load the missing expert weights from disk
         if callable(getattr(model, "generate_weight_name_filter", None)):
+            filter_mode = "selective"
             # Filter and load only missing expert weights
             weight_name_filter = model.generate_weight_name_filter(
                 p2p_missing_logical_experts
             )
         else:
+            filter_mode = "full"
             # Do a full reload from disk/DRAM
             logger.info(
                 "[Elastic EP] Model does not implement generate_weight_name_filter. "
@@ -317,17 +319,16 @@ def update_expert_location_with_recovery(
             weight_name_filter = None
 
         filter_stats = {"checked": 0, "matched": 0, "matched_samples": []}
-        if weight_name_filter is not None:
-            original_weight_name_filter = weight_name_filter
+        original_weight_name_filter = weight_name_filter or (lambda _name: True)
 
-            def weight_name_filter(name: str) -> bool:
-                filter_stats["checked"] += 1
-                matched = original_weight_name_filter(name)
-                if matched:
-                    filter_stats["matched"] += 1
-                    if len(filter_stats["matched_samples"]) < 20:
-                        filter_stats["matched_samples"].append(name)
-                return matched
+        def weight_name_filter(name: str) -> bool:
+            filter_stats["checked"] += 1
+            matched = original_weight_name_filter(name)
+            if matched:
+                filter_stats["matched"] += 1
+                if len(filter_stats["matched_samples"]) < 20:
+                    filter_stats["matched_samples"].append(name)
+            return matched
 
         if expert_backup_client is not None and expert_backup_client.use_backup:
             # Load the missing weights from the DRAM backup
@@ -346,13 +347,14 @@ def update_expert_location_with_recovery(
 
         logger.info(
             "[Elastic EP] Missing expert recovery filter rank=%s "
-            "checked=%s matched=%s matched_samples=%s",
+            "mode=%s checked=%s matched=%s matched_samples=%s",
             tp_rank,
+            filter_mode,
             filter_stats["checked"],
             filter_stats["matched"],
             filter_stats["matched_samples"],
         )
-        if weight_name_filter is not None and filter_stats["matched"] == 0:
+        if filter_stats["matched"] == 0:
             raise RuntimeError(
                 "[Elastic EP] Missing expert recovery matched zero checkpoint weights "
                 f"on rank {tp_rank}; missing_by_layer="

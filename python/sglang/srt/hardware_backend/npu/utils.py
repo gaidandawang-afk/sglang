@@ -272,6 +272,26 @@ def copy_npu_formatted_tensor_(
     return torch.ops.npu.copy_memory_(destination_alias, source_alias, False)
 
 
+def copy_to_npu_formatted_tensor_(
+    destination: torch.Tensor, source: torch.Tensor
+) -> torch.Tensor:
+    """Convert an ND value to the destination's format, then write its exact slot."""
+
+    if not is_npu_internal_format_tensor(destination):
+        return destination.copy_(source)
+
+    import torch_npu
+
+    formatted_source = torch_npu.empty_with_format(
+        tuple(destination.shape),
+        dtype=destination.dtype,
+        device=destination.device,
+        acl_format=torch_npu.get_npu_format(destination),
+    )
+    formatted_source.copy_(source)
+    return copy_npu_formatted_tensor_(destination, formatted_source)
+
+
 def get_indexer_weight_stream():
     global indexer_weight_stream
     if indexer_weight_stream is None:
