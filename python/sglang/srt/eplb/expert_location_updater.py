@@ -208,6 +208,10 @@ def create_temp_buffers(sample_tensors):
     return [torch.empty_like(tensor) for tensor in sample_tensors]
 
 
+def _p2p_ops_need_npu_staging(p2p_ops: List[P2POp]) -> bool:
+    return bool(p2p_ops) and p2p_ops[0].tensor.device.type == "npu"
+
+
 def _stage_npu_p2p_ops(
     p2p_ops: List[P2POp],
 ) -> Tuple[List[P2POp], List[Tuple[torch.Tensor, torch.Tensor]]]:
@@ -686,7 +690,7 @@ def update_expert_weights_single_layer(
                     batch_ops.extend(ops_by_expert[eid])
             if batch_ops:
                 recv_copy_infos = []
-                if process_group_context.device_group is not None:
+                if _p2p_ops_need_npu_staging(batch_ops):
                     batch_ops, recv_copy_infos = _stage_npu_p2p_ops(batch_ops)
                 reqs = torch.distributed.batch_isend_irecv(batch_ops)
                 for req in reqs:

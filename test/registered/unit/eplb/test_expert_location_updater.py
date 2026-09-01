@@ -4,10 +4,23 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.eplb.expert_location_updater import (
+    _p2p_ops_need_npu_staging,
     _update_expert_weights_raw,
     update_expert_weights_single_layer,
 )
 from sglang.srt.eplb.process_group_context import EPLBProcessGroupContext
+
+
+def test_npu_p2p_staging_does_not_depend_on_an_explicit_group():
+    npu_op = SimpleNamespace(
+        tensor=SimpleNamespace(device=SimpleNamespace(type="npu"))
+    )
+    cuda_op = SimpleNamespace(
+        tensor=SimpleNamespace(device=SimpleNamespace(type="cuda"))
+    )
+
+    assert _p2p_ops_need_npu_staging([npu_op])
+    assert not _p2p_ops_need_npu_staging([cuda_op])
 
 
 def test_gpu_per_node_uses_original_ep_size_after_rank_failure():
