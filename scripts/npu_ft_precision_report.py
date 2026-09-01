@@ -38,9 +38,59 @@ def _iter_recent_files(paths: list[Path], since_minutes: int):
 
 
 def _sample_fingerprint(fields: dict):
+    if "sample_values_raw" in fields:
+        return repr(
+            (fields.get("sample_coordinates_raw"), fields["sample_values_raw"])
+        )
     if "sample_values" not in fields:
         return None
     return repr((fields.get("sample_coordinates"), fields["sample_values"]))
+
+
+def _raw_field(fields_text: str, name: str):
+    marker = f"'{name}': "
+    start = fields_text.find(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    end = fields_text.find(", '", start)
+    if end < 0:
+        end = len(fields_text) - 1 if fields_text.endswith("}") else len(fields_text)
+    return fields_text[start:end]
+
+
+def _parse_fields(fields_text: str):
+    try:
+        return ast.literal_eval(fields_text), False
+    except (SyntaxError, ValueError):
+        fields = {
+            name: _raw_field(fields_text, name)
+            for name in (
+                "storage_offset",
+                "acl_format",
+                "npu_storage_size",
+                "sample_error",
+            )
+        }
+        fields = {name: value for name, value in fields.items() if value is not None}
+
+        coordinates_marker = "'sample_coordinates': "
+        values_marker = ", 'sample_values': "
+        coordinates_start = fields_text.find(coordinates_marker)
+        values_start = fields_text.find(values_marker)
+        if coordinates_start >= 0 and values_start > coordinates_start:
+            coordinates_start += len(coordinates_marker)
+            fields["sample_coordinates_raw"] = fields_text[
+                coordinates_start:values_start
+            ]
+            values_start += len(values_marker)
+            values_end = (
+                len(fields_text) - 1
+                if fields_text.endswith("}")
+                else len(fields_text)
+            )
+            fields["sample_values_raw"] = fields_text[values_start:values_end]
+        return fields, True
 
 
 def _slot_key(record: dict):
@@ -67,7 +117,7 @@ def _record_summary(record: dict):
         "format": fields.get("acl_format"),
         "offset": fields.get("storage_offset"),
         "storage_size": fields.get("npu_storage_size"),
-        "samples": fields.get("sample_values"),
+        "samples": fields.get("sample_values", fields.get("sample_values_raw")),
         "sample_error": fields.get("sample_error"),
     }
 
@@ -121,6 +171,7 @@ def main():
     files_scanned = 0
     matched_lines = 0
     parse_errors = 0
+    field_parse_fallbacks = 0
 
     for path in _iter_recent_files(args.paths, args.since_minutes):
         files_scanned += 1
@@ -138,9 +189,9 @@ def main():
                     if match is None:
                         continue
                     matched_lines += 1
-                    try:
-                        fields = ast.literal_eval(match.group("fields"))
-                    except (SyntaxError, ValueError):
+                    fields, used_fallback = _parse_fields(match.group("fields"))
+                    field_parse_fallbacks += int(used_fallback)
+                    if not fields:
                         parse_errors += 1
                         continue
                     expert_text = match.group("expert")
@@ -178,6 +229,7 @@ def main():
         "files_scanned": files_scanned,
         "matched_lines": matched_lines,
         "parse_errors": parse_errors,
+        "field_parse_fallbacks": field_parse_fallbacks,
         "stage_rank_counts": {
             f"{stage}/rank{rank}": count
             for (stage, rank), count in sorted(stage_rank_counts.items())
