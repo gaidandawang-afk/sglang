@@ -202,40 +202,18 @@ def _copy_expert_tensor_(
 def _stage_npu_p2p_ops(
     p2p_ops: List[P2POp],
 ) -> Tuple[List[P2POp], List[Tuple[torch.Tensor, torch.Tensor]]]:
-    """Stage NPU P2P payloads in offset-zero ND tensors.
-
-    Expert weights may use device-private formats such as FRACTAL_NZ. HCCL
-    batch P2P transfers a flat payload without carrying that format metadata,
-    so communicate the logical ND representation and restore the destination
-    format after receiving it.
-    """
-
     staged_ops = []
     recv_copy_infos = []
     for op in p2p_ops:
-        if op.tensor.device.type != "npu":
+        if op.tensor.storage_offset() == 0:
             staged_ops.append(op)
             continue
 
-        import torch_npu
-
-        from sglang.srt.hardware_backend.npu.utils import NPUACLFormat
-
-        staged_tensor = torch_npu.empty_with_format(
-            tuple(op.tensor.shape),
-            dtype=op.tensor.dtype,
-            device=op.tensor.device,
-            acl_format=int(NPUACLFormat.ACL_FORMAT_ND),
-        )
-        if staged_tensor.storage_offset() != 0 or torch_npu.get_npu_format(
-            staged_tensor
-        ) != int(NPUACLFormat.ACL_FORMAT_ND):
-            raise RuntimeError("Failed to create an offset-zero ND EPLB P2P buffer.")
-
+        staged_tensor = torch.empty_like(op.tensor)
         if op.op == torch.distributed.irecv:
             recv_copy_infos.append((staged_tensor, op.tensor))
         else:
-            staged_tensor.copy_(op.tensor)
+            _copy_expert_tensor_(staged_tensor, op.tensor)
         staged_ops.append(
             P2POp(
                 op=op.op,
@@ -246,31 +224,6 @@ def _stage_npu_p2p_ops(
             )
         )
     return staged_ops, recv_copy_infos
-
-
-def _copy_npu_p2p_recv_(
-    destination_tensor: torch.Tensor, nd_source_tensor: torch.Tensor
-) -> None:
-    import torch_npu
-
-    from sglang.srt.hardware_backend.npu.utils import (
-        copy_npu_formatted_tensor_,
-        is_npu_internal_format_tensor,
-    )
-
-    if not is_npu_internal_format_tensor(destination_tensor):
-        destination_tensor.copy_(nd_source_tensor)
-        return
-
-    formatted_tensor = torch_npu.empty_with_format(
-        tuple(destination_tensor.shape),
-        dtype=destination_tensor.dtype,
-        device=destination_tensor.device,
-        acl_format=torch_npu.get_npu_format(destination_tensor),
-    )
-    # Tensor.copy_ performs the logical ND -> device-format conversion here.
-    formatted_tensor.copy_(nd_source_tensor)
-    copy_npu_formatted_tensor_(destination_tensor, formatted_tensor)
 
 
 def update_expert_weights_single_layer(
@@ -688,7 +641,7 @@ def update_expert_weights_single_layer(
                 for req in reqs:
                     req.wait()
                 for staged_tensor, destination_tensor in recv_copy_infos:
-                    _copy_npu_p2p_recv_(destination_tensor, staged_tensor)
+                    _copy_expert_tensor_(destination_tensor, staged_tensor)
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for (
