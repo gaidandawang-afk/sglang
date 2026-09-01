@@ -5,6 +5,8 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.eplb.expert_location_updater import (
+    _copy_expert_tensor_,
+    _copy_npu_p2p_recv_,
     _p2p_ops_need_npu_staging,
     _update_expert_weights_raw,
     update_expert_weights_single_layer,
@@ -84,6 +86,56 @@ def test_npu_p2p_uses_nd_staging_regardless_of_storage_offset():
     assert all(staged.tensor.acl_format == nd_format for staged in staged_ops)
     assert all(staged.tensor.storage_offset() == 0 for staged in staged_ops)
     assert [staged.tensor.values for staged in staged_ops] == [[1, 2], [3, 4]]
+
+
+def test_internal_format_expert_copy_uses_formatted_copy():
+    nz_format = int(NPUACLFormat.ACL_FORMAT_FRACTAL_NZ)
+    source = _FakeNPUTensor([1, 2], nz_format, storage_offset=8)
+    destination = _FakeNPUTensor([0, 0], nz_format, storage_offset=16)
+
+    with (
+        patch(
+            "sglang.srt.hardware_backend.npu.utils.is_npu_internal_format_tensor",
+            return_value=True,
+        ),
+        patch(
+            "sglang.srt.hardware_backend.npu.utils.copy_npu_formatted_tensor_",
+            side_effect=lambda destination, source: destination.copy_(source),
+        ) as formatted_copy,
+    ):
+        _copy_expert_tensor_(destination, source)
+
+    assert destination.values == [1, 2]
+    formatted_copy.assert_called_once_with(destination, source)
+
+
+def test_nd_p2p_recv_converts_to_offset_zero_destination_format():
+    nz_format = int(NPUACLFormat.ACL_FORMAT_FRACTAL_NZ)
+    nd_format = int(NPUACLFormat.ACL_FORMAT_ND)
+    source = _FakeNPUTensor([7, 8], nd_format)
+    destination = _FakeNPUTensor([0, 0], nz_format, storage_offset=16)
+    fake_torch_npu = SimpleNamespace(
+        empty_with_format=lambda shape, **kwargs: _FakeNPUTensor(
+            [0] * shape[0], kwargs["acl_format"]
+        ),
+        get_npu_format=lambda tensor: tensor.acl_format,
+    )
+
+    with (
+        patch.dict(sys.modules, {"torch_npu": fake_torch_npu}),
+        patch(
+            "sglang.srt.hardware_backend.npu.utils.is_npu_internal_format_tensor",
+            side_effect=lambda tensor: tensor.acl_format != nd_format,
+        ),
+        patch(
+            "sglang.srt.hardware_backend.npu.utils.copy_npu_formatted_tensor_",
+            side_effect=lambda destination, source: destination.copy_(source),
+        ) as formatted_copy,
+    ):
+        _copy_npu_p2p_recv_(destination, source)
+
+    assert destination.values == [7, 8]
+    assert formatted_copy.call_args.args[1].acl_format == nz_format
 
 
 def test_gpu_per_node_uses_original_ep_size_after_rank_failure():

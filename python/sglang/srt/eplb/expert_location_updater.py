@@ -212,6 +212,23 @@ def _p2p_ops_need_npu_staging(p2p_ops: List[P2POp]) -> bool:
     return bool(p2p_ops) and p2p_ops[0].tensor.device.type == "npu"
 
 
+def _copy_expert_tensor_(
+    destination_tensor: torch.Tensor, source_tensor: torch.Tensor
+) -> None:
+    if destination_tensor.device.type == "npu":
+        from sglang.srt.hardware_backend.npu.utils import (
+            copy_npu_formatted_tensor_,
+            is_npu_internal_format_tensor,
+        )
+
+        if is_npu_internal_format_tensor(
+            destination_tensor
+        ) and is_npu_internal_format_tensor(source_tensor):
+            copy_npu_formatted_tensor_(destination_tensor, source_tensor)
+            return
+    destination_tensor.copy_(source_tensor)
+
+
 def _stage_npu_p2p_ops(
     p2p_ops: List[P2POp],
 ) -> Tuple[List[P2POp], List[Tuple[torch.Tensor, torch.Tensor]]]:
@@ -248,6 +265,30 @@ def _stage_npu_p2p_ops(
             )
         )
     return staged_ops, recv_copy_infos
+
+
+def _copy_npu_p2p_recv_(
+    destination_tensor: torch.Tensor, nd_source_tensor: torch.Tensor
+) -> None:
+    import torch_npu
+
+    from sglang.srt.hardware_backend.npu.utils import (
+        copy_npu_formatted_tensor_,
+        is_npu_internal_format_tensor,
+    )
+
+    if not is_npu_internal_format_tensor(destination_tensor):
+        destination_tensor.copy_(nd_source_tensor)
+        return
+
+    formatted_tensor = torch_npu.empty_with_format(
+        tuple(destination_tensor.shape),
+        dtype=destination_tensor.dtype,
+        device=destination_tensor.device,
+        acl_format=torch_npu.get_npu_format(destination_tensor),
+    )
+    formatted_tensor.copy_(nd_source_tensor)
+    copy_npu_formatted_tensor_(destination_tensor, formatted_tensor)
 
 
 def update_expert_weights_single_layer(
@@ -403,8 +444,9 @@ def update_expert_weights_single_layer(
         for src_expert_location in range(*local_expert_location_range):
             if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
                 for i in range(num_tensors):
-                    _get_tensor(temp_buffers, i, dst_expert_location).copy_(
-                        _get_tensor(routed_experts_weights, i, src_expert_location)
+                    _copy_expert_tensor_(
+                        _get_tensor(temp_buffers, i, dst_expert_location),
+                        _get_tensor(routed_experts_weights, i, src_expert_location),
                     )
                 buffer2weight_copy_infos.append(
                     (dst_expert_location, dst_expert_location)
@@ -707,7 +749,7 @@ def update_expert_weights_single_layer(
                 for req in reqs:
                     req.wait()
                 for staged_tensor, destination_tensor in recv_copy_infos:
-                    destination_tensor.copy_(staged_tensor)
+                    _copy_npu_p2p_recv_(destination_tensor, staged_tensor)
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for (
@@ -715,11 +757,14 @@ def update_expert_weights_single_layer(
             routed_experts_weights_expert_location,
         ) in buffer2weight_copy_infos:
             for i in range(num_tensors):
-                _get_tensor(
-                    routed_experts_weights,
-                    i,
-                    routed_experts_weights_expert_location,
-                ).copy_(_get_tensor(temp_buffers, i, temp_buffers_expert_location))
+                _copy_expert_tensor_(
+                    _get_tensor(
+                        routed_experts_weights,
+                        i,
+                        routed_experts_weights_expert_location,
+                    ),
+                    _get_tensor(temp_buffers, i, temp_buffers_expert_location),
+                )
 
     def _get_tensor(tensors, tensor_index: int, expert_location: int) -> torch.Tensor:
         return tensors[tensor_index][_get_local_expert_location(expert_location)]
