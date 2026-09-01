@@ -104,6 +104,44 @@ def _copy_loaded_weight_(destination: torch.Tensor, source: torch.Tensor) -> Non
     destination.copy_(source)
 
 
+def _copy_loaded_w13_weight_(
+    destination: torch.Tensor,
+    source: torch.Tensor,
+    shard_dim: int,
+    start: int,
+    shard_size: int,
+) -> None:
+    if not _is_npu:
+        destination.narrow(shard_dim, start, shard_size).copy_(source)
+        return
+
+    from sglang.srt.hardware_backend.npu.utils import (
+        NPUACLFormat,
+        copy_to_npu_formatted_tensor_,
+        is_npu_internal_format_tensor,
+    )
+
+    if not is_npu_internal_format_tensor(destination):
+        destination.narrow(shard_dim, start, shard_size).copy_(source)
+        return
+
+    import torch_npu
+
+    # A standalone NZ tensor for one half of w13 is not guaranteed to have the
+    # same physical layout as that half inside the merged NZ tensor. Preserve
+    # the other half in ND, update the logical slice, then write the whole w13
+    # tensor back in the destination's internal format.
+    nd_destination = torch_npu.empty_with_format(
+        tuple(destination.shape),
+        dtype=destination.dtype,
+        device=destination.device,
+        acl_format=NPUACLFormat.ACL_FORMAT_ND,
+    )
+    nd_destination.copy_(destination)
+    nd_destination.narrow(shard_dim, start, shard_size).copy_(source)
+    copy_to_npu_formatted_tensor_(destination, nd_destination)
+
+
 def _get_deepep_comm_group(a2a_backend):
     group = get_tp_group().device_group
 
@@ -640,7 +678,14 @@ class FusedMoE(torch.nn.Module):
                     shard_dim, shard_size * tp_rank, shard_size
                 )
 
-            expert_data = expert_data.narrow(shard_dim, start, shard_size)
+            _copy_loaded_w13_weight_(
+                expert_data,
+                loaded_weight,
+                shard_dim,
+                start,
+                shard_size,
+            )
+            return
         _copy_loaded_weight_(expert_data, loaded_weight)
 
     def _load_w2(

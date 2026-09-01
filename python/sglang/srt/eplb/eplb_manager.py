@@ -26,6 +26,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _generate_standard_expert_weight_name_filter(logical_experts_map):
+    """Select standard per-expert checkpoint weights for missing experts."""
+    import re
+
+    pattern = re.compile(r"layers\.(\d+)\.mlp\.experts\.(\d+)\.")
+
+    def weight_name_filter(name: str) -> bool:
+        match = pattern.search(name)
+        if match is None:
+            return False
+        layer_id, expert_id = int(match.group(1)), int(match.group(2))
+        return (
+            layer_id in logical_experts_map
+            and expert_id in logical_experts_map[layer_id]
+        )
+
+    return weight_name_filter
+
+
 class EPLBManager:
     def __init__(
         self,
@@ -310,16 +329,17 @@ def update_expert_location_with_recovery(
                 p2p_missing_logical_experts
             )
         else:
-            filter_mode = "full"
-            # Do a full reload from disk/DRAM
+            filter_mode = "standard-selective"
             logger.info(
                 "[Elastic EP] Model does not implement generate_weight_name_filter. "
-                "Performing full weight reload."
+                "Using the standard per-expert checkpoint name filter."
             )
-            weight_name_filter = None
+            weight_name_filter = _generate_standard_expert_weight_name_filter(
+                p2p_missing_logical_experts
+            )
 
         filter_stats = {"checked": 0, "matched": 0, "matched_samples": []}
-        original_weight_name_filter = weight_name_filter or (lambda _name: True)
+        original_weight_name_filter = weight_name_filter
 
         def weight_name_filter(name: str) -> bool:
             filter_stats["checked"] += 1

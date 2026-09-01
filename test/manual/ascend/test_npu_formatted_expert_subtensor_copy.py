@@ -4,6 +4,7 @@ import torch
 import torch_npu
 
 from sglang.srt.hardware_backend.npu.utils import (
+    NPUACLFormat,
     copy_npu_formatted_tensor_,
     copy_to_npu_formatted_tensor_,
     npu_format_cast,
@@ -52,20 +53,36 @@ def main() -> None:
                 f"offset={original_storage_offset}"
             )
 
-        half_destination = destination.narrow(0, shape[1] // 2, shape[1] // 2)
-        half_replacement_cpu = torch.full(
-            half_destination.shape,
-            fill_value=3000 + slot,
-            dtype=torch.bfloat16,
+        # Update two logical halves through a full-size ND tensor. A standalone
+        # half-size NZ tensor is not a valid proxy for a half inside parent NZ.
+        nd_full = torch_npu.empty_with_format(
+            tuple(destination.shape),
+            dtype=destination.dtype,
+            device=destination.device,
+            acl_format=NPUACLFormat.ACL_FORMAT_ND,
         )
-        copy_to_npu_formatted_tensor_(
-            half_destination, half_replacement_cpu.to(device)
+        nd_full.copy_(destination)
+        half_size = shape[1] // 2
+        first_half_cpu = torch.full(
+            (half_size, shape[2]), fill_value=3000 + slot, dtype=torch.bfloat16
         )
+        nd_full.narrow(0, 0, half_size).copy_(first_half_cpu.to(device))
+        copy_to_npu_formatted_tensor_(destination, nd_full)
+
+        nd_full.copy_(destination)
+        second_half_cpu = torch.full(
+            (half_size, shape[2]), fill_value=4000 + slot, dtype=torch.bfloat16
+        )
+        nd_full.narrow(0, half_size, half_size).copy_(second_half_cpu.to(device))
+        copy_to_npu_formatted_tensor_(destination, nd_full)
         torch_npu.npu.synchronize()
-        if not torch.equal(half_destination.cpu(), half_replacement_cpu):
+        if not torch.equal(destination[:half_size].cpu(), first_half_cpu):
             raise AssertionError(
-                f"ND-to-formatted narrowed copy mismatch at slot={slot}: "
-                f"offset={half_destination.storage_offset()}"
+                f"ND-to-formatted first-half copy mismatch at slot={slot}"
+            )
+        if not torch.equal(destination[half_size:].cpu(), second_half_cpu):
+            raise AssertionError(
+                f"ND-to-formatted second-half copy mismatch at slot={slot}"
             )
 
     print(
