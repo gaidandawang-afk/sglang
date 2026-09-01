@@ -42,19 +42,25 @@ class _FakeNPUTensor:
         return self
 
 
-def test_nonzero_offset_npu_p2p_uses_nd_staging():
+def test_npu_p2p_uses_nd_staging_regardless_of_storage_offset():
     from sglang.srt.eplb.expert_location_updater import _stage_npu_p2p_ops
 
     nz_format = int(NPUACLFormat.ACL_FORMAT_FRACTAL_NZ)
     nd_format = int(NPUACLFormat.ACL_FORMAT_ND)
-    source = _FakeNPUTensor([1, 2], nz_format, storage_offset=8)
-    op = SimpleNamespace(
-        op=torch.distributed.isend,
-        tensor=source,
-        peer=1,
-        group=None,
-        tag=0,
-    )
+    sources = [
+        _FakeNPUTensor([1, 2], nz_format, storage_offset=0),
+        _FakeNPUTensor([3, 4], nz_format, storage_offset=8),
+    ]
+    ops = [
+        SimpleNamespace(
+            op=torch.distributed.isend,
+            tensor=source,
+            peer=1,
+            group=None,
+            tag=0,
+        )
+        for source in sources
+    ]
     fake_torch_npu = SimpleNamespace(
         empty_with_format=lambda shape, **kwargs: _FakeNPUTensor(
             [0] * shape[0], kwargs["acl_format"]
@@ -69,13 +75,15 @@ def test_nonzero_offset_npu_p2p_uses_nd_staging():
             side_effect=lambda **kwargs: SimpleNamespace(**kwargs),
         ),
     ):
-        staged_ops, recv_copy_infos = _stage_npu_p2p_ops([op])
+        staged_ops, recv_copy_infos = _stage_npu_p2p_ops(ops)
 
     assert recv_copy_infos == []
-    assert staged_ops[0].tensor is not source
-    assert staged_ops[0].tensor.acl_format == nd_format
-    assert staged_ops[0].tensor.storage_offset() == 0
-    assert staged_ops[0].tensor.values == [1, 2]
+    assert all(
+        staged.tensor is not source for staged, source in zip(staged_ops, sources)
+    )
+    assert all(staged.tensor.acl_format == nd_format for staged in staged_ops)
+    assert all(staged.tensor.storage_offset() == 0 for staged in staged_ops)
+    assert [staged.tensor.values for staged in staged_ops] == [[1, 2], [3, 4]]
 
 
 def test_gpu_per_node_uses_original_ep_size_after_rank_failure():

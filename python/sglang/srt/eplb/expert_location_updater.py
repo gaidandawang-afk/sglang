@@ -215,13 +215,11 @@ def _p2p_ops_need_npu_staging(p2p_ops: List[P2POp]) -> bool:
 def _stage_npu_p2p_ops(
     p2p_ops: List[P2POp],
 ) -> Tuple[List[P2POp], List[Tuple[torch.Tensor, torch.Tensor]]]:
+    """Transfer NPU expert tensors through offset-zero ND buffers."""
+
     staged_ops = []
     recv_copy_infos = []
     for op in p2p_ops:
-        if op.tensor.storage_offset() == 0:
-            staged_ops.append(op)
-            continue
-
         import torch_npu
 
         from sglang.srt.hardware_backend.npu.utils import NPUACLFormat
