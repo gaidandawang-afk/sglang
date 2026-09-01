@@ -16,6 +16,11 @@ STATE_RE = re.compile(
     r"fields=(?P<fields>\{.*\})"
 )
 PLAN_MARKER = "NPU FT precision step=eplb_transfer_plan"
+PLAN_RE = re.compile(
+    r"NPU FT precision step=eplb_transfer_plan layer_id=(?P<layer>\d+) "
+    r"original_rank=(?P<rank>\d+).*? movement_plan=(?P<plan>\[.*\]) "
+    r"p2p_plan="
+)
 MOVEMENT_KINDS = (
     "same-gpu",
     "free-rider",
@@ -119,6 +124,7 @@ def _record_summary(record: dict):
         "storage_size": fields.get("npu_storage_size"),
         "samples": fields.get("sample_values", fields.get("sample_values_raw")),
         "sample_error": fields.get("sample_error"),
+        "movement": record.get("movement", {"kind": "unknown"}),
     }
 
 
@@ -168,6 +174,8 @@ def main():
     stage_rank_counts = Counter()
     sampled_stage_rank_counts = Counter()
     movement_counts = Counter()
+    movement_entries = []
+    movement_plan_parse_errors = 0
     files_scanned = 0
     matched_lines = 0
     parse_errors = 0
@@ -184,6 +192,23 @@ def main():
                         matched_lines += 1
                         for kind in MOVEMENT_KINDS:
                             movement_counts[kind] += line.count(f"'{kind}'")
+                        plan_match = PLAN_RE.search(line)
+                        if plan_match is not None:
+                            try:
+                                plan = ast.literal_eval(plan_match.group("plan"))
+                                for expert, kind, source, destination in plan:
+                                    movement_entries.append(
+                                        {
+                                            "layer": int(plan_match.group("layer")),
+                                            "rank": int(plan_match.group("rank")),
+                                            "expert": expert,
+                                            "kind": kind,
+                                            "source": source,
+                                            "destination": destination,
+                                        }
+                                    )
+                            except (SyntaxError, ValueError, TypeError):
+                                movement_plan_parse_errors += 1
                         continue
                     match = STATE_RE.search(line)
                     if match is None:
@@ -215,6 +240,27 @@ def main():
         except OSError:
             continue
 
+    all_records = [record for records in records_by_stage.values() for record in records]
+    num_local_experts = (
+        max(record["slot"] for record in all_records) + 1 if all_records else None
+    )
+    movement_by_destination = {}
+    if num_local_experts is not None:
+        for entry in movement_entries:
+            movement_by_destination[
+                (
+                    entry["layer"],
+                    entry["rank"],
+                    entry["expert"],
+                    entry["destination"] % num_local_experts,
+                )
+            ] = entry
+        for record in records_by_stage["migration_after"]:
+            movement = movement_by_destination.get(
+                (record["layer"], record["rank"], record["expert"], record["slot"])
+            )
+            record["movement"] = movement or {"kind": "unchanged"}
+
     same_slot_checks = {
         "post_load_to_first_forward_before": _compare_same_slot(
             records_by_stage, "post_load", "first_forward_before"
@@ -224,12 +270,18 @@ def main():
         ),
     }
     migration_mismatches = _compare_migration(records_by_stage)
+    migration_mismatch_kinds = Counter(
+        item.get("movement", {}).get("kind", "unknown")
+        for item in migration_mismatches
+    )
 
     report = {
         "files_scanned": files_scanned,
         "matched_lines": matched_lines,
         "parse_errors": parse_errors,
         "field_parse_fallbacks": field_parse_fallbacks,
+        "movement_plan_parse_errors": movement_plan_parse_errors,
+        "num_local_experts": num_local_experts,
         "stage_rank_counts": {
             f"{stage}/rank{rank}": count
             for (stage, rank), count in sorted(stage_rank_counts.items())
@@ -239,6 +291,9 @@ def main():
             for (stage, rank), count in sorted(sampled_stage_rank_counts.items())
         },
         "movement_counts": dict(movement_counts),
+        "migration_mismatch_counts_by_movement": dict(
+            sorted(migration_mismatch_kinds.items())
+        ),
         "mismatch_counts": {
             **{name: len(items) for name, items in same_slot_checks.items()},
             "migration_before_to_after": len(migration_mismatches),
