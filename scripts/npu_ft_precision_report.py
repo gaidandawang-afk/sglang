@@ -18,7 +18,9 @@ STATE_RE = re.compile(
 PLAN_MARKER = "NPU FT precision step=eplb_transfer_plan"
 PLAN_RE = re.compile(
     r"NPU FT precision step=eplb_transfer_plan layer_id=(?P<layer>\d+) "
-    r"original_rank=(?P<rank>\d+).*? movement_plan=(?P<plan>\[.*\]) "
+    r"original_rank=(?P<rank>\d+) "
+    r"active_original_ranks=(?P<active>.*?) local_changes=.*? "
+    r"movement_plan=(?P<plan>\[.*\]) "
     r"p2p_plan="
 )
 MOVEMENT_KINDS = (
@@ -98,13 +100,14 @@ def _parse_fields(fields_text: str):
         return fields, True
 
 
-def _slot_key(record: dict):
-    return (
+def _slot_key(record: dict, *, include_stage_cycle: bool):
+    key = (
         record["rank"],
         record["layer"],
         record["slot"],
         record["tensor"],
     )
+    return (record.get("stage_cycle"), *key) if include_stage_cycle else key
 
 
 def _expert_key(record: dict):
@@ -125,6 +128,7 @@ def _record_summary(record: dict):
         "expert": record["expert"],
         "tensor": record["tensor"],
         "migration_epoch": record.get("migration_epoch"),
+        "stage_cycle": record.get("stage_cycle"),
         "format": fields.get("acl_format"),
         "offset": fields.get("storage_offset"),
         "storage_size": fields.get("npu_storage_size"),
@@ -134,11 +138,22 @@ def _record_summary(record: dict):
     }
 
 
-def _compare_same_slot(records_by_stage, before_stage, after_stage):
-    before = {_slot_key(record): record for record in records_by_stage[before_stage]}
+def _compare_same_slot(
+    records_by_stage,
+    before_stage,
+    after_stage,
+    *,
+    include_stage_cycle=True,
+):
+    before = {
+        _slot_key(record, include_stage_cycle=include_stage_cycle): record
+        for record in records_by_stage[before_stage]
+    }
     output = []
     for after_record in records_by_stage[after_stage]:
-        before_record = before.get(_slot_key(after_record))
+        before_record = before.get(
+            _slot_key(after_record, include_stage_cycle=include_stage_cycle)
+        )
         if before_record is None:
             continue
         before_fp = _sample_fingerprint(before_record["fields"])
@@ -184,6 +199,8 @@ def main():
     movement_plan_parse_errors = 0
     migration_epoch_by_rank = defaultdict(int)
     last_state_stage_by_rank = {}
+    stage_cycle_by_rank_and_base = defaultdict(int)
+    migration_epoch_contexts = {}
     files_scanned = 0
     matched_lines = 0
     parse_errors = 0
@@ -204,6 +221,14 @@ def main():
                         if plan_match is not None:
                             try:
                                 plan_rank = int(plan_match.group("rank"))
+                                active_text = plan_match.group("active")
+                                try:
+                                    active_ranks = ast.literal_eval(active_text)
+                                except (SyntaxError, ValueError):
+                                    active_ranks = active_text
+                                migration_epoch_contexts[
+                                    (migration_epoch_by_rank[plan_rank], plan_rank)
+                                ] = active_ranks
                                 plan = ast.literal_eval(plan_match.group("plan"))
                                 for expert, kind, source, destination in plan:
                                     movement_entries.append(
@@ -213,6 +238,7 @@ def main():
                                             ],
                                             "layer": int(plan_match.group("layer")),
                                             "rank": plan_rank,
+                                            "active_original_ranks": active_ranks,
                                             "expert": expert,
                                             "kind": kind,
                                             "source": source,
@@ -252,6 +278,18 @@ def main():
                     }
                     if stage in ("migration_before", "migration_after"):
                         record["migration_epoch"] = migration_epoch_by_rank[rank]
+                    elif stage.endswith("_before"):
+                        stage_base = stage[: -len("_before")]
+                        if last_state_stage_by_rank.get(rank) != stage:
+                            stage_cycle_by_rank_and_base[(rank, stage_base)] += 1
+                        record["stage_cycle"] = stage_cycle_by_rank_and_base[
+                            (rank, stage_base)
+                        ]
+                    elif stage.endswith("_after"):
+                        stage_base = stage[: -len("_after")]
+                        record["stage_cycle"] = stage_cycle_by_rank_and_base[
+                            (rank, stage_base)
+                        ]
                     last_state_stage_by_rank[rank] = stage
                     records_by_stage[record["stage"]].append(record)
                     stage_rank_counts[(record["stage"], record["rank"])] += 1
@@ -292,10 +330,23 @@ def main():
 
     same_slot_checks = {
         "post_load_to_first_forward_before": _compare_same_slot(
-            records_by_stage, "post_load", "first_forward_before"
+            records_by_stage,
+            "post_load",
+            "first_forward_before",
+            include_stage_cycle=False,
         ),
         "first_forward_before_to_after": _compare_same_slot(
             records_by_stage, "first_forward_before", "first_forward_after"
+        ),
+        "post_scale_down_forward_before_to_after": _compare_same_slot(
+            records_by_stage,
+            "post_scale_down_forward_before",
+            "post_scale_down_forward_after",
+        ),
+        "first_real_post_scale_down_forward_before_to_after": _compare_same_slot(
+            records_by_stage,
+            "first_real_post_scale_down_forward_before",
+            "first_real_post_scale_down_forward_after",
         ),
     }
     migration_mismatches = _compare_migration(records_by_stage)
@@ -351,6 +402,12 @@ def main():
         "movement_counts_by_epoch": {
             f"epoch{epoch}/{kind}": count
             for (epoch, kind), count in sorted(movement_counts_by_epoch.items())
+        },
+        "migration_epoch_active_ranks": {
+            f"epoch{epoch}/rank{rank}": active_ranks
+            for (epoch, rank), active_ranks in sorted(
+                migration_epoch_contexts.items()
+            )
         },
         "mismatch_counts": {
             **{name: len(items) for name, items in same_slot_checks.items()},
