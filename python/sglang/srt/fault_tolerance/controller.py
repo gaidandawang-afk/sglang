@@ -37,14 +37,19 @@ _FT_SUPPORT_GATES = [
     ),
     (lambda a: getattr(a, "pp_size", 1) == 1, "ft_requires_pp1"),
     (
-        lambda a: getattr(a, "elastic_ep_backend", None) == "mooncake",
+        lambda a: (
+            getattr(a, "elastic_ep_backend", None) == "mooncake"
+            or (
+                getattr(a, "device", None) == "npu"
+                and getattr(a, "elastic_ep_backend", None) == "mc2"
+            )
+        ),
         "ft_requires_mooncake_active_rank_backend",
     ),
     (
         lambda a: getattr(a, "disaggregation_mode", "null") == "null",
         "ft_unsupported_with_pd",
     ),
-    (lambda a: getattr(a, "device", None) != "npu", "ft_unsupported_with_npu"),
     (
         lambda a: getattr(a, "tokenizer_worker_num", 1) <= 1,
         "ft_unsupported_with_multi_tokenizer",

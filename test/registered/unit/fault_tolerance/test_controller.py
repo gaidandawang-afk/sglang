@@ -16,6 +16,25 @@ def make_state(*, dp_size=2, ranks_per_dp=1, strategy="pause"):
 
 
 class TestFaultToleranceState(unittest.TestCase):
+    def test_npu_mc2_configuration_is_supported(self):
+        args = SimpleNamespace(
+            pp_size=1,
+            elastic_ep_backend="mc2",
+            disaggregation_mode="null",
+            device="npu",
+            tokenizer_worker_num=1,
+            use_ray=False,
+            enable_dp_attention=True,
+            enable_eplb=True,
+            tp_size=4,
+            dp_size=4,
+            ep_size=4,
+            moe_dp_size=1,
+            attn_cp_size=1,
+        )
+
+        self.assertEqual(is_ft_supported_config(args), (True, ""))
+
     def test_single_dp_is_rejected(self):
         args = SimpleNamespace(
             pp_size=1,
