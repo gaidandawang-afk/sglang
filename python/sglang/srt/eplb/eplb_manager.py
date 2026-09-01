@@ -16,6 +16,7 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.eplb.npu_precision_trace import trace_expert_tensor_state
 from sglang.srt.runtime_context import get_server_args
 
 if TYPE_CHECKING:
@@ -256,6 +257,19 @@ def update_expert_location_with_recovery(
     )
 
     if len(p2p_missing_logical_experts) > 0:
+        trace_kwargs = dict(
+            rank=tp_rank,
+            routed_experts_weights_of_layer=model.routed_experts_weights_of_layer,
+            physical_to_logical_map_cpu=(
+                new_expert_location_metadata.physical_to_logical_map_cpu
+            ),
+            num_local_physical_experts=(
+                new_expert_location_metadata.num_local_physical_experts
+            ),
+            logical_experts_by_layer=p2p_missing_logical_experts,
+        )
+        trace_expert_tensor_state(stage="missing_recovery_before", **trace_kwargs)
+
         # Load the missing expert weights from disk
         if callable(getattr(model, "generate_weight_name_filter", None)):
             # Filter and load only missing expert weights
@@ -275,11 +289,17 @@ def update_expert_location_with_recovery(
             expert_backup_client.update_weights(weight_name_filter)
         else:
             # Load the missing weights from disk
-            update_weights_from_disk_callable(
+            success, message = update_weights_from_disk_callable(
                 get_server_args().model_path,
                 get_server_args().load_format,
                 weight_name_filter=weight_name_filter,
             )
+            if not success:
+                raise RuntimeError(
+                    f"[Elastic EP] Failed to recover missing experts: {message}"
+                )
+
+        trace_expert_tensor_state(stage="missing_recovery_after", **trace_kwargs)
 
     # Re-init LPLB solvers after expert location update
     if ep_dispatch_algorithm == "lp":

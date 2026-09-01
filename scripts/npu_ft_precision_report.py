@@ -184,6 +184,76 @@ def _compare_migration(records_by_stage):
     return output
 
 
+def _analyze_missing_recovery(records_by_stage):
+    post_load_by_expert = defaultdict(set)
+    for record in records_by_stage["post_load"]:
+        fingerprint = _sample_fingerprint(record["fields"])
+        if fingerprint is not None:
+            post_load_by_expert[
+                (record["layer"], record["expert"], record["tensor"])
+            ].add(fingerprint)
+
+    before_by_slot = {
+        (
+            record.get("migration_epoch"),
+            record["rank"],
+            record["layer"],
+            record["slot"],
+            record["tensor"],
+        ): record
+        for record in records_by_stage["missing_recovery_before"]
+    }
+    counts = Counter()
+    mismatches = []
+    for after_record in records_by_stage["missing_recovery_after"]:
+        after_fp = _sample_fingerprint(after_record["fields"])
+        if after_fp is None:
+            counts["unsampled"] += 1
+            continue
+
+        before_record = before_by_slot.get(
+            (
+                after_record.get("migration_epoch"),
+                after_record["rank"],
+                after_record["layer"],
+                after_record["slot"],
+                after_record["tensor"],
+            )
+        )
+        before_fp = (
+            _sample_fingerprint(before_record["fields"])
+            if before_record is not None
+            else None
+        )
+        counts["changed" if before_fp != after_fp else "unchanged"] += 1
+
+        expected = post_load_by_expert.get(
+            (
+                after_record["layer"],
+                after_record["expert"],
+                after_record["tensor"],
+            ),
+            set(),
+        )
+        if not expected:
+            counts["no_post_load_reference"] += 1
+        elif after_fp in expected:
+            counts["matches_post_load"] += 1
+        else:
+            counts["differs_from_post_load"] += 1
+            mismatches.append(
+                {
+                    "before": (
+                        _record_summary(before_record)
+                        if before_record is not None
+                        else None
+                    ),
+                    "after": _record_summary(after_record),
+                }
+            )
+    return counts, mismatches
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("paths", nargs="+", type=Path)
@@ -276,7 +346,12 @@ def main():
                         "tensor": int(match.group("tensor")),
                         "fields": fields,
                     }
-                    if stage in ("migration_before", "migration_after"):
+                    if stage in (
+                        "migration_before",
+                        "migration_after",
+                        "missing_recovery_before",
+                        "missing_recovery_after",
+                    ):
                         record["migration_epoch"] = migration_epoch_by_rank[rank]
                     elif stage.endswith("_before"):
                         stage_base = stage[: -len("_before")]
@@ -350,6 +425,7 @@ def main():
         ),
     }
     migration_mismatches = _compare_migration(records_by_stage)
+    recovery_counts, recovery_mismatches = _analyze_missing_recovery(records_by_stage)
     migration_mismatch_kinds = Counter(
         item.get("movement", {}).get("kind", "unknown")
         for item in migration_mismatches
@@ -387,6 +463,7 @@ def main():
             for (stage, rank), count in sorted(sampled_stage_rank_counts.items())
         },
         "movement_counts": dict(movement_counts),
+        "missing_recovery_counts": dict(sorted(recovery_counts.items())),
         "migration_mismatch_counts_by_movement": dict(
             sorted(migration_mismatch_kinds.items())
         ),
@@ -412,6 +489,7 @@ def main():
         "mismatch_counts": {
             **{name: len(items) for name, items in same_slot_checks.items()},
             "migration_before_to_after": len(migration_mismatches),
+            "missing_recovery_differs_from_post_load": len(recovery_mismatches),
         },
         "mismatches": {
             **{
@@ -419,6 +497,9 @@ def main():
                 for name, items in same_slot_checks.items()
             },
             "migration_before_to_after": migration_mismatches[
+                : args.max_mismatches
+            ],
+            "missing_recovery_differs_from_post_load": recovery_mismatches[
                 : args.max_mismatches
             ],
         },

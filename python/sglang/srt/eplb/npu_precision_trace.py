@@ -83,12 +83,18 @@ def trace_expert_tensor_state(
     routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
     physical_to_logical_map_cpu: Optional[torch.Tensor] = None,
     num_local_physical_experts: Optional[int] = None,
+    logical_experts_by_layer: Optional[Dict[int, List[int]]] = None,
 ) -> None:
     if not npu_precision_trace_enabled():
         return
 
     include_values = get_bool_env_var(_TRACE_VALUES_ENV)
-    for layer_id in _selected_layer_ids(routed_experts_weights_of_layer.keys()):
+    available_layer_ids = (
+        logical_experts_by_layer.keys()
+        if logical_experts_by_layer is not None
+        else routed_experts_weights_of_layer.keys()
+    )
+    for layer_id in _selected_layer_ids(available_layer_ids):
         tensors = routed_experts_weights_of_layer[layer_id]
         if not tensors:
             continue
@@ -103,6 +109,11 @@ def trace_expert_tensor_state(
                 logical_expert_id = int(
                     physical_to_logical_map_cpu[layer_id, physical_slot].item()
                 )
+            if (
+                logical_experts_by_layer is not None
+                and logical_expert_id not in logical_experts_by_layer[layer_id]
+            ):
+                continue
             for tensor_index, tensor in enumerate(tensors):
                 expert_tensor = tensor[local_slot]
                 try:
