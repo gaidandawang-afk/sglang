@@ -116,6 +116,7 @@ def main():
 
     records_by_stage = defaultdict(list)
     stage_rank_counts = Counter()
+    sampled_stage_rank_counts = Counter()
     movement_counts = Counter()
     files_scanned = 0
     matched_lines = 0
@@ -156,6 +157,10 @@ def main():
                     }
                     records_by_stage[record["stage"]].append(record)
                     stage_rank_counts[(record["stage"], record["rank"])] += 1
+                    if _sample_fingerprint(fields) is not None:
+                        sampled_stage_rank_counts[
+                            (record["stage"], record["rank"])
+                        ] += 1
         except OSError:
             continue
 
@@ -176,6 +181,10 @@ def main():
         "stage_rank_counts": {
             f"{stage}/rank{rank}": count
             for (stage, rank), count in sorted(stage_rank_counts.items())
+        },
+        "sampled_stage_rank_counts": {
+            f"{stage}/rank{rank}": count
+            for (stage, rank), count in sorted(sampled_stage_rank_counts.items())
         },
         "movement_counts": dict(movement_counts),
         "mismatch_counts": {
