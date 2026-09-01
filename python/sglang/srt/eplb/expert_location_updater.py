@@ -222,7 +222,20 @@ def _stage_npu_p2p_ops(
             staged_ops.append(op)
             continue
 
-        staged_tensor = torch.empty_like(op.tensor)
+        import torch_npu
+
+        from sglang.srt.hardware_backend.npu.utils import NPUACLFormat
+
+        staged_tensor = torch_npu.empty_with_format(
+            tuple(op.tensor.shape),
+            dtype=op.tensor.dtype,
+            device=op.tensor.device,
+            acl_format=int(NPUACLFormat.ACL_FORMAT_ND),
+        )
+        if staged_tensor.storage_offset() != 0 or torch_npu.get_npu_format(
+            staged_tensor
+        ) != int(NPUACLFormat.ACL_FORMAT_ND):
+            raise RuntimeError("Failed to create an offset-zero ND EPLB P2P buffer.")
         if op.op == torch.distributed.irecv:
             recv_copy_infos.append((staged_tensor, op.tensor))
         else:

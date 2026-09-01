@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -9,6 +10,7 @@ from sglang.srt.eplb.expert_location_updater import (
     update_expert_weights_single_layer,
 )
 from sglang.srt.eplb.process_group_context import EPLBProcessGroupContext
+from sglang.srt.hardware_backend.npu.utils import NPUACLFormat
 
 
 def test_npu_p2p_staging_does_not_depend_on_an_explicit_group():
@@ -21,6 +23,59 @@ def test_npu_p2p_staging_does_not_depend_on_an_explicit_group():
 
     assert _p2p_ops_need_npu_staging([npu_op])
     assert not _p2p_ops_need_npu_staging([cuda_op])
+
+
+class _FakeNPUTensor:
+    def __init__(self, values, acl_format, storage_offset=0):
+        self.values = list(values)
+        self.shape = (len(self.values),)
+        self.dtype = torch.float16
+        self.device = SimpleNamespace(type="npu")
+        self.acl_format = acl_format
+        self._storage_offset = storage_offset
+
+    def storage_offset(self):
+        return self._storage_offset
+
+    def copy_(self, source):
+        self.values = list(source.values)
+        return self
+
+
+def test_nonzero_offset_npu_p2p_uses_nd_staging():
+    from sglang.srt.eplb.expert_location_updater import _stage_npu_p2p_ops
+
+    nz_format = int(NPUACLFormat.ACL_FORMAT_FRACTAL_NZ)
+    nd_format = int(NPUACLFormat.ACL_FORMAT_ND)
+    source = _FakeNPUTensor([1, 2], nz_format, storage_offset=8)
+    op = SimpleNamespace(
+        op=torch.distributed.isend,
+        tensor=source,
+        peer=1,
+        group=None,
+        tag=0,
+    )
+    fake_torch_npu = SimpleNamespace(
+        empty_with_format=lambda shape, **kwargs: _FakeNPUTensor(
+            [0] * shape[0], kwargs["acl_format"]
+        ),
+        get_npu_format=lambda tensor: tensor.acl_format,
+    )
+
+    with (
+        patch.dict(sys.modules, {"torch_npu": fake_torch_npu}),
+        patch(
+            "sglang.srt.eplb.expert_location_updater.P2POp",
+            side_effect=lambda **kwargs: SimpleNamespace(**kwargs),
+        ),
+    ):
+        staged_ops, recv_copy_infos = _stage_npu_p2p_ops([op])
+
+    assert recv_copy_infos == []
+    assert staged_ops[0].tensor is not source
+    assert staged_ops[0].tensor.acl_format == nd_format
+    assert staged_ops[0].tensor.storage_offset() == 0
+    assert staged_ops[0].tensor.values == [1, 2]
 
 
 def test_gpu_per_node_uses_original_ep_size_after_rank_failure():
