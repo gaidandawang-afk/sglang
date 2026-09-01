@@ -608,6 +608,15 @@ class ModelRunner:
             is_hybrid_swa=self.is_hybrid_swa,
         )
         self.maybe_apply_post_load_model_transforms()
+        self._npu_ft_precision_trace_next_forward_stage = None
+        if _is_npu:
+            from sglang.srt.eplb.npu_precision_trace import (
+                npu_precision_trace_enabled,
+            )
+
+            if npu_precision_trace_enabled():
+                self._trace_npu_ft_expert_state("post_load")
+                self._npu_ft_precision_trace_next_forward_stage = "first_forward"
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
@@ -615,6 +624,27 @@ class ModelRunner:
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
+        )
+
+    def _trace_npu_ft_expert_state(self, stage: str) -> None:
+        routed_weights = getattr(self.model, "routed_experts_weights_of_layer", None)
+        if routed_weights is None:
+            logger.warning(
+                "NPU FT precision state stage=%s rank=%s skipped=no_routed_weights",
+                stage,
+                self.ps.tp_rank,
+            )
+            return
+
+        from sglang.srt.eplb.npu_precision_trace import trace_expert_tensor_state
+
+        metadata = get_global_expert_location_metadata()
+        trace_expert_tensor_state(
+            stage=stage,
+            rank=self.ps.tp_rank,
+            routed_experts_weights_of_layer=routed_weights,
+            physical_to_logical_map_cpu=metadata.physical_to_logical_map_cpu,
+            num_local_physical_experts=metadata.num_local_physical_experts,
         )
 
     def maybe_init_remote_instance_transfer_engine(self):
@@ -1361,6 +1391,12 @@ class ModelRunner:
 
         self.forward_pass_id += 1
 
+        precision_trace_stage = getattr(
+            self, "_npu_ft_precision_trace_next_forward_stage", None
+        )
+        if precision_trace_stage is not None:
+            self._trace_npu_ft_expert_state(f"{precision_trace_stage}_before")
+
         # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = (
@@ -1407,6 +1443,9 @@ class ModelRunner:
                     reinit_attn_backend,
                     split_forward_count,
                 )
+        if precision_trace_stage is not None:
+            self._trace_npu_ft_expert_state(f"{precision_trace_stage}_after")
+            self._npu_ft_precision_trace_next_forward_stage = None
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
@@ -2009,6 +2048,15 @@ class ModelRunner:
             "reserved_kv_page=0",
             self.ps.dp_rank,
         )
+        if _is_npu:
+            from sglang.srt.eplb.npu_precision_trace import (
+                npu_precision_trace_enabled,
+            )
+
+            if npu_precision_trace_enabled():
+                self._npu_ft_precision_trace_next_forward_stage = (
+                    "post_scale_down_forward"
+                )
         logger.info(
             "NPU FT dummy step=model_runner_forward phase=begin dp_rank=%s "
             "active_mask=%s",
@@ -2040,6 +2088,12 @@ class ModelRunner:
             # The diagnostic belongs to the first real request, not this
             # recovery dummy forward.
             state.npu_mc2_elastic_info.arm_dispatch_mapping_log()
+        from sglang.srt.eplb.npu_precision_trace import npu_precision_trace_enabled
+
+        if npu_precision_trace_enabled():
+            self._npu_ft_precision_trace_next_forward_stage = (
+                "first_real_post_scale_down_forward"
+            )
 
     def synchronize_npu_fault_tolerance_health_gate(self) -> None:
         logger.info(

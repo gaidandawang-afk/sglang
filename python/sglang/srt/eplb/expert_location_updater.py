@@ -26,6 +26,10 @@ from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
 )
+from sglang.srt.eplb.npu_precision_trace import (
+    npu_precision_trace_enabled,
+    trace_expert_tensor_state,
+)
 from sglang.srt.eplb.process_group_context import get_eplb_process_group_context
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import get_bool_env_var
@@ -156,6 +160,16 @@ def _update_expert_weights_raw(
 
     missing_logical_experts_by_layers: Dict[int, List[int]] = {}
 
+    trace_expert_tensor_state(
+        stage="migration_before",
+        rank=rank,
+        routed_experts_weights_of_layer=routed_experts_weights_of_layer,
+        physical_to_logical_map_cpu=(
+            old_expert_location_metadata.physical_to_logical_map_cpu
+        ),
+        num_local_physical_experts=num_local_physical_experts,
+    )
+
     for layer_id in update_layer_ids:
         missing_logical_experts_info: List[int] = []
         update_expert_weights_single_layer(
@@ -177,26 +191,21 @@ def _update_expert_weights_raw(
         )
         if len(missing_logical_experts_info) > 0:
             missing_logical_experts_by_layers[layer_id] = missing_logical_experts_info
+
+    trace_expert_tensor_state(
+        stage="migration_after",
+        rank=rank,
+        routed_experts_weights_of_layer=routed_experts_weights_of_layer,
+        physical_to_logical_map_cpu=(
+            new_expert_location_metadata.physical_to_logical_map_cpu
+        ),
+        num_local_physical_experts=num_local_physical_experts,
+    )
     return missing_logical_experts_by_layers
 
 
 def create_temp_buffers(sample_tensors):
     return [torch.empty_like(tensor) for tensor in sample_tensors]
-
-
-def _copy_expert_tensor_(
-    destination_tensor: torch.Tensor, source_tensor: torch.Tensor
-) -> None:
-    if destination_tensor.device.type == "npu":
-        from sglang.srt.hardware_backend.npu.utils import (
-            copy_npu_formatted_tensor_,
-            is_npu_internal_format_tensor,
-        )
-
-        if is_npu_internal_format_tensor(destination_tensor):
-            copy_npu_formatted_tensor_(destination_tensor, source_tensor)
-            return
-    destination_tensor.copy_(source_tensor)
 
 
 def _stage_npu_p2p_ops(
@@ -213,7 +222,7 @@ def _stage_npu_p2p_ops(
         if op.op == torch.distributed.irecv:
             recv_copy_infos.append((staged_tensor, op.tensor))
         else:
-            _copy_expert_tensor_(staged_tensor, op.tensor)
+            staged_tensor.copy_(op.tensor)
         staged_ops.append(
             P2POp(
                 op=op.op,
@@ -283,6 +292,7 @@ def update_expert_weights_single_layer(
         if old_physical_to_logical_map[physical_location]
         != new_physical_to_logical_map[physical_location]
     ]
+    movement_plan = []
 
     def _p2p_plan(p2p_op_infos):
         return [
@@ -313,21 +323,28 @@ def update_expert_weights_single_layer(
         _create_isend_ops(p2p_op_infos)
         if process_group_context.active_original_ranks is None:
             _filter_p2p_ops(p2p_op_infos)
-        if process_group_context.active_original_ranks is not None:
+        if (
+            process_group_context.active_original_ranks is not None
+            or npu_precision_trace_enabled()
+        ):
             logger.info(
                 "NPU FT precision step=eplb_transfer_plan layer_id=%s "
                 "original_rank=%s active_original_ranks=%s local_changes=%s "
-                "p2p_plan=%s missing_logical_experts=%s",
+                "movement_plan=%s p2p_plan=%s missing_logical_experts=%s",
                 layer_id,
                 rank,
                 process_group_context.active_original_ranks,
                 local_changes,
+                movement_plan,
                 _p2p_plan(p2p_op_infos),
                 missing_logical_experts_info,
             )
         _execute_p2p_ops(p2p_op_infos)
         _execute_buffer2weight_copies(buffer2weight_copy_infos)
-        if process_group_context.active_original_ranks is not None:
+        if (
+            process_group_context.active_original_ranks is not None
+            or npu_precision_trace_enabled()
+        ):
             logger.info(
                 "NPU FT precision step=eplb_transfer_complete layer_id=%s "
                 "original_rank=%s local_changes=%s",
@@ -371,12 +388,19 @@ def update_expert_weights_single_layer(
         for src_expert_location in range(*local_expert_location_range):
             if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
                 for i in range(num_tensors):
-                    _copy_expert_tensor_(
-                        _get_tensor(temp_buffers, i, dst_expert_location),
-                        _get_tensor(routed_experts_weights, i, src_expert_location),
+                    _get_tensor(temp_buffers, i, dst_expert_location).copy_(
+                        _get_tensor(routed_experts_weights, i, src_expert_location)
                     )
                 buffer2weight_copy_infos.append(
                     (dst_expert_location, dst_expert_location)
+                )
+                movement_plan.append(
+                    (
+                        logical_expert_id,
+                        "same-gpu",
+                        src_expert_location,
+                        dst_expert_location,
+                    )
                 )
                 if debug:
                     output_logs.append(
@@ -391,6 +415,14 @@ def update_expert_weights_single_layer(
             if new_physical_to_logical_map[src_expert_location] == logical_expert_id:
                 buffer2weight_copy_infos.append(
                     (src_expert_location, dst_expert_location)
+                )
+                movement_plan.append(
+                    (
+                        logical_expert_id,
+                        "free-rider",
+                        src_expert_location,
+                        dst_expert_location,
+                    )
                 )
                 if debug:
                     output_logs.append(
@@ -408,6 +440,9 @@ def update_expert_weights_single_layer(
             and not cross_node_mapping.chunk_values
         ):
             missing_logical_experts_info.append(logical_expert_id)
+            movement_plan.append(
+                (logical_expert_id, "missing", None, dst_expert_location)
+            )
             return
 
         # case 4: same-node
@@ -421,6 +456,14 @@ def update_expert_weights_single_layer(
                 src_rank=chosen_src_rank,
                 logical_expert_id=logical_expert_id,
                 dst_expert_location=dst_expert_location,
+            )
+            movement_plan.append(
+                (
+                    logical_expert_id,
+                    "same-node-p2p",
+                    chosen_src_rank,
+                    dst_expert_location,
+                )
             )
             if debug:
                 output_logs.append(
@@ -439,6 +482,14 @@ def update_expert_weights_single_layer(
             src_rank=chosen_src_rank,
             logical_expert_id=logical_expert_id,
             dst_expert_location=dst_expert_location,
+        )
+        movement_plan.append(
+            (
+                logical_expert_id,
+                "cross-node-p2p",
+                chosen_src_rank,
+                dst_expert_location,
+            )
         )
         if debug:
             output_logs.append(
@@ -641,7 +692,7 @@ def update_expert_weights_single_layer(
                 for req in reqs:
                     req.wait()
                 for staged_tensor, destination_tensor in recv_copy_infos:
-                    _copy_expert_tensor_(destination_tensor, staged_tensor)
+                    destination_tensor.copy_(staged_tensor)
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for (
@@ -649,14 +700,11 @@ def update_expert_weights_single_layer(
             routed_experts_weights_expert_location,
         ) in buffer2weight_copy_infos:
             for i in range(num_tensors):
-                _copy_expert_tensor_(
-                    _get_tensor(
-                        routed_experts_weights,
-                        i,
-                        routed_experts_weights_expert_location,
-                    ),
-                    _get_tensor(temp_buffers, i, temp_buffers_expert_location),
-                )
+                _get_tensor(
+                    routed_experts_weights,
+                    i,
+                    routed_experts_weights_expert_location,
+                ).copy_(_get_tensor(temp_buffers, i, temp_buffers_expert_location))
 
     def _get_tensor(tensors, tensor_index: int, expert_location: int) -> torch.Tensor:
         return tensors[tensor_index][_get_local_expert_location(expert_location)]
