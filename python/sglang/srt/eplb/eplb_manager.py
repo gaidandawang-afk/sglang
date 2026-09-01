@@ -257,15 +257,47 @@ def update_expert_location_with_recovery(
     )
 
     if len(p2p_missing_logical_experts) > 0:
+        num_local_physical_experts = (
+            new_expert_location_metadata.num_local_physical_experts
+        )
+        local_target_samples = []
+        for layer_id, logical_expert_ids in p2p_missing_logical_experts.items():
+            for logical_expert_id in logical_expert_ids:
+                for physical_expert_id in (
+                    new_expert_location_metadata.logical_to_all_physical(
+                        layer_id, logical_expert_id
+                    )
+                ):
+                    if (
+                        physical_expert_id // num_local_physical_experts
+                        == tp_rank
+                    ):
+                        local_target_samples.append(
+                            (
+                                layer_id,
+                                logical_expert_id,
+                                physical_expert_id,
+                                physical_expert_id % num_local_physical_experts,
+                            )
+                        )
+        logger.info(
+            "[Elastic EP] Missing expert recovery plan rank=%s "
+            "missing_by_layer=%s local_target_count=%s local_target_samples=%s",
+            tp_rank,
+            {
+                layer_id: len(logical_expert_ids)
+                for layer_id, logical_expert_ids in p2p_missing_logical_experts.items()
+            },
+            len(local_target_samples),
+            local_target_samples[:20],
+        )
         trace_kwargs = dict(
             rank=tp_rank,
             routed_experts_weights_of_layer=model.routed_experts_weights_of_layer,
             physical_to_logical_map_cpu=(
                 new_expert_location_metadata.physical_to_logical_map_cpu
             ),
-            num_local_physical_experts=(
-                new_expert_location_metadata.num_local_physical_experts
-            ),
+            num_local_physical_experts=num_local_physical_experts,
             logical_experts_by_layer=p2p_missing_logical_experts,
         )
         trace_expert_tensor_state(stage="missing_recovery_before", **trace_kwargs)
@@ -284,6 +316,19 @@ def update_expert_location_with_recovery(
             )
             weight_name_filter = None
 
+        filter_stats = {"checked": 0, "matched": 0, "matched_samples": []}
+        if weight_name_filter is not None:
+            original_weight_name_filter = weight_name_filter
+
+            def weight_name_filter(name: str) -> bool:
+                filter_stats["checked"] += 1
+                matched = original_weight_name_filter(name)
+                if matched:
+                    filter_stats["matched"] += 1
+                    if len(filter_stats["matched_samples"]) < 20:
+                        filter_stats["matched_samples"].append(name)
+                return matched
+
         if expert_backup_client is not None and expert_backup_client.use_backup:
             # Load the missing weights from the DRAM backup
             expert_backup_client.update_weights(weight_name_filter)
@@ -298,6 +343,21 @@ def update_expert_location_with_recovery(
                 raise RuntimeError(
                     f"[Elastic EP] Failed to recover missing experts: {message}"
                 )
+
+        logger.info(
+            "[Elastic EP] Missing expert recovery filter rank=%s "
+            "checked=%s matched=%s matched_samples=%s",
+            tp_rank,
+            filter_stats["checked"],
+            filter_stats["matched"],
+            filter_stats["matched_samples"],
+        )
+        if weight_name_filter is not None and filter_stats["matched"] == 0:
+            raise RuntimeError(
+                "[Elastic EP] Missing expert recovery matched zero checkpoint weights "
+                f"on rank {tp_rank}; missing_by_layer="
+                f"{p2p_missing_logical_experts}"
+            )
 
         trace_expert_tensor_state(stage="missing_recovery_after", **trace_kwargs)
 

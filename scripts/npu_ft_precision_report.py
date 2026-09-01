@@ -23,6 +23,19 @@ PLAN_RE = re.compile(
     r"movement_plan=(?P<plan>\[.*\]) "
     r"p2p_plan="
 )
+RECOVERY_FILTER_MARKER = "[Elastic EP] Missing expert recovery filter"
+RECOVERY_FILTER_RE = re.compile(
+    r"\[Elastic EP\] Missing expert recovery filter rank=(?P<rank>\d+) "
+    r"checked=(?P<checked>\d+) matched=(?P<matched>\d+) "
+    r"matched_samples=(?P<samples>\[.*\])"
+)
+RECOVERY_PLAN_MARKER = "[Elastic EP] Missing expert recovery plan"
+RECOVERY_PLAN_RE = re.compile(
+    r"\[Elastic EP\] Missing expert recovery plan rank=(?P<rank>\d+) "
+    r"missing_by_layer=(?P<missing>\{.*?\}) "
+    r"local_target_count=(?P<count>\d+) "
+    r"local_target_samples=(?P<samples>\[.*\])"
+)
 MOVEMENT_KINDS = (
     "same-gpu",
     "free-rider",
@@ -121,6 +134,9 @@ def _expert_key(record: dict):
 
 def _record_summary(record: dict):
     fields = record["fields"]
+    movement = record.get("movement")
+    if movement is None and record["stage"].startswith("missing_recovery_"):
+        movement = {"kind": "missing-recovery"}
     return {
         "rank": record["rank"],
         "layer": record["layer"],
@@ -134,7 +150,7 @@ def _record_summary(record: dict):
         "storage_size": fields.get("npu_storage_size"),
         "samples": fields.get("sample_values", fields.get("sample_values_raw")),
         "sample_error": fields.get("sample_error"),
-        "movement": record.get("movement", {"kind": "unknown"}),
+        "movement": movement or {"kind": "unknown"},
     }
 
 
@@ -271,6 +287,8 @@ def main():
     last_state_stage_by_rank = {}
     stage_cycle_by_rank_and_base = defaultdict(int)
     migration_epoch_contexts = {}
+    missing_recovery_filter_stats = {}
+    missing_recovery_plan_stats = {}
     files_scanned = 0
     matched_lines = 0
     parse_errors = 0
@@ -281,7 +299,50 @@ def main():
         try:
             with path.open("r", encoding="utf-8", errors="ignore") as file:
                 for line in file:
-                    if "NPU FT precision" not in line:
+                    if not any(
+                        marker in line
+                        for marker in (
+                            "NPU FT precision",
+                            RECOVERY_FILTER_MARKER,
+                            RECOVERY_PLAN_MARKER,
+                        )
+                    ):
+                        continue
+                    if RECOVERY_FILTER_MARKER in line:
+                        match = RECOVERY_FILTER_RE.search(line)
+                        if match is not None:
+                            rank = int(match.group("rank"))
+                            try:
+                                samples = ast.literal_eval(match.group("samples"))
+                            except (SyntaxError, ValueError):
+                                samples = match.group("samples")
+                            missing_recovery_filter_stats[
+                                (migration_epoch_by_rank[rank], rank)
+                            ] = {
+                                "checked": int(match.group("checked")),
+                                "matched": int(match.group("matched")),
+                                "matched_samples": samples,
+                            }
+                        continue
+                    if RECOVERY_PLAN_MARKER in line:
+                        match = RECOVERY_PLAN_RE.search(line)
+                        if match is not None:
+                            rank = int(match.group("rank"))
+                            try:
+                                missing = ast.literal_eval(match.group("missing"))
+                            except (SyntaxError, ValueError):
+                                missing = match.group("missing")
+                            try:
+                                samples = ast.literal_eval(match.group("samples"))
+                            except (SyntaxError, ValueError):
+                                samples = match.group("samples")
+                            missing_recovery_plan_stats[
+                                (migration_epoch_by_rank[rank], rank)
+                            ] = {
+                                "missing_by_layer": missing,
+                                "local_target_count": int(match.group("count")),
+                                "local_target_samples": samples,
+                            }
                         continue
                     if PLAN_MARKER in line:
                         matched_lines += 1
@@ -464,6 +525,16 @@ def main():
         },
         "movement_counts": dict(movement_counts),
         "missing_recovery_counts": dict(sorted(recovery_counts.items())),
+        "missing_recovery_filter_stats": {
+            f"epoch{epoch}/rank{rank}": stats
+            for (epoch, rank), stats in sorted(
+                missing_recovery_filter_stats.items()
+            )
+        },
+        "missing_recovery_plan_stats": {
+            f"epoch{epoch}/rank{rank}": stats
+            for (epoch, rank), stats in sorted(missing_recovery_plan_stats.items())
+        },
         "migration_mismatch_counts_by_movement": dict(
             sorted(migration_mismatch_kinds.items())
         ),
