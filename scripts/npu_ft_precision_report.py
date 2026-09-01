@@ -108,7 +108,12 @@ def _slot_key(record: dict):
 
 
 def _expert_key(record: dict):
-    return record["layer"], record["expert"], record["tensor"]
+    return (
+        record.get("migration_epoch"),
+        record["layer"],
+        record["expert"],
+        record["tensor"],
+    )
 
 
 def _record_summary(record: dict):
@@ -119,6 +124,7 @@ def _record_summary(record: dict):
         "slot": record["slot"],
         "expert": record["expert"],
         "tensor": record["tensor"],
+        "migration_epoch": record.get("migration_epoch"),
         "format": fields.get("acl_format"),
         "offset": fields.get("storage_offset"),
         "storage_size": fields.get("npu_storage_size"),
@@ -176,6 +182,8 @@ def main():
     movement_counts = Counter()
     movement_entries = []
     movement_plan_parse_errors = 0
+    migration_epoch_by_rank = defaultdict(int)
+    last_state_stage_by_rank = {}
     files_scanned = 0
     matched_lines = 0
     parse_errors = 0
@@ -195,12 +203,16 @@ def main():
                         plan_match = PLAN_RE.search(line)
                         if plan_match is not None:
                             try:
+                                plan_rank = int(plan_match.group("rank"))
                                 plan = ast.literal_eval(plan_match.group("plan"))
                                 for expert, kind, source, destination in plan:
                                     movement_entries.append(
                                         {
+                                            "migration_epoch": migration_epoch_by_rank[
+                                                plan_rank
+                                            ],
                                             "layer": int(plan_match.group("layer")),
-                                            "rank": int(plan_match.group("rank")),
+                                            "rank": plan_rank,
                                             "expert": expert,
                                             "kind": kind,
                                             "source": source,
@@ -220,9 +232,16 @@ def main():
                         parse_errors += 1
                         continue
                     expert_text = match.group("expert")
+                    stage = match.group("stage")
+                    rank = int(match.group("rank"))
+                    if (
+                        stage == "migration_before"
+                        and last_state_stage_by_rank.get(rank) != "migration_before"
+                    ):
+                        migration_epoch_by_rank[rank] += 1
                     record = {
-                        "stage": match.group("stage"),
-                        "rank": int(match.group("rank")),
+                        "stage": stage,
+                        "rank": rank,
                         "layer": int(match.group("layer")),
                         "slot": int(match.group("slot")),
                         "expert": (
@@ -231,6 +250,9 @@ def main():
                         "tensor": int(match.group("tensor")),
                         "fields": fields,
                     }
+                    if stage in ("migration_before", "migration_after"):
+                        record["migration_epoch"] = migration_epoch_by_rank[rank]
+                    last_state_stage_by_rank[rank] = stage
                     records_by_stage[record["stage"]].append(record)
                     stage_rank_counts[(record["stage"], record["rank"])] += 1
                     if _sample_fingerprint(fields) is not None:
@@ -251,13 +273,20 @@ def main():
                 (
                     entry["layer"],
                     entry["rank"],
+                    entry["migration_epoch"],
                     entry["expert"],
                     entry["destination"] % num_local_experts,
                 )
             ] = entry
         for record in records_by_stage["migration_after"]:
             movement = movement_by_destination.get(
-                (record["layer"], record["rank"], record["expert"], record["slot"])
+                (
+                    record["layer"],
+                    record["rank"],
+                    record.get("migration_epoch"),
+                    record["expert"],
+                    record["slot"],
+                )
             )
             record["movement"] = movement or {"kind": "unchanged"}
 
@@ -273,6 +302,22 @@ def main():
     migration_mismatch_kinds = Counter(
         item.get("movement", {}).get("kind", "unknown")
         for item in migration_mismatches
+    )
+    migration_mismatch_epochs = Counter(
+        f"epoch{item.get('migration_epoch')}"
+        for item in migration_mismatches
+    )
+    migration_epoch_stage_rank_counts = Counter(
+        (
+            record.get("migration_epoch"),
+            record["stage"],
+            record["rank"],
+        )
+        for stage in ("migration_before", "migration_after")
+        for record in records_by_stage[stage]
+    )
+    movement_counts_by_epoch = Counter(
+        (entry["migration_epoch"], entry["kind"]) for entry in movement_entries
     )
 
     report = {
@@ -294,6 +339,19 @@ def main():
         "migration_mismatch_counts_by_movement": dict(
             sorted(migration_mismatch_kinds.items())
         ),
+        "migration_mismatch_counts_by_epoch": dict(
+            sorted(migration_mismatch_epochs.items())
+        ),
+        "migration_epoch_stage_rank_counts": {
+            f"epoch{epoch}/{stage}/rank{rank}": count
+            for (epoch, stage, rank), count in sorted(
+                migration_epoch_stage_rank_counts.items()
+            )
+        },
+        "movement_counts_by_epoch": {
+            f"epoch{epoch}/{kind}": count
+            for (epoch, kind), count in sorted(movement_counts_by_epoch.items())
+        },
         "mismatch_counts": {
             **{name: len(items) for name, items in same_slot_checks.items()},
             "migration_before_to_after": len(migration_mismatches),
