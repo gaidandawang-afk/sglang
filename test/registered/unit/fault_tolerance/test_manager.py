@@ -4,7 +4,10 @@ from contextlib import suppress
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-from sglang.srt.fault_tolerance.manager import FaultToleranceManager
+from sglang.srt.fault_tolerance.manager import (
+    WATCHDOG_LEASE_TIMEOUT_SEC,
+    FaultToleranceManager,
+)
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     FaultToleranceCommandReqOutput,
@@ -158,7 +161,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_pause_native_ready_automatically_reopens_route(self):
+    async def test_pause_runtime_ready_automatically_reopens_route(self):
         manager = make_manager()
         manager.state.finish_scale_down([1])
         manager._route_dp_mask = [True, False]
@@ -275,6 +278,24 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
             ({}, "'instruction' is required."),
             ({"instruction": "retry", "params": []}, "'params' must be an object."),
             (
+                {"instruction": "scale_down", "params": {}},
+                "'removed_dp_ranks' must be a list of integers.",
+            ),
+            (
+                {
+                    "instruction": "scale_down",
+                    "params": {"removed_dp_ranks": [True]},
+                },
+                "'removed_dp_ranks' must be a list of integers.",
+            ),
+            (
+                {
+                    "instruction": "scale_down",
+                    "params": {"removed_dp_ranks": [4]},
+                },
+                "'removed_dp_ranks' contains a rank out of range.",
+            ),
+            (
                 {"instruction": "retry", "request_id": 1},
                 "'request_id' must be a string.",
             ),
@@ -286,7 +307,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(status, 400)
                 self.assertEqual(response["message"], expected_error)
 
-    async def test_native_ready_before_process_up_still_auto_recovers(self):
+    async def test_runtime_ready_before_process_up_still_auto_recovers(self):
         manager = make_manager()
         manager.state.finish_scale_down([1])
         manager._route_dp_mask = [True, False]
@@ -308,7 +329,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.state.expected_dp_mask, [True, True])
         self.assertEqual(manager.status()[1]["engines"][1]["status"], "healthy")
 
-    async def test_process_up_waits_for_native_ready_before_reopening_route(self):
+    async def test_process_up_waits_for_runtime_ready_before_reopening_route(self):
         manager = make_manager()
         manager.state.expected_dp_mask[1] = False
         manager._route_dp_mask = [True, False]
@@ -324,19 +345,19 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.status()[1]["engines"][1]["status"], "healthy")
         self.assertEqual(update.status, [True, True])
 
-    async def test_continue_route_intersects_native_process_and_expected(self):
+    async def test_continue_route_intersects_runtime_process_and_expected(self):
         manager = make_manager(dp_size=2, ranks_per_dp=2, strategy="continue")
         manager.state.expected_dp_mask[1] = False
-        # DP1 (global ranks 2,3) fully down and not yet native-recovered.
+        # DP1 (global ranks 2,3) is fully down and not yet runtime-recovered.
         manager.state.observe_process_active_ranks([2, 3], active=False)
 
         update = manager.observe_active_ranks(ActiveRanksOutput(status=[True, False]))
 
-        # route = expected & process_alive & native; DP1 cannot auto-recover yet.
+        # DP1 cannot auto-recover until process and runtime state are ready.
         self.assertEqual(manager.state.expected_dp_mask, [True, False])
         self.assertEqual(update.status, [True, False])
 
-    async def test_continue_native_recovery_auto_recovers_dead_dp(self):
+    async def test_continue_runtime_recovery_auto_recovers_dead_dp(self):
         manager = make_manager(dp_size=2, ranks_per_dp=2, strategy="continue")
         # Scale-down DP1 then kill it; it stays dead until it rejoins and its
         # data plane recovers, at which point "continue" re-admits it automatically.
@@ -348,8 +369,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
 
         update = manager.observe_active_ranks(ActiveRanksOutput(status=[True, True]))
 
-        # The DP-level native callback cleared both global pending ranks and
-        # auto-recovered DP1 without an explicit recover.
+        # Runtime readiness clears pending ranks and recovers DP1 automatically.
         self.assertEqual(manager.state.pending_recovery_global_ranks, set())
         self.assertEqual(manager.state.expected_dp_mask, [True, True])
         # The route was already all-true, so no new publish is emitted; recovery
@@ -364,7 +384,9 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         )
         last_seen, ranks = manager._watchdog_leases[1]
 
-        await manager._sweep_expired_watchdog_leases(now=last_seen + 6)
+        await manager._sweep_expired_watchdog_leases(
+            now=last_seen + WATCHDOG_LEASE_TIMEOUT_SEC + 1
+        )
 
         self.assertEqual(ranks, (2, 3))
         self.assertEqual(
@@ -424,9 +446,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager._route_dp_mask = [True, False]
 
         self.assertIsNone(manager.admission_error(0))
-        self.assertEqual(
-            manager.admission_error(1), "routed_dp_rank=1 is not active"
-        )
+        self.assertEqual(manager.admission_error(1), "routed_dp_rank=1 is not active")
 
 
 if __name__ == "__main__":

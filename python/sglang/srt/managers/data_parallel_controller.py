@@ -79,7 +79,7 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 logger = logging.getLogger(__name__)
 
 SCHEDULER_PIDS_ARG = "scheduler_pids"
-FT_WATCHDOG_POLL_INTERVAL = 1.0
+FT_WATCHDOG_POLL_INTERVAL = 3.0
 FT_WATCHDOG_SEND_TIMEOUT_MS = 1000
 
 

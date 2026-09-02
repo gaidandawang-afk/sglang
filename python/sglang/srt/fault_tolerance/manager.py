@@ -8,7 +8,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from sglang.srt.fault_tolerance.controller import FaultToleranceState
+from sglang.srt.fault_tolerance.ft_state import FaultToleranceState
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     ActiveRanksUpdateReqOutput,
@@ -25,14 +25,14 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 WATCHDOG_LEASE_SWEEP_INTERVAL_SEC = 1
-WATCHDOG_LEASE_TIMEOUT_SEC = 5
+WATCHDOG_LEASE_TIMEOUT_SEC = 60
 FT_REQUEST_ACCEPTED_MESSAGE = (
     "Request accepted; poll /fault_tolerance/status for updates."
 )
 _ALLOWED_INSTRUCTIONS = {"retry", "scale_down"}
 
 
-def validate_apply_payload(obj: Any) -> Tuple[str, Dict[str, Any], str]:
+def validate_apply_payload(obj: Any, dp_size: int) -> Tuple[str, Dict[str, Any], str]:
     if not isinstance(obj, dict):
         raise ValueError("Request body must be a JSON object.")
     instruction = obj.get("instruction")
@@ -43,6 +43,12 @@ def validate_apply_payload(obj: Any) -> Tuple[str, Dict[str, Any], str]:
     params = obj.get("params", {})
     if not isinstance(params, dict):
         raise ValueError("'params' must be an object.")
+    if instruction == "scale_down":
+        ranks = params.get("removed_dp_ranks")
+        if not isinstance(ranks, list) or any(type(rank) is not int for rank in ranks):
+            raise ValueError("'removed_dp_ranks' must be a list of integers.")
+        if any(rank < 0 or rank >= dp_size for rank in ranks):
+            raise ValueError("'removed_dp_ranks' contains a rank out of range.")
     request_id = obj.get("request_id", "")
     if not isinstance(request_id, str):
         raise ValueError("'request_id' must be a string.")
@@ -102,7 +108,9 @@ class FaultToleranceManager:
 
     def submit(self, obj: Any) -> tuple[int, dict]:
         try:
-            instruction, params, request_id = validate_apply_payload(obj)
+            instruction, params, request_id = validate_apply_payload(
+                obj, self.state.dp_size
+            )
         except ValueError as exc:
             return 400, {"message": str(exc)}
         # One centralized SGLang request controls all DP engines atomically.
@@ -215,7 +223,7 @@ class FaultToleranceManager:
                 continue
             if (
                 process_alive_dp_mask[dp_rank]
-                and st.native_active_dp_mask[dp_rank]
+                and st.runtime_active_dp_mask[dp_rank]
                 and not any(
                     member in st.pending_recovery_global_ranks
                     for member in st.global_ranks_for_dp(dp_rank)
@@ -235,7 +243,7 @@ class FaultToleranceManager:
                 [
                     expected
                     and process_alive_dp_mask[dp_rank]
-                    and st.native_active_dp_mask[dp_rank]
+                    and st.runtime_active_dp_mask[dp_rank]
                     for dp_rank, expected in enumerate(st.expected_dp_mask)
                 ]
             )
@@ -251,7 +259,7 @@ class FaultToleranceManager:
         self, ranks: ActiveRanksOutput
     ) -> Optional[ActiveRanksOutput]:
         # Scheduler-originated ActiveRanksOutput.status is a DP-rank mask.
-        self.state.observe_native_active_dp_mask(list(ranks.status))
+        self.state.observe_runtime_active_dp_mask(list(ranks.status))
         return self._route_after_observation(self._auto_recover_ready_dps())
 
     def observe_process_active_ranks(

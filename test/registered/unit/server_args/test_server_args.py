@@ -1806,6 +1806,50 @@ class TestGrpcServerArgs(CustomTestCase):
         self.assertNotIn("max_prefill_tokens", kwargs)
 
 
+class TestFaultToleranceArgs(CustomTestCase):
+    def _args(self, **overrides):
+        enable_dp_attention = overrides.pop("enable_dp_attention", True)
+        args = SimpleNamespace(
+            enable_fault_tolerance=True,
+            dp_size=2,
+            disaggregation_mode="null",
+            fault_tolerance_on_error_strategy="pause",
+            fault_tolerance_timeout=60,
+            fault_tolerance_pause_timeout=300,
+            _resolved=lambda: SimpleNamespace(enable_dp_attention=enable_dp_attention),
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_required_external_args(self):
+        invalid = [
+            {"dp_size": 1},
+            {"enable_dp_attention": False},
+            {"disaggregation_mode": "decode"},
+        ]
+        for overrides in invalid:
+            with self.subTest(overrides=overrides), self.assertRaises(AssertionError):
+                ServerArgs._handle_fault_tolerance(self._args(**overrides))
+
+    def test_new_timeouts_must_be_positive(self):
+        for field in ("fault_tolerance_timeout", "fault_tolerance_pause_timeout"):
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                ServerArgs._handle_fault_tolerance(self._args(**{field: 0}))
+
+    def test_unrelated_compatibility_fields_are_not_checked(self):
+        args = self._args()
+        args.enable_eplb = False
+        args.elastic_ep_backend = None
+        args.ep_join_mode = "scale"
+        args.max_ep_size = 8
+        args.pp_size = 2
+        args.device = "npu"
+        args.tokenizer_worker_num = 2
+        args.use_ray = True
+        ServerArgs._handle_fault_tolerance(args)
+
+
 class TestTwoBatchOverlapBackend(CustomTestCase):
     """Non-EP DP two-batch-overlap backend requirement.
 

@@ -3798,12 +3798,18 @@ class ServerArgs:
     def _handle_fault_tolerance(self):
         if not self.enable_fault_tolerance:
             return
-
-        from sglang.srt.fault_tolerance.controller import is_ft_supported_config
-
-        supported, reason = is_ft_supported_config(self)
-        if not supported:
-            raise ValueError(f"Fault tolerance v5 unsupported config: {reason}")
+        resolved = self._resolved()
+        assert self.dp_size > 1, "Fault tolerance requires --dp-size greater than 1."
+        assert (
+            resolved.enable_dp_attention
+        ), "Fault tolerance requires --enable-dp-attention."
+        assert (
+            self.disaggregation_mode == "null"
+        ), "Fault tolerance does not support disaggregation."
+        assert self.fault_tolerance_on_error_strategy in ("pause", "continue")
+        assert (
+            self.fault_tolerance_timeout > 0 and self.fault_tolerance_pause_timeout > 0
+        )
 
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""

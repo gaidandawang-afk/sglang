@@ -1,60 +1,13 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List
 
 
 class RankState(str, Enum):
     HEALTHY = "healthy"
     UNHEALTHY = "unhealthy"
     DEAD = "dead"
-
-
-def _dp_attention_gate(server_args) -> bool:
-    if not getattr(server_args, "enable_dp_attention", False):
-        return True
-    attention_block_count = getattr(server_args, "dp_size", 1) * getattr(
-        server_args, "attn_cp_size", 1
-    )
-    return getattr(server_args, "tp_size", 1) % attention_block_count == 0
-
-
-_FT_SUPPORT_GATES = [
-    (lambda a: getattr(a, "dp_size", 1) > 1, "ft_requires_dp_gt1"),
-    (lambda a: getattr(a, "enable_dp_attention", False), "ft_requires_dp_attention"),
-    (lambda a: getattr(a, "enable_eplb", False), "ft_requires_eplb"),
-    (
-        lambda a: getattr(a, "max_ep_size", None) in (None, getattr(a, "tp_size", 1)),
-        "ft_unsupported_with_runtime_ep_scale",
-    ),
-    (
-        lambda a: getattr(a, "ep_join_mode", None) != "scale",
-        "ft_unsupported_with_runtime_ep_scale",
-    ),
-    (lambda a: getattr(a, "pp_size", 1) == 1, "ft_requires_pp1"),
-    (
-        lambda a: getattr(a, "elastic_ep_backend", None) == "mooncake",
-        "ft_requires_mooncake_active_rank_backend",
-    ),
-    (
-        lambda a: getattr(a, "disaggregation_mode", "null") == "null",
-        "ft_unsupported_with_pd",
-    ),
-    (lambda a: getattr(a, "device", None) != "npu", "ft_unsupported_with_npu"),
-    (
-        lambda a: getattr(a, "tokenizer_worker_num", 1) <= 1,
-        "ft_unsupported_with_multi_tokenizer",
-    ),
-    (lambda a: not getattr(a, "use_ray", False), "ft_unsupported_with_ray_engine"),
-    (_dp_attention_gate, "ft_requires_tp_divisible_by_dp_and_attn_cp"),
-]
-
-
-def is_ft_supported_config(server_args) -> Tuple[bool, str]:
-    for supported, error in _FT_SUPPORT_GATES:
-        if not supported(server_args):
-            return False, error
-    return True, ""
 
 
 class FaultToleranceState:
@@ -64,27 +17,22 @@ class FaultToleranceState:
         self.global_rank_count = global_rank_count
         self.global_ranks_per_dp = global_rank_count // dp_size
         self.expected_dp_mask = [True] * dp_size
-        self.native_active_dp_mask = [True] * dp_size
+        self.runtime_active_dp_mask = [True] * dp_size
         self.process_alive_global_rank_mask = [True] * global_rank_count
-        # Process events use physical scheduler/global ranks, so recovery pending
-        # stays at that same granularity until a DP-level native-ready event arrives.
         self.pending_recovery_global_ranks: set[int] = set()
         self.unhealthy_dp_ranks: set[int] = set()
         self.ft_operation_in_progress = False
         self.cluster_paused = False
 
     def global_ranks_for_dp(self, dp_rank: int) -> range:
-        # FT keeps this mapping local until the upstream topology helper is stable.
-        # With PP=1, scheduler/global ranks for one DP form a contiguous block;
-        # the block can contain multiple attention TP/CP ranks.
         start = dp_rank * self.global_ranks_per_dp
         return range(start, start + self.global_ranks_per_dp)
 
     def global_ranks_for_dps(self, dp_ranks: Iterable[int]) -> List[int]:
         return [
             rank
-            for dp_rank in sorted(set(dp_ranks))
-            for rank in self.global_ranks_for_dp(dp_rank)
+            for dp in sorted(set(dp_ranks))
+            for rank in self.global_ranks_for_dp(dp)
         ]
 
     def expand_dp_mask_to_global_rank_mask(self, dp_mask: List[bool]) -> List[bool]:
@@ -97,10 +45,7 @@ class FaultToleranceState:
         self, global_rank_mask: List[bool]
     ) -> List[bool]:
         return [
-            all(
-                rank < len(global_rank_mask) and global_rank_mask[rank]
-                for rank in self.global_ranks_for_dp(dp)
-            )
+            all(global_rank_mask[rank] for rank in self.global_ranks_for_dp(dp))
             for dp in range(self.dp_size)
         ]
 
@@ -130,6 +75,7 @@ class FaultToleranceState:
         }
 
     def has_incident(self) -> bool:
+        """Return whether the committed topology has a fault requiring FT action."""
         process_alive_dp_mask = self.process_alive_dp_mask()
         return bool(self.unhealthy_dp_ranks) or any(
             expected and not process_alive_dp_mask[rank]
@@ -155,12 +101,9 @@ class FaultToleranceState:
             )
             self.cluster_paused = True
 
-    def observe_native_active_dp_mask(self, active_dp_mask: List[bool]) -> None:
-        # ActiveRanksOutput is a DP-rank mask at the FT boundary. A true DP bit
-        # means all physical scheduler ranks in that DP have rejoined the native
-        # data plane, so their global-rank pending markers can be retired together.
-        self.native_active_dp_mask = list(active_dp_mask)
-        for dp_rank, active in enumerate(self.native_active_dp_mask):
+    def observe_runtime_active_dp_mask(self, active_dp_mask: List[bool]) -> None:
+        self.runtime_active_dp_mask = list(active_dp_mask)
+        for dp_rank, active in enumerate(self.runtime_active_dp_mask):
             if active and dp_rank < self.dp_size:
                 self.pending_recovery_global_ranks.difference_update(
                     self.global_ranks_for_dp(dp_rank)
