@@ -115,3 +115,20 @@ def test_model_runner_health_gate_delegates_dummy_and_synchronizes_device():
         batch_size=1, active_mask=[True, False]
     )
     synchronize.assert_called_once_with()
+
+
+def test_npu_scale_down_snapshot_is_a_post_health_gate_finalize_step():
+    finalize = load_method(
+        MODEL_RUNNER_PATH,
+        "ModelRunner",
+        "finalize_npu_fault_tolerance_scale_down",
+        {},
+    )
+    state = SimpleNamespace(snapshot_active_to_last=Mock())
+    finalize.__globals__["ElasticEPStateManager"] = SimpleNamespace(
+        instance=lambda: state
+    )
+
+    finalize(SimpleNamespace())
+
+    state.snapshot_active_to_last.assert_called_once_with()

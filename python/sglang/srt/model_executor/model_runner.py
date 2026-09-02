@@ -1966,8 +1966,12 @@ class ModelRunner:
     def synchronize_npu_fault_tolerance_health_gate(self) -> None:
         torch.get_device_module(self.device).synchronize()
 
+    def finalize_npu_fault_tolerance_scale_down(self) -> None:
+        ElasticEPStateManager.instance().snapshot_active_to_last()
+
     def apply_fault_tolerance_scale_down(self, active_mask: list[bool]) -> None:
         state = ElasticEPStateManager.instance()
+        is_npu_ft_mc2 = _is_npu and self.server_args.elastic_ep_backend == "mc2"
         mask = torch.as_tensor(
             active_mask,
             dtype=state.active_ranks.dtype,
@@ -1977,7 +1981,7 @@ class ModelRunner:
         state.active_ranks_cpu.copy_(mask.detach().cpu())
         for _ in self.eplb_manager.rebalance(force=True):
             pass
-        if _is_npu and self.server_args.elastic_ep_backend == "mc2":
+        if is_npu_ft_mc2:
             state.update_npu_mc2_elastic_info()
             from sglang.srt.elastic_ep.npu_mc2 import (
                 validate_mc2_scale_down_routing,
@@ -2003,7 +2007,8 @@ class ModelRunner:
                 self.ps.dp_rank,
                 validation_summary,
             )
-        state.snapshot_active_to_last()
+        else:
+            state.snapshot_active_to_last()
 
     def update_model_fields(
         self,

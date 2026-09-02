@@ -225,6 +225,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             rebuild_npu_fault_tolerance_survivor_control_group=Mock(),
             run_npu_fault_tolerance_dummy_batch=Mock(),
             synchronize_npu_fault_tolerance_health_gate=Mock(),
+            finalize_npu_fault_tolerance_scale_down=Mock(),
         )
         scheduler = SimpleNamespace(
             ps=SimpleNamespace(
@@ -403,6 +404,9 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         model_runner.synchronize_npu_fault_tolerance_health_gate.side_effect = lambda: (
             events.append("final_sync")
         )
+        model_runner.finalize_npu_fault_tolerance_scale_down.side_effect = lambda: (
+            events.append("snapshot")
+        )
 
         self.recover_scale_down(scheduler, [True, False])
 
@@ -417,6 +421,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 "forward_handoff",
                 ("dummy", [True, False]),
                 "final_sync",
+                "snapshot",
             ],
         )
         self.assertIsNone(scheduler._ft_pending_discard_reason)
@@ -431,6 +436,21 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         scheduler.tp_worker.model_runner.apply_fault_tolerance_scale_down.assert_not_called()
         self.assertEqual(scheduler._ft_pending_discard_reason, "boom")
+
+    def test_npu_health_gate_failure_does_not_snapshot_success(self):
+        scheduler = self.make_scheduler()
+        model_runner = scheduler.tp_worker.model_runner
+        model_runner.synchronize_npu_fault_tolerance_health_gate.side_effect = (
+            RuntimeError("device sync failed")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "device sync failed"):
+            self.recover_scale_down(scheduler, [True, False])
+
+        model_runner.run_npu_fault_tolerance_dummy_batch.assert_called_once_with(
+            [True, False]
+        )
+        model_runner.finalize_npu_fault_tolerance_scale_down.assert_not_called()
 
     def test_npu_scale_down_command_recovers_and_unpauses(self):
         scheduler = self.make_scheduler()

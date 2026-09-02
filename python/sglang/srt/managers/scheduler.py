@@ -4537,6 +4537,7 @@ class Scheduler(
         with self.forward_stream_ctx:
             model_runner.run_npu_fault_tolerance_dummy_batch(active_mask)
         model_runner.synchronize_npu_fault_tolerance_health_gate()
+        model_runner.finalize_npu_fault_tolerance_scale_down()
         logger.info(
             "NPU FT recovery phase=complete dp_rank=%s active_mask=%s",
             self.ps.dp_rank,
