@@ -24,57 +24,16 @@ class NPUFaultToleranceAdapter:
 
         device = torch.device("npu", self.device_id)
         logger.info(
-            "NPU FT device recovery step=bind_device phase=begin dp_rank=%s "
-            "device_id=%s",
+            "NPU FT device recovery phase=begin dp_rank=%s device_id=%s",
             self.dp_rank,
             self.device_id,
         )
         torch_npu.npu.set_device(device)
-        logger.info(
-            "NPU FT device recovery step=bind_device phase=complete dp_rank=%s "
-            "device_id=%s",
-            self.dp_rank,
-            self.device_id,
-        )
-
-        logger.info(
-            "NPU FT device recovery step=stop_device phase=begin dp_rank=%s "
-            "device_id=%s",
-            self.dp_rank,
-            self.device_id,
-        )
         torch_npu.npu.stop_device(self.device_id)
-        logger.info(
-            "NPU FT device recovery step=stop_device phase=complete dp_rank=%s "
-            "device_id=%s",
-            self.dp_rank,
-            self.device_id,
-        )
-
-        logger.info(
-            "NPU FT device recovery step=restart_device phase=begin dp_rank=%s "
-            "device_id=%s",
-            self.dp_rank,
-            self.device_id,
-        )
         torch_npu.npu.restart_device(self.device_id)
-        logger.info(
-            "NPU FT device recovery step=restart_device phase=complete dp_rank=%s "
-            "device_id=%s",
-            self.dp_rank,
-            self.device_id,
-        )
-
-        logger.info(
-            "NPU FT device recovery step=reinit_process_group phase=begin "
-            "dp_rank=%s device_id=%s",
-            self.dp_rank,
-            self.device_id,
-        )
         torch_npu.distributed.reinit_process_group(None, False)
         logger.info(
-            "NPU FT device recovery step=reinit_process_group phase=complete "
-            "dp_rank=%s device_id=%s",
+            "NPU FT device recovery phase=complete dp_rank=%s device_id=%s",
             self.dp_rank,
             self.device_id,
         )

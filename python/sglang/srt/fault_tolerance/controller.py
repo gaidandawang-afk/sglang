@@ -23,14 +23,6 @@ def _dp_attention_gate(server_args) -> bool:
     return getattr(server_args, "tp_size", 1) % attention_block_count == 0
 
 
-def _elastic_backend_gate(server_args) -> bool:
-    device = getattr(server_args, "device", None)
-    backend = getattr(server_args, "elastic_ep_backend", None)
-    if device == "npu":
-        return backend == "mc2"
-    return backend == "mooncake"
-
-
 _FT_SUPPORT_GATES = [
     (lambda a: getattr(a, "dp_size", 1) > 1, "ft_requires_dp_gt1"),
     (lambda a: getattr(a, "enable_dp_attention", False), "ft_requires_dp_attention"),
@@ -45,7 +37,8 @@ _FT_SUPPORT_GATES = [
     ),
     (lambda a: getattr(a, "pp_size", 1) == 1, "ft_requires_pp1"),
     (
-        _elastic_backend_gate,
+        lambda a: getattr(a, "elastic_ep_backend", None)
+        == ("mc2" if getattr(a, "device", None) == "npu" else "mooncake"),
         "ft_requires_mooncake_active_rank_backend",
     ),
     (

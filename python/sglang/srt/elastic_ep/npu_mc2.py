@@ -226,5 +226,5 @@ class NpuMC2ElasticInfo:
             active_ranks,
             original_ep_size=self.original_ep_size,
             num_local_physical_experts=self.num_local_physical_experts,
-        ).to(device=self.tensor.device)
+        )
         self.tensor.copy_(updated)

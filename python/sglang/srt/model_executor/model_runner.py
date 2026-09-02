@@ -1934,16 +1934,7 @@ class ModelRunner:
         return output
 
     def recover_npu_device_for_fault_tolerance_scale_down(self) -> None:
-        from sglang.srt.fault_tolerance.npu_adapter import NPUFaultToleranceAdapter
-
-        adapter = getattr(self, "_npu_fault_tolerance_adapter", None)
-        if adapter is None:
-            adapter = NPUFaultToleranceAdapter(
-                device_id=self.gpu_id,
-                dp_rank=self.ps.dp_rank,
-            )
-            self._npu_fault_tolerance_adapter = adapter
-        adapter.recover_device_runtime()
+        self._npu_fault_tolerance_adapter.recover_device_runtime()
 
     def rebuild_npu_fault_tolerance_survivor_control_group(
         self, active_mask: list[bool]

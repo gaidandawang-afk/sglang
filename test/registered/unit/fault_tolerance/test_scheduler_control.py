@@ -456,11 +456,11 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertFalse(scheduler._engine_paused)
         self.assertIsNone(scheduler._ft_pause_deadline)
 
-    def test_npu_scale_down_failure_keeps_engine_paused(self):
+    def test_npu_dummy_failure_keeps_engine_paused_without_success_ack(self):
         scheduler = self.make_scheduler()
         scheduler.server_args.elastic_ep_backend = "mc2"
-        scheduler._recover_npu_fault_tolerance_scale_down = Mock(
-            side_effect=RuntimeError("reinit failed")
+        scheduler.tp_worker.model_runner.run_npu_fault_tolerance_dummy_batch.side_effect = (
+            RuntimeError("dummy failed")
         )
         request = FaultToleranceCommandReqInput(
             request_id="s",
@@ -476,9 +476,10 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             self.handle_command.__globals__["_is_npu"] = False
 
         self.assertFalse(output.success)
-        self.assertIn("reinit failed", output.message)
+        self.assertIn("dummy failed", output.message)
         self.assertTrue(scheduler._engine_paused)
         self.assertEqual(scheduler._ft_pause_deadline, 130.0)
+        scheduler.tp_worker.model_runner.synchronize_npu_fault_tolerance_health_gate.assert_not_called()
 
     def test_pause_deadline_notifies_node_main_once(self):
         notify = self.check_deadline.__globals__["notify_node_main_process_failure"]

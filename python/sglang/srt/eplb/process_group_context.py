@@ -21,11 +21,6 @@ class EPLBProcessGroupContext:
             or original_rank in self.active_original_ranks
         )
 
-    def to_control_group_rank(self, original_rank: int) -> int:
-        if self.active_original_ranks is None:
-            return original_rank
-        return self.active_original_ranks.index(original_rank)
-
     def is_control_group_root(self, original_rank: int) -> bool:
         if self.active_original_ranks is None:
             return original_rank == 0

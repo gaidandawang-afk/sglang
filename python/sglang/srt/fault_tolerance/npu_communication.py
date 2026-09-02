@@ -11,30 +11,6 @@ from torch.distributed import PrefixStore, TCPStore
 logger = logging.getLogger(__name__)
 
 
-def _get_original_eplb_device_group():
-    from sglang.srt.distributed.parallel_state import get_moe_ep_group
-
-    return get_moe_ep_group().device_group
-
-
-def _install_eplb_process_group_context(
-    *, control_group, device_group, active_original_ranks
-) -> None:
-    from sglang.srt.eplb.process_group_context import (
-        EPLBProcessGroupContext,
-        set_eplb_process_group_context,
-    )
-
-    set_eplb_process_group_context(
-        EPLBProcessGroupContext(
-            control_group=control_group,
-            device_group=device_group,
-            active_original_ranks=active_original_ranks,
-            control_group_uses_cpu=True,
-        )
-    )
-
-
 def _parse_tcp_endpoint(endpoint: str) -> tuple[str, int]:
     address = endpoint.removeprefix("tcp://")
     host, port = address.rsplit(":", 1)
@@ -46,26 +22,6 @@ def _parse_tcp_endpoint(endpoint: str) -> tuple[str, int]:
 def create_npu_ft_store(endpoint: str) -> TCPStore:
     host, port = _parse_tcp_endpoint(endpoint)
     return TCPStore(host_name=host, port=port, is_master=True, wait_for_workers=False)
-
-
-def _create_survivor_process_group(
-    *,
-    store,
-    timeout: timedelta,
-    world_size: int,
-    rank: int,
-    group_name: str,
-):
-    from sglang.srt.utils import init_custom_process_group
-
-    return init_custom_process_group(
-        backend="gloo",
-        store=store,
-        timeout=timeout,
-        world_size=world_size,
-        rank=rank,
-        group_name=group_name,
-    )
 
 
 @dataclass
@@ -90,6 +46,13 @@ class NPUFaultToleranceCommunication:
                 f"NPU FT local original rank {self.original_rank} is not active"
             )
 
+        from sglang.srt.distributed.parallel_state import get_moe_ep_group
+        from sglang.srt.eplb.process_group_context import (
+            EPLBProcessGroupContext,
+            set_eplb_process_group_context,
+        )
+        from sglang.srt.utils import init_custom_process_group
+
         compact_rank = active_ranks.index(self.original_rank)
         generation = self.generation + 1
         membership = "".join("1" if active else "0" for active in active_mask)
@@ -104,22 +67,26 @@ class NPUFaultToleranceCommunication:
             active_ranks,
             generation,
         )
-        group = _create_survivor_process_group(
+        group = init_custom_process_group(
+            backend="gloo",
             store=store,
             timeout=timeout,
             world_size=len(active_ranks),
             rank=compact_rank,
             group_name=group_name,
         )
-        device_group = _get_original_eplb_device_group()
+        device_group = get_moe_ep_group().device_group
         dist.barrier(group=group)
         self.control_group = group
         self.active_original_ranks = active_ranks
         self.generation = generation
-        _install_eplb_process_group_context(
-            control_group=group,
-            device_group=device_group,
-            active_original_ranks=active_ranks,
+        set_eplb_process_group_context(
+            EPLBProcessGroupContext(
+                control_group=group,
+                device_group=device_group,
+                active_original_ranks=active_ranks,
+                control_group_uses_cpu=True,
+            )
         )
         logger.info(
             "NPU FT control group phase=complete original_rank=%s compact_rank=%s "

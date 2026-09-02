@@ -50,15 +50,27 @@ class TestNPUFaultToleranceCommunication(unittest.TestCase):
         )
         new_group = object()
         device_group = object()
+        create_group = Mock(return_value=new_group)
+        install_context = Mock()
+        context = Mock()
+        utils = ModuleType("sglang.srt.utils")
+        utils.init_custom_process_group = create_group
+        parallel_state = ModuleType("sglang.srt.distributed.parallel_state")
+        parallel_state.get_moe_ep_group = Mock(
+            return_value=ModuleType("moe_ep_group")
+        )
+        parallel_state.get_moe_ep_group.return_value.device_group = device_group
+        process_group_context = ModuleType("sglang.srt.eplb.process_group_context")
+        process_group_context.EPLBProcessGroupContext = context
+        process_group_context.set_eplb_process_group_context = install_context
 
-        with (
-            patch.object(
-                module, "_create_survivor_process_group", return_value=new_group
-            ) as create_group,
-            patch.object(
-                module, "_get_original_eplb_device_group", return_value=device_group
-            ),
-            patch.object(module, "_install_eplb_process_group_context") as install,
+        with patch.dict(
+            sys.modules,
+            {
+                utils.__name__: utils,
+                parallel_state.__name__: parallel_state,
+                process_group_context.__name__: process_group_context,
+            },
         ):
             communication.rebuild_survivor_control_group([False, True, True, True])
 
@@ -70,11 +82,13 @@ class TestNPUFaultToleranceCommunication(unittest.TestCase):
         module.dist.barrier.assert_called_once_with(group=new_group)
         self.assertIs(communication.control_group, new_group)
         self.assertEqual(communication.active_original_ranks, (1, 2, 3))
-        install.assert_called_once_with(
+        context.assert_called_once_with(
             control_group=new_group,
             device_group=device_group,
             active_original_ranks=(1, 2, 3),
+            control_group_uses_cpu=True,
         )
+        install_context.assert_called_once_with(context.return_value)
 
     def test_rebuild_rejects_inactive_local_rank(self):
         module = load_communication_module()

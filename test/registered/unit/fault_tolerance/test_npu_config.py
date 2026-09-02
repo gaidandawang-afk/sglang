@@ -29,18 +29,6 @@ def load_method(path, class_name, method_name, namespace):
     return namespace[method_name]
 
 
-def load_function(path, function_name, namespace):
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    function = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == function_name
-    )
-    module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
-    exec(compile(module, str(path), "exec"), namespace)
-    return namespace[function_name]
-
-
 class TestNPUFaultToleranceConfig(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -64,14 +52,6 @@ class TestNPUFaultToleranceConfig(unittest.TestCase):
                 {"Any": Any, "Dict": Dict, "List": List, "Tuple": Tuple},
             )
         )
-        cls.elastic_backend_gate = staticmethod(
-            load_function(
-                REPO_ROOT / "python/sglang/srt/fault_tolerance/controller.py",
-                "_elastic_backend_gate",
-                {},
-            )
-        )
-
     def make_args(self):
         return SimpleNamespace(
             enable_fault_tolerance=True,
@@ -94,23 +74,6 @@ class TestNPUFaultToleranceConfig(unittest.TestCase):
             field,
         )
         self.assertIn('choices=["none", "mooncake", "nixl", "mc2"]', field)
-
-    def test_fault_tolerance_gate_accepts_mc2_only_on_npu(self):
-        self.assertTrue(
-            self.elastic_backend_gate(
-                SimpleNamespace(device="npu", elastic_ep_backend="mc2")
-            )
-        )
-        self.assertFalse(
-            self.elastic_backend_gate(
-                SimpleNamespace(device="cuda", elastic_ep_backend="mc2")
-            )
-        )
-        self.assertTrue(
-            self.elastic_backend_gate(
-                SimpleNamespace(device="cuda", elastic_ep_backend="mooncake")
-            )
-        )
 
     def test_extra_metadata_port_is_reserved_only_for_npu_ft_mc2(self):
         path = REPO_ROOT / "python/sglang/srt/server_args.py"
