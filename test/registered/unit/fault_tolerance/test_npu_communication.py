@@ -49,10 +49,17 @@ class TestNPUFaultToleranceCommunication(unittest.TestCase):
             active_original_ranks=(0, 1, 2, 3),
         )
         new_group = object()
+        device_group = object()
 
-        with patch.object(
-            module, "_create_survivor_process_group", return_value=new_group
-        ) as create_group:
+        with (
+            patch.object(
+                module, "_create_survivor_process_group", return_value=new_group
+            ) as create_group,
+            patch.object(
+                module, "_get_original_eplb_device_group", return_value=device_group
+            ),
+            patch.object(module, "_install_eplb_process_group_context") as install,
+        ):
             communication.rebuild_survivor_control_group([False, True, True, True])
 
         create_group.assert_called_once()
@@ -63,6 +70,11 @@ class TestNPUFaultToleranceCommunication(unittest.TestCase):
         module.dist.barrier.assert_called_once_with(group=new_group)
         self.assertIs(communication.control_group, new_group)
         self.assertEqual(communication.active_original_ranks, (1, 2, 3))
+        install.assert_called_once_with(
+            control_group=new_group,
+            device_group=device_group,
+            active_original_ranks=(1, 2, 3),
+        )
 
     def test_rebuild_rejects_inactive_local_rank(self):
         module = load_communication_module()

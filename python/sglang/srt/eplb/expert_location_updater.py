@@ -26,6 +26,7 @@ from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
 )
+from sglang.srt.eplb.process_group_context import get_eplb_process_group_context
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import get_bool_env_var
 
@@ -149,7 +150,9 @@ def _update_expert_weights_raw(
 
     world_size = torch.distributed.get_world_size()
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
-    num_gpu_per_node = world_size // nnodes
+    original_world_size = old_expert_location_metadata.ep_size
+    assert original_world_size % nnodes == 0
+    num_gpu_per_node = original_world_size // nnodes
 
     missing_logical_experts_by_layers: Dict[int, List[int]] = {}
 
@@ -214,6 +217,7 @@ def update_expert_weights_single_layer(
         )
 
     output_logs = [] if debug else None
+    process_group_context = get_eplb_process_group_context()
 
     num_physical_experts = len(old_physical_to_logical_map)
     num_tensors = len(routed_experts_weights)
@@ -233,7 +237,8 @@ def update_expert_weights_single_layer(
 
         _handle_recv(buffer2weight_copy_infos, p2p_op_infos)
         _create_isend_ops(p2p_op_infos)
-        _filter_p2p_ops(p2p_op_infos)
+        if process_group_context.active_original_ranks is None:
+            _filter_p2p_ops(p2p_op_infos)
         _execute_p2p_ops(p2p_op_infos)
         _execute_buffer2weight_copies(buffer2weight_copy_infos)
 
@@ -302,6 +307,19 @@ def update_expert_weights_single_layer(
             _compute_comm_info(logical_expert_id=logical_expert_id)
         )
 
+        if (
+            process_group_context.active_original_ranks is not None
+            and not same_node_mapping.chunk_values
+            and not cross_node_mapping.chunk_values
+        ):
+            if missing_logical_experts_info is None:
+                raise RuntimeError(
+                    "EPLB cannot recover a missing expert without a recovery list"
+                )
+            if logical_expert_id not in missing_logical_experts_info:
+                missing_logical_experts_info.append(logical_expert_id)
+            return
+
         # case 4: same-node
         if rank in need_comm_self_node_dst_ranks:
             chosen_src_rank = same_node_mapping.chunk_value_from_element_value(
@@ -353,7 +371,7 @@ def update_expert_weights_single_layer(
                     P2POp(
                         op=torch.distributed.irecv,
                         tensor=_get_tensor(temp_buffers, i, dst_expert_location),
-                        peer=src_rank,
+                        **_p2p_peer_kwargs(src_rank),
                     )
                     for i in range(num_tensors)
                 ],
@@ -403,7 +421,7 @@ def update_expert_weights_single_layer(
                         tensor=_get_tensor(
                             routed_experts_weights, i, src_expert_location
                         ),
-                        peer=dst_rank,
+                        **_p2p_peer_kwargs(dst_rank),
                     )
                     for dst_rank in all_dst_ranks
                     for i in range(num_tensors)
@@ -419,6 +437,19 @@ def update_expert_weights_single_layer(
                 if old_physical_to_logical_map[x] == logical_expert_id
             ]
         )
+        if process_group_context.active_original_ranks is not None:
+            all_src_ranks = [
+                src_rank
+                for src_rank in all_src_ranks
+                if process_group_context.is_active(src_rank)
+            ]
+        elif (elastic_ep_state := ElasticEPStateManager.instance()) is not None:
+            active_src_ranks = [
+                src_rank
+                for src_rank in all_src_ranks
+                if elastic_ep_state.active_ranks_cpu[src_rank]
+            ]
+            all_src_ranks = active_src_ranks or all_src_ranks
         all_src_nodes = [x // num_gpu_per_node for x in all_src_ranks]
         self_node_src_ranks = [
             x for x in all_src_ranks if x // num_gpu_per_node == self_node_id
@@ -432,6 +463,12 @@ def update_expert_weights_single_layer(
                 and x // num_local_physical_experts not in all_src_ranks
             ]
         )
+        if process_group_context.active_original_ranks is not None:
+            need_comm_dst_ranks = [
+                dst_rank
+                for dst_rank in need_comm_dst_ranks
+                if process_group_context.is_active(dst_rank)
+            ]
         need_comm_self_node_dst_ranks = (
             [x for x in need_comm_dst_ranks if x // num_gpu_per_node == self_node_id]
             if len(self_node_src_ranks) > 0
@@ -477,6 +514,14 @@ def update_expert_weights_single_layer(
                     if any(not is_active[op.peer] for op in ops):
                         missing_logical_experts_info.append(logical_expert_id)
                         p2p_op_infos[i] = (logical_expert_id, [])
+
+    def _p2p_peer_kwargs(original_rank: int):
+        if process_group_context.device_group is None:
+            return {"peer": original_rank}
+        return {
+            "peer": original_rank,
+            "group": process_group_context.device_group,
+        }
 
     def _execute_p2p_ops(p2p_op_infos):
         sorted_infos = sorted(p2p_op_infos, key=lambda info: info[0])

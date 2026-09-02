@@ -11,6 +11,30 @@ from torch.distributed import PrefixStore, TCPStore
 logger = logging.getLogger(__name__)
 
 
+def _get_original_eplb_device_group():
+    from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+    return get_moe_ep_group().device_group
+
+
+def _install_eplb_process_group_context(
+    *, control_group, device_group, active_original_ranks
+) -> None:
+    from sglang.srt.eplb.process_group_context import (
+        EPLBProcessGroupContext,
+        set_eplb_process_group_context,
+    )
+
+    set_eplb_process_group_context(
+        EPLBProcessGroupContext(
+            control_group=control_group,
+            device_group=device_group,
+            active_original_ranks=active_original_ranks,
+            control_group_uses_cpu=True,
+        )
+    )
+
+
 def _parse_tcp_endpoint(endpoint: str) -> tuple[str, int]:
     address = endpoint.removeprefix("tcp://")
     host, port = address.rsplit(":", 1)
@@ -87,10 +111,16 @@ class NPUFaultToleranceCommunication:
             rank=compact_rank,
             group_name=group_name,
         )
+        device_group = _get_original_eplb_device_group()
         dist.barrier(group=group)
         self.control_group = group
         self.active_original_ranks = active_ranks
         self.generation = generation
+        _install_eplb_process_group_context(
+            control_group=group,
+            device_group=device_group,
+            active_original_ranks=active_ranks,
+        )
         logger.info(
             "NPU FT control group phase=complete original_rank=%s compact_rank=%s "
             "active_original_ranks=%s generation=%s",
