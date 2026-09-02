@@ -1957,6 +1957,15 @@ class ModelRunner:
             raise RuntimeError("NPU fault-tolerance communication is not initialized")
         communication.rebuild_survivor_control_group(active_mask)
 
+    def run_npu_fault_tolerance_dummy_batch(self, active_mask: list[bool]) -> None:
+        self.eager_runner.run_dummy_via_model_runner(
+            batch_size=1,
+            active_mask=active_mask,
+        )
+
+    def synchronize_npu_fault_tolerance_health_gate(self) -> None:
+        torch.get_device_module(self.device).synchronize()
+
     def apply_fault_tolerance_scale_down(self, active_mask: list[bool]) -> None:
         state = ElasticEPStateManager.instance()
         mask = torch.as_tensor(

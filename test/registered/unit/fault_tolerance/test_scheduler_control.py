@@ -1,5 +1,6 @@
 import ast
 from collections import deque
+from contextlib import nullcontext
 from http import HTTPStatus
 import logging
 from pathlib import Path
@@ -222,6 +223,8 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             apply_fault_tolerance_scale_down=Mock(),
             recover_npu_device_for_fault_tolerance_scale_down=Mock(),
             rebuild_npu_fault_tolerance_survivor_control_group=Mock(),
+            run_npu_fault_tolerance_dummy_batch=Mock(),
+            synchronize_npu_fault_tolerance_health_gate=Mock(),
         )
         scheduler = SimpleNamespace(
             ps=SimpleNamespace(
@@ -235,6 +238,9 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             _ft_pause_deadline=130.0,
             _ft_pending_discard_reason=None,
             _ft_discard_inflight_window=Mock(return_value=True),
+            schedule_stream=SimpleNamespace(synchronize=Mock()),
+            forward_stream=SimpleNamespace(wait_stream=Mock()),
+            forward_stream_ctx=nullcontext(),
         )
         scheduler._recover_npu_fault_tolerance_scale_down = (
             lambda active_mask: self.recover_scale_down(scheduler, active_mask)
@@ -385,6 +391,18 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         model_runner.apply_fault_tolerance_scale_down.side_effect = lambda mask: (
             events.append(("apply", mask))
         )
+        scheduler.schedule_stream.synchronize.side_effect = lambda: events.append(
+            "schedule_sync"
+        )
+        scheduler.forward_stream.wait_stream.side_effect = lambda stream: events.append(
+            "forward_handoff"
+        )
+        model_runner.run_npu_fault_tolerance_dummy_batch.side_effect = lambda mask: (
+            events.append(("dummy", mask))
+        )
+        model_runner.synchronize_npu_fault_tolerance_health_gate.side_effect = lambda: (
+            events.append("final_sync")
+        )
 
         self.recover_scale_down(scheduler, [True, False])
 
@@ -395,6 +413,10 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 ("rebuild_group", [True, False]),
                 ("discard", "boom"),
                 ("apply", [True, False]),
+                "schedule_sync",
+                "forward_handoff",
+                ("dummy", [True, False]),
+                "final_sync",
             ],
         )
         self.assertIsNone(scheduler._ft_pending_discard_reason)
