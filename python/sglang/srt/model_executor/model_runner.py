@@ -405,9 +405,9 @@ class ModelRunner:
         )
 
         if self.ps.pp_size > 1:
-            assert (
-                self.support_pp
-            ), "Pipeline Parallel is not compatible with this model."
+            assert self.support_pp, (
+                "Pipeline Parallel is not compatible with this model."
+            )
 
         # For weight updates
         self.init_weight_updater()
@@ -677,7 +677,15 @@ class ModelRunner:
 
     def maybe_init_elastic_ep(self):
         if self.server_args.elastic_ep_backend:
-            ElasticEPStateManager.init(self.server_args)
+            state = ElasticEPStateManager.init(self.server_args)
+            if (
+                _is_npu
+                and self.server_args.enable_fault_tolerance
+                and self.server_args.elastic_ep_backend == "mc2"
+            ):
+                state.init_npu_mc2_elastic_info(
+                    num_physical_experts=get_global_expert_location_metadata().num_physical_experts
+                )
 
     def init_token_oracle(self):
         self._token_oracle_manager = install_token_oracle_from_env(
@@ -1960,6 +1968,8 @@ class ModelRunner:
         state.active_ranks_cpu.copy_(mask.detach().cpu())
         for _ in self.eplb_manager.rebalance(force=True):
             pass
+        if _is_npu and self.server_args.elastic_ep_backend == "mc2":
+            state.update_npu_mc2_elastic_info()
         state.snapshot_active_to_last()
 
     def update_model_fields(
