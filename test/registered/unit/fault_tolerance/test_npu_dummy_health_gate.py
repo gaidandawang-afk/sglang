@@ -105,7 +105,14 @@ def test_model_runner_health_gate_delegates_dummy_and_synchronizes_device():
             )
         },
     )
-    eager_runner = SimpleNamespace(run_dummy_via_model_runner=Mock())
+    health_gate_states = []
+
+    def run_dummy_via_model_runner(**kwargs):
+        health_gate_states.append(model_runner._npu_ft_health_gate_in_progress)
+
+    eager_runner = SimpleNamespace(
+        run_dummy_via_model_runner=Mock(side_effect=run_dummy_via_model_runner)
+    )
     model_runner = SimpleNamespace(eager_runner=eager_runner, device="npu:1")
 
     dummy(model_runner, [True, False])
@@ -114,7 +121,59 @@ def test_model_runner_health_gate_delegates_dummy_and_synchronizes_device():
     eager_runner.run_dummy_via_model_runner.assert_called_once_with(
         batch_size=1, active_mask=[True, False]
     )
+    assert health_gate_states == [True]
+    assert model_runner._npu_ft_health_gate_in_progress is False
     synchronize.assert_called_once_with()
+
+
+def test_health_gate_dummy_skips_automatic_membership_rebalance():
+    maybe_rebalance = load_method(
+        MODEL_RUNNER_PATH,
+        "ModelRunner",
+        "_maybe_rebalance_after_rank_fault",
+        {
+            "ModelRunnerOutput": object,
+            "ForwardBatch": object,
+            "Optional": Optional,
+            "PPProxyTensors": object,
+        },
+    )
+    output = object()
+    model_runner = SimpleNamespace(_npu_ft_health_gate_in_progress=True)
+
+    assert (
+        maybe_rebalance(
+            model_runner,
+            output,
+            forward_batch=None,
+            pp_proxy_tensors=None,
+            reinit_attn_backend=False,
+            split_forward_count=1,
+        )
+        is output
+    )
+
+
+def test_health_gate_membership_suppression_is_cleared_on_failure():
+    dummy = load_method(
+        MODEL_RUNNER_PATH,
+        "ModelRunner",
+        "run_npu_fault_tolerance_dummy_batch",
+        {},
+    )
+    model_runner = SimpleNamespace(
+        eager_runner=SimpleNamespace(
+            run_dummy_via_model_runner=Mock(side_effect=RuntimeError("dummy failed"))
+        )
+    )
+
+    try:
+        dummy(model_runner, [True, False])
+    except RuntimeError as exc:
+        assert str(exc) == "dummy failed"
+    else:
+        raise AssertionError("dummy failure did not propagate")
+    assert model_runner._npu_ft_health_gate_in_progress is False
 
 
 def test_npu_scale_down_snapshot_is_a_post_health_gate_finalize_step():

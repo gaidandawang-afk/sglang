@@ -1914,6 +1914,8 @@ class ModelRunner:
         reinit_attn_backend: bool,
         split_forward_count: int,
     ) -> ModelRunnerOutput:
+        if getattr(self, "_npu_ft_health_gate_in_progress", False):
+            return output
         state = ElasticEPStateManager.instance()
         if (
             self.server_args.enable_fault_tolerance
@@ -1958,10 +1960,17 @@ class ModelRunner:
         communication.rebuild_survivor_control_group(active_mask)
 
     def run_npu_fault_tolerance_dummy_batch(self, active_mask: list[bool]) -> None:
-        self.eager_runner.run_dummy_via_model_runner(
-            batch_size=1,
-            active_mask=active_mask,
+        previous_health_gate_state = getattr(
+            self, "_npu_ft_health_gate_in_progress", False
         )
+        self._npu_ft_health_gate_in_progress = True
+        try:
+            self.eager_runner.run_dummy_via_model_runner(
+                batch_size=1,
+                active_mask=active_mask,
+            )
+        finally:
+            self._npu_ft_health_gate_in_progress = previous_health_gate_state
 
     def synchronize_npu_fault_tolerance_health_gate(self) -> None:
         torch.get_device_module(self.device).synchronize()
