@@ -33,6 +33,10 @@ class FakeTensor:
     def data_ptr(self):
         return self._data_ptr
 
+    def copy_(self, source):
+        self.values = list(source.values)
+        return self
+
 
 DEVICE = FakeDevice()
 
@@ -40,8 +44,10 @@ DEVICE = FakeDevice()
 def load_utils_functions(torch):
     tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
     wanted = {
+        "is_npu_internal_format_tensor",
         "require_torch_npu_nz_p2p_support",
         "copy_npu_formatted_tensor_",
+        "copy_to_npu_formatted_tensor_",
     }
     nodes = [
         node
@@ -49,7 +55,10 @@ def load_utils_functions(torch):
         if isinstance(node, ast.FunctionDef) and node.name in wanted
     ]
     module = ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[]))
-    namespace = {"torch": torch}
+    namespace = {
+        "NPUACLFormat": SimpleNamespace(ACL_FORMAT_ND=2),
+        "torch": torch,
+    }
     exec(compile(module, str(MODULE_PATH), "exec"), namespace)
     return namespace
 
@@ -119,3 +128,37 @@ def test_formatted_copy_aliases_full_expert_views_at_offset_zero():
 
     assert changed_offsets == [8, 16]
     assert destination.values == source.values
+
+
+def test_nd_full_expert_is_converted_before_formatted_slot_write():
+    def empty_with_format(shape, *, dtype, device, acl_format):
+        return FakeTensor([0, 0, 0, 0], acl_format=acl_format, data_ptr=1000)
+
+    def change_data_ptr(alias, tensor, storage_offset):
+        alias._data_ptr = tensor.data_ptr()
+        alias.target = tensor
+
+    def copy_memory(destination_alias, source_alias, non_blocking):
+        destination_alias.target.values = list(source_alias.target.values)
+        return destination_alias
+
+    torch_npu = SimpleNamespace(
+        empty_with_format=empty_with_format,
+        get_npu_format=lambda tensor: tensor.acl_format,
+        get_storage_size=lambda tensor: tensor.target.physical_storage_size,
+        npu_change_data_ptr=change_data_ptr,
+    )
+    torch = SimpleNamespace(
+        Tensor=FakeTensor,
+        ops=SimpleNamespace(npu=SimpleNamespace(copy_memory_=copy_memory)),
+    )
+    copy_to_formatted = load_utils_functions(torch)[
+        "copy_to_npu_formatted_tensor_"
+    ]
+    destination = FakeTensor([0, 0, 0, 0], storage_offset=8, data_ptr=108)
+    nd_source = FakeTensor([9, 8, 7, 6], acl_format=2, data_ptr=300)
+
+    with patch.dict(sys.modules, {"torch_npu": torch_npu}):
+        copy_to_formatted(destination, nd_source)
+
+    assert destination.values == nd_source.values
