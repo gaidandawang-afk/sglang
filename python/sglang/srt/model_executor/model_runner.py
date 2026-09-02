@@ -1979,6 +1979,30 @@ class ModelRunner:
             pass
         if _is_npu and self.server_args.elastic_ep_backend == "mc2":
             state.update_npu_mc2_elastic_info()
+            from sglang.srt.elastic_ep.npu_mc2 import (
+                validate_mc2_scale_down_routing,
+            )
+
+            expert_location = get_global_expert_location_metadata()
+            validation_summary = validate_mc2_scale_down_routing(
+                active_mask,
+                original_ep_size=state.npu_mc2_elastic_info.original_ep_size,
+                num_local_physical_experts=(
+                    state.npu_mc2_elastic_info.num_local_physical_experts
+                ),
+                ep_dispatch_algorithm=self.server_args.ep_dispatch_algorithm,
+                logical_to_all_physical_map=(
+                    expert_location.logical_to_all_physical_map_cpu
+                ),
+                logical_to_rank_dispatch_physical_map=(
+                    expert_location.logical_to_rank_dispatch_physical_map
+                ),
+            )
+            logger.info(
+                "NPU FT MC2 routing validation complete: dp_rank=%s summary=%s",
+                self.ps.dp_rank,
+                validation_summary,
+            )
         state.snapshot_active_to_last()
 
     def update_model_fields(

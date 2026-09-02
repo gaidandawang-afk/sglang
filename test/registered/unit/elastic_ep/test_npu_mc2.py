@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 MC2_MODULE_PATH = REPO_ROOT / "python/sglang/srt/elastic_ep/npu_mc2.py"
 DISPATCH_MODULE_PATH = REPO_ROOT / "python/sglang/srt/eplb/expert_location_dispatch.py"
 ELASTIC_EP_MODULE_PATH = REPO_ROOT / "python/sglang/srt/elastic_ep/elastic_ep.py"
+EPLB_ALGORITHM_PATH = REPO_ROOT / "python/sglang/srt/eplb/eplb_algorithms/__init__.py"
 
 
 class FakeTensor:
@@ -194,6 +195,46 @@ def test_compacts_only_live_original_physical_expert_ids():
     assert compact_ids.dtype == original_ids.dtype
 
 
+def test_validates_live_static_routing_in_the_original_namespace():
+    module = load_mc2_module()
+
+    summary = module.validate_mc2_scale_down_routing(
+        [True, False, True, True],
+        original_ep_size=4,
+        num_local_physical_experts=2,
+        ep_dispatch_algorithm="static",
+        logical_to_all_physical_map=[[[0, 4], [1, 6]]],
+        logical_to_rank_dispatch_physical_map=[[4, 1]],
+    )
+
+    assert summary == {"logical_expert_count": 2, "candidate_count": 4}
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "candidate_map", "static_map", "error"),
+    [
+        ("dynamic", [[[0, 2]]], None, "dead candidates"),
+        ("static", [[[0]]], [[2]], "static id 2 is on a dead rank"),
+        ("static", [[[2]]], [[2]], "no active physical expert"),
+        ("dynamic", [[[8]]], None, "out-of-range"),
+    ],
+)
+def test_rejects_dead_or_invalid_mc2_routing(
+    algorithm, candidate_map, static_map, error
+):
+    module = load_mc2_module()
+
+    with pytest.raises(RuntimeError, match=error):
+        module.validate_mc2_scale_down_routing(
+            [True, False, True, True],
+            original_ep_size=4,
+            num_local_physical_experts=2,
+            ep_dispatch_algorithm=algorithm,
+            logical_to_all_physical_map=candidate_map,
+            logical_to_rank_dispatch_physical_map=static_map,
+        )
+
+
 @contextmanager
 def load_dispatch_function(compact):
     tree = ast.parse(DISPATCH_MODULE_PATH.read_text(encoding="utf-8"))
@@ -267,13 +308,13 @@ def test_elastic_ep_selects_an_npu_device():
     harness = ast.fix_missing_locations(
         ast.Module(
             body=[
-                    ast.ClassDef(
-                        name="Harness",
-                        bases=[],
-                        keywords=[],
-                        body=[select_device],
-                        decorator_list=[],
-                    )
+                ast.ClassDef(
+                    name="Harness",
+                    bases=[],
+                    keywords=[],
+                    body=[select_device],
+                    decorator_list=[],
+                )
             ],
             type_ignores=[],
         )
@@ -287,3 +328,54 @@ def test_elastic_ep_selects_an_npu_device():
     exec(compile(harness, str(ELASTIC_EP_MODULE_PATH), "exec"), namespace)
 
     assert namespace["Harness"]._select_device() == "npu"
+
+
+def test_elasticity_aware_placement_consumes_the_cpu_active_mask():
+    tree = ast.parse(EPLB_ALGORITHM_PATH.read_text(encoding="utf-8"))
+    selected = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "EplbAlgorithm"
+        or isinstance(node, ast.FunctionDef)
+        and node.name == "rebalance_experts"
+    ]
+    module = ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[]))
+    active_ranks_cpu = object()
+    state = SimpleNamespace(active_ranks=object(), active_ranks_cpu=active_ranks_cpu)
+    manager = SimpleNamespace(instance=lambda: state)
+    elastic_module = ModuleType("sglang.srt.elastic_ep.elastic_ep")
+    elastic_module.ElasticEPStateManager = manager
+    captured = {}
+    elasticity_aware = SimpleNamespace(
+        rebalance_experts=lambda **kwargs: captured.update(kwargs) or "balanced"
+    )
+    torch = SimpleNamespace(Tensor=object, device=lambda name: name)
+    namespace = {
+        "Enum": __import__("enum").Enum,
+        "auto": __import__("enum").auto,
+        "Optional": Optional,
+        "torch": torch,
+        "deepseek": SimpleNamespace(),
+        "deepseek_vec": SimpleNamespace(),
+        "elasticity_aware": elasticity_aware,
+    }
+    modules = {
+        "sglang": ModuleType("sglang"),
+        "sglang.srt": ModuleType("sglang.srt"),
+        "sglang.srt.elastic_ep": ModuleType("sglang.srt.elastic_ep"),
+        elastic_module.__name__: elastic_module,
+    }
+    with patch.dict(sys.modules, modules):
+        exec(compile(module, str(EPLB_ALGORITHM_PATH), "exec"), namespace)
+        result = namespace["rebalance_experts"](
+            tokens_per_expert=SimpleNamespace(sum=lambda dim: "weights"),
+            num_physical_experts=8,
+            num_local_physical_experts=2,
+            num_groups=1,
+            num_nodes=1,
+            algorithm=namespace["EplbAlgorithm"].elasticity_aware,
+        )
+
+    assert result == "balanced"
+    assert captured["active_ranks"] is active_ranks_cpu
