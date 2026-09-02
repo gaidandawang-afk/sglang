@@ -958,8 +958,8 @@ class Scheduler(
 
             init_npu_ft_communication(
                 self.fault_tolerance_metadata_ipc_name,
-                original_rank=self.ps.dp_rank,
-                original_world_size=self.ps.dp_size,
+                original_rank=self.ps.tp_rank,
+                original_world_size=self.ps.tp_size,
                 timeout_sec=self.server_args.fault_tolerance_timeout,
                 mlp_sync_group=self.tp_cpu_group,
             )

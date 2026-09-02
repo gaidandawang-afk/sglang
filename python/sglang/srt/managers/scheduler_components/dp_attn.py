@@ -146,8 +146,34 @@ class MLPSyncBatchInfo:
         npu_ft_comm = get_npu_ft_communication()
         if npu_ft_comm is not None:
             local_info_cpu = local_info_tensor.detach().cpu().contiguous()
+            active_original_ranks = npu_ft_comm.active_original_ranks
+            group_world_size = torch.distributed.get_world_size(
+                npu_ft_comm.mlp_sync_group
+            )
+            if group_world_size != len(active_original_ranks):
+                raise RuntimeError(
+                    "NPU FT MLP-sync membership mismatch: "
+                    f"group_world_size={group_world_size}, "
+                    f"active_original_ranks={active_original_ranks}"
+                )
+
+            num_physical_slots = self.dp_size * self.tp_size * self.cp_size
+            invalid_ranks = [
+                rank
+                for rank in active_original_ranks
+                if rank < 0 or rank >= num_physical_slots
+            ]
+            if invalid_ranks:
+                raise RuntimeError(
+                    "NPU FT MLP-sync physical rank is outside the metadata layout: "
+                    f"invalid_ranks={invalid_ranks}, "
+                    f"num_physical_slots={num_physical_slots}, "
+                    f"dp_size={self.dp_size}, attn_tp_size={self.tp_size}, "
+                    f"attn_cp_size={self.cp_size}"
+                )
+
             gathered = torch.empty(
-                len(npu_ft_comm.active_original_ranks),
+                len(active_original_ranks),
                 info_width,
                 dtype=local_info_cpu.dtype,
             )
@@ -161,9 +187,11 @@ class MLPSyncBatchInfo:
                 local_forward_mode=ForwardMode(self.local_forward_mode).name,
                 num_tokens=self.num_tokens,
             )
-            global_info_tensor[list(npu_ft_comm.active_original_ranks), 0] = gathered.to(
-                device=device
-            )
+            # The metadata layout is (DP, attention-CP, attention-TP), with TP
+            # as the fastest-changing dimension. Flattening the first two axes
+            # therefore maps each physical TP rank to its original global slot.
+            flat_info = global_info_tensor.view(-1, info_width)
+            flat_info[list(active_original_ranks)] = gathered.to(device=device)
         elif use_all_reduce:
             # Admission can expose different WORLD sizes; use fixed global slots.
             global_info_tensor.zero_()

@@ -8,9 +8,128 @@ from sglang.srt.fault_tolerance.npu_communication import (
     NpuFTCommunication,
     all_gather_into_tensor_with_timeout,
 )
+from sglang.srt.managers.scheduler_components.dp_attn import MLPSyncBatchInfo
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 
 class TestNpuMLPSyncTimeout(unittest.TestCase):
+    @staticmethod
+    def _make_mlp_sync_info(*, dp_size=2, attn_tp_size=2, attn_cp_size=1):
+        return MLPSyncBatchInfo(
+            dp_size=dp_size,
+            tp_size=attn_tp_size,
+            cp_size=attn_cp_size,
+            num_tokens=1,
+            num_tokens_for_logprob=1,
+            can_cuda_graph=True,
+            is_extend_in_batch=False,
+            local_can_run_tbo=True,
+            local_forward_mode=ForwardMode.DECODE.value,
+            can_run_breakable_cuda_graph=False,
+        )
+
+    @staticmethod
+    def _run_physical_rank_gather(info, communication, gathered_rows):
+        gathered_rows = torch.tensor(gathered_rows, dtype=torch.int64)
+
+        def fake_all_gather(output_tensor, input_tensor, *, group, timeout_sec):
+            output_tensor.copy_(gathered_rows.flatten())
+
+        num_physical_slots = info.dp_size * info.tp_size * info.cp_size
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.dp_attn.get_npu_ft_communication",
+                return_value=communication,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.dp_attn.all_gather_into_tensor_with_timeout",
+                side_effect=fake_all_gather,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.dp_attn.torch.distributed.get_world_size",
+                return_value=len(communication.active_original_ranks),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.dp_attn.get_tp_group",
+                return_value=Mock(
+                    active_ranks_cpu=torch.ones(
+                        num_physical_slots, dtype=torch.int64
+                    )
+                ),
+            ),
+        ):
+            info.all_gather(device="cpu", group=communication.mlp_sync_group)
+
+    def test_mlp_sync_scatter_uses_physical_rank_layout_with_attention_tp(self):
+        info = self._make_mlp_sync_info(dp_size=2, attn_tp_size=2)
+        communication = NpuFTCommunication(
+            store=Mock(),
+            original_rank=0,
+            timeout_sec=5,
+            mlp_sync_group=Mock(),
+            active_original_ranks=(0, 1, 2, 3),
+        )
+
+        self._run_physical_rank_gather(
+            info,
+            communication,
+            [
+                [10, 1, 1, 0, 1, ForwardMode.DECODE.value, 0],
+                [11, 1, 1, 0, 1, ForwardMode.DECODE.value, 0],
+                [20, 2, 1, 0, 1, ForwardMode.DECODE.value, 0],
+                [21, 2, 1, 0, 1, ForwardMode.DECODE.value, 0],
+            ],
+        )
+
+        # Physical ranks 0 and 2 are the attention-TP0 members of DP0 and DP1.
+        self.assertEqual(info.global_num_tokens, [10, 20])
+        self.assertEqual(info.global_num_tokens_for_logprob, [1, 2])
+
+    def test_mlp_sync_scatter_preserves_dead_dp_fallback_after_scale_down(self):
+        info = self._make_mlp_sync_info(dp_size=2, attn_tp_size=2)
+        communication = NpuFTCommunication(
+            store=Mock(),
+            original_rank=2,
+            timeout_sec=5,
+            mlp_sync_group=Mock(),
+            active_original_ranks=(2, 3),
+        )
+
+        self._run_physical_rank_gather(
+            info,
+            communication,
+            [
+                [20, 2, 1, 0, 1, ForwardMode.DECODE.value, 0],
+                [21, 2, 1, 0, 1, ForwardMode.DECODE.value, 0],
+            ],
+        )
+
+        self.assertEqual(info.global_num_tokens, [0, 20])
+        self.assertEqual(info.global_num_tokens_for_logprob, [0, 2])
+
+    def test_mlp_sync_rejects_group_membership_size_mismatch(self):
+        info = self._make_mlp_sync_info(dp_size=2, attn_tp_size=2)
+        communication = NpuFTCommunication(
+            store=Mock(),
+            original_rank=0,
+            timeout_sec=5,
+            mlp_sync_group=Mock(),
+            active_original_ranks=(0, 1),
+        )
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.dp_attn.get_npu_ft_communication",
+                return_value=communication,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.dp_attn.torch.distributed.get_world_size",
+                return_value=4,
+            ),
+            self.assertRaisesRegex(RuntimeError, "membership mismatch"),
+        ):
+            info.all_gather(device="cpu", group=communication.mlp_sync_group)
+
     def test_rebuild_survivor_groups_separates_control_and_device_planes(self):
         communication = NpuFTCommunication(
             store=Mock(),
