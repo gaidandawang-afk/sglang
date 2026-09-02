@@ -336,6 +336,23 @@ class ModelRunner:
             )
             raise
 
+        if (
+            _is_npu
+            and server_args.enable_fault_tolerance
+            and server_args.elastic_ep_backend == "mc2"
+        ):
+            from sglang.srt.fault_tolerance.npu_adapter import (
+                NPUFaultToleranceAdapter,
+            )
+
+            self._npu_fault_tolerance_adapter = NPUFaultToleranceAdapter(
+                device_id=self.gpu_id,
+                dp_rank=self.ps.dp_rank,
+            )
+            self._npu_fault_tolerance_adapter.configure_operation_timeout(
+                server_args.fault_tolerance_communication_abort_timeout
+            )
+
         # Initialize MooncakeTransferEngine BEFORE init_torch_distributed so
         # that the shared TE can be passed to the Mooncake PG backend (avoids
         # creating duplicate TransferEngines).
@@ -1919,6 +1936,18 @@ class ModelRunner:
             )
             self._npu_fault_tolerance_adapter = adapter
         adapter.recover_device_runtime()
+
+    def rebuild_npu_fault_tolerance_survivor_control_group(
+        self, active_mask: list[bool]
+    ) -> None:
+        from sglang.srt.fault_tolerance.npu_communication import (
+            get_npu_ft_communication,
+        )
+
+        communication = get_npu_ft_communication()
+        if communication is None:
+            raise RuntimeError("NPU fault-tolerance communication is not initialized")
+        communication.rebuild_survivor_control_group(active_mask)
 
     def apply_fault_tolerance_scale_down(self, active_mask: list[bool]) -> None:
         state = ElasticEPStateManager.instance()

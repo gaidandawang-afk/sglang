@@ -55,6 +55,22 @@ class TestNPUFaultToleranceAdapter(unittest.TestCase):
             ],
         )
 
+    def test_configure_operation_timeout(self):
+        torch_module = SimpleNamespace(device=Mock())
+        with patch.dict(sys.modules, {"torch": torch_module}):
+            adapter_module = load_adapter_module()
+        set_timeout = Mock()
+        torch_npu = SimpleNamespace(
+            npu=SimpleNamespace(set_op_timeout_ms=set_timeout)
+        )
+        adapter = adapter_module.NPUFaultToleranceAdapter(device_id=2, dp_rank=5)
+
+        with patch.dict(sys.modules, {"torch_npu": torch_npu}):
+            adapter.configure_operation_timeout(7)
+            adapter.configure_operation_timeout(0)
+
+        set_timeout.assert_called_once_with(7000)
+
 
 if __name__ == "__main__":
     unittest.main()

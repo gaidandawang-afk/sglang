@@ -16,6 +16,30 @@ def make_state(*, dp_size=2, ranks_per_dp=1, strategy="pause"):
 
 
 class TestFaultToleranceState(unittest.TestCase):
+    def test_npu_requires_mc2_backend(self):
+        args = SimpleNamespace(
+            pp_size=1,
+            elastic_ep_backend="mc2",
+            disaggregation_mode="null",
+            device="npu",
+            tokenizer_worker_num=1,
+            use_ray=False,
+            enable_dp_attention=True,
+            enable_eplb=True,
+            tp_size=4,
+            dp_size=2,
+            attn_cp_size=1,
+            max_ep_size=None,
+            ep_join_mode=None,
+        )
+        self.assertEqual(is_ft_supported_config(args), (True, ""))
+
+        args.elastic_ep_backend = "mooncake"
+        self.assertEqual(
+            is_ft_supported_config(args),
+            (False, "ft_requires_mooncake_active_rank_backend"),
+        )
+
     def test_single_dp_is_rejected(self):
         args = SimpleNamespace(
             pp_size=1,

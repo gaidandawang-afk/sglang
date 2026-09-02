@@ -221,6 +221,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         model_runner = SimpleNamespace(
             apply_fault_tolerance_scale_down=Mock(),
             recover_npu_device_for_fault_tolerance_scale_down=Mock(),
+            rebuild_npu_fault_tolerance_survivor_control_group=Mock(),
         )
         scheduler = SimpleNamespace(
             ps=SimpleNamespace(
@@ -375,6 +376,9 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         model_runner.recover_npu_device_for_fault_tolerance_scale_down.side_effect = (
             lambda: events.append("recover")
         )
+        model_runner.rebuild_npu_fault_tolerance_survivor_control_group.side_effect = (
+            lambda mask: events.append(("rebuild_group", mask))
+        )
         scheduler._ft_discard_inflight_window.side_effect = lambda reason: (
             events.append(("discard", reason)) or True
         )
@@ -386,7 +390,12 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         self.assertEqual(
             events,
-            ["recover", ("discard", "boom"), ("apply", [True, False])],
+            [
+                "recover",
+                ("rebuild_group", [True, False]),
+                ("discard", "boom"),
+                ("apply", [True, False]),
+            ],
         )
         self.assertIsNone(scheduler._ft_pending_discard_reason)
 

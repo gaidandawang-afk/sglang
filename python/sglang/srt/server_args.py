@@ -1043,6 +1043,16 @@ class ServerArgs:
         "Timeout in seconds for fault-tolerance control commands.",
         NS("parallel"),
     ] = 60
+    fault_tolerance_gloo_timeout: A[
+        int,
+        "Timeout in seconds for fault-tolerance survivor Gloo operations.",
+        NS("parallel"),
+    ] = 30
+    fault_tolerance_communication_abort_timeout: A[
+        int,
+        "NPU communication abort timeout in seconds; 0 disables timeout setup.",
+        NS("parallel"),
+    ] = 10
     fault_tolerance_pause_timeout: A[
         float,
         "Fail-stop timeout in seconds for an unattended fault-tolerance pause.",
@@ -3798,6 +3808,53 @@ class ServerArgs:
     def _handle_fault_tolerance(self):
         if not self.enable_fault_tolerance:
             return
+
+        if is_npu() and self.fault_tolerance_on_error_strategy == "continue":
+            logger.warning(
+                "NPU fault tolerance does not support the continue strategy; "
+                "using pause instead"
+            )
+            self.fault_tolerance_on_error_strategy = "pause"
+
+        if is_npu() and self.elastic_ep_backend == "mc2":
+            if not (
+                0
+                < self.fault_tolerance_gloo_timeout
+                < self.fault_tolerance_timeout
+            ):
+                raise ValueError(
+                    "fault_tolerance_gloo_timeout must be positive and less than "
+                    "fault_tolerance_timeout"
+                )
+
+            task_queue = os.environ.setdefault("TASK_QUEUE_ENABLE", "0")
+            if task_queue != "0":
+                raise ValueError(
+                    "TASK_QUEUE_ENABLE must be 0 when NPU fault tolerance is enabled"
+                )
+
+            abort_timeout = self.fault_tolerance_communication_abort_timeout
+            if abort_timeout != 0 and abort_timeout < 2:
+                raise ValueError(
+                    "fault_tolerance_communication_abort_timeout must be 0 or "
+                    "at least 2 seconds"
+                )
+            if abort_timeout > 0:
+                os.environ.setdefault("HCCL_EVENT_TIMEOUT", str(abort_timeout))
+                os.environ.setdefault("HCCL_EXEC_TIMEOUT", str(abort_timeout - 1))
+                os.environ.setdefault("ACL_DEVICE_SYNC_TIMEOUT", str(abort_timeout))
+                os.environ.setdefault("ACL_STREAM_TIMEOUT", str(abort_timeout * 1000))
+                try:
+                    event_timeout = int(os.environ["HCCL_EVENT_TIMEOUT"])
+                    exec_timeout = int(os.environ["HCCL_EXEC_TIMEOUT"])
+                except ValueError as exc:
+                    raise ValueError(
+                        "HCCL_EVENT_TIMEOUT and HCCL_EXEC_TIMEOUT must be integers"
+                    ) from exc
+                if event_timeout <= exec_timeout:
+                    raise ValueError(
+                        "HCCL_EVENT_TIMEOUT must be greater than HCCL_EXEC_TIMEOUT"
+                    )
 
         from sglang.srt.fault_tolerance.controller import is_ft_supported_config
 
@@ -8998,6 +9055,8 @@ class PortArgs:
     # derive the /dev/shm path for load snapshots.
     instance_id: str = ""
 
+    fault_tolerance_metadata_ipc_name: str = ""
+
     @staticmethod
     def init_new(
         server_args: ServerArgs,
@@ -9062,13 +9121,13 @@ class PortArgs:
             dist_init_host = na.host
             dist_init_port = na.port
 
-            # We need 5 consecutive ports from port_base for:
-            # port_base, detokenizer, rpc, metrics, scheduler.
+            # Reserve through port_base + 6 for the existing endpoints plus the
+            # NPU fault-tolerance metadata store.
             # In multi-node, all nodes derive ports independently from
             # dist_init_port, so the derivation must be deterministic
             # (no availability-based search). If incrementing would
             # overflow the valid TCP range, decrement instead.
-            NUM_DERIVED_PORTS = 5
+            NUM_DERIVED_PORTS = 6
             if server_args.is_ep_joiner:
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
@@ -9082,6 +9141,7 @@ class PortArgs:
             rpc_port = port_base + 2
             metrics_port = port_base + 3
             load_collector_port = port_base + 5
+            fault_tolerance_metadata_port = port_base + 6
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
@@ -9109,6 +9169,15 @@ class PortArgs:
                     wait_port_available(metrics_port, "metrics_port")
                     if server_args.nnodes > 1:
                         wait_port_available(load_collector_port, "load_collector_port")
+                    if (
+                        server_args.device == "npu"
+                        and server_args.enable_fault_tolerance
+                        and server_args.elastic_ep_backend == "mc2"
+                    ):
+                        wait_port_available(
+                            fault_tolerance_metadata_port,
+                            "fault_tolerance_metadata_port",
+                        )
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
@@ -9136,4 +9205,13 @@ class PortArgs:
                     dist_init_host, load_collector_port
                 ).to_tcp(),
                 instance_id=instance_id,
+                fault_tolerance_metadata_ipc_name=(
+                    NetworkAddress(
+                        dist_init_host, fault_tolerance_metadata_port
+                    ).to_tcp()
+                    if server_args.device == "npu"
+                    and server_args.enable_fault_tolerance
+                    and server_args.elastic_ep_backend == "mc2"
+                    else ""
+                ),
             )

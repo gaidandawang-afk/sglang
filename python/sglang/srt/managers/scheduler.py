@@ -358,6 +358,9 @@ class Scheduler(
         # Parse args
         self.server_args = server_args
         self.nccl_port = port_args.nccl_port
+        self.fault_tolerance_metadata_ipc_name = (
+            port_args.fault_tolerance_metadata_ipc_name
+        )
         self.schedule_policy = server_args.schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
@@ -944,6 +947,22 @@ class Scheduler(
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
+        if (
+            self.server_args.device == "npu"
+            and self.server_args.enable_fault_tolerance
+            and self.server_args.elastic_ep_backend == "mc2"
+        ):
+            from sglang.srt.fault_tolerance.npu_communication import (
+                init_npu_ft_communication,
+            )
+
+            init_npu_ft_communication(
+                self.fault_tolerance_metadata_ipc_name,
+                original_rank=self.ps.dp_rank,
+                original_world_size=self.ps.dp_size,
+                gloo_timeout_sec=self.server_args.fault_tolerance_gloo_timeout,
+                control_group=self.tp_cpu_group,
+            )
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use
@@ -4500,6 +4519,7 @@ class Scheduler(
             active_mask,
         )
         model_runner.recover_npu_device_for_fault_tolerance_scale_down()
+        model_runner.rebuild_npu_fault_tolerance_survivor_control_group(active_mask)
 
         pending_reason = self._ft_pending_discard_reason
         if pending_reason is not None:
