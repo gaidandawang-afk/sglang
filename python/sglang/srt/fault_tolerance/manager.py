@@ -84,6 +84,19 @@ class FaultToleranceManager:
         ranks = params.get("ranks", [])
         if timeout <= 0:
             raise ValueError("timeout must be positive")
+        gloo_timeout = getattr(
+            self.server_args, "fault_tolerance_gloo_timeout", None
+        )
+        if (
+            getattr(self.server_args, "device", None) == "npu"
+            and getattr(self.server_args, "elastic_ep_backend", None) == "mc2"
+            and gloo_timeout is not None
+            and timeout <= gloo_timeout
+        ):
+            raise ValueError(
+                "timeout must be greater than fault_tolerance_gloo_timeout "
+                f"({gloo_timeout}s)"
+            )
         if any(rank < 0 or rank >= self.state.dp_size for rank in ranks):
             raise ValueError("rank out of range")
         return instruction, ranks, timeout

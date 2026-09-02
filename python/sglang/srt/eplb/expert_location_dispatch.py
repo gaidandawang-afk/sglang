@@ -13,12 +13,15 @@
 # ==============================================================================
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 import torch
 
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.runtime_context import get_server_args
+
+if TYPE_CHECKING:
+    from sglang.srt.elastic_ep.npu_mc2 import NpuMC2ElasticInfo
 
 
 @dataclass
@@ -31,15 +34,30 @@ class ExpertLocationDispatchInfo:
     # (num_logical_experts,)
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
     num_physical_experts: int
+    npu_mc2_elastic_info: Optional["NpuMC2ElasticInfo"] = None
 
     @classmethod
     def init_new(cls, layer_id: int):
-        ep_dispatch_algorithm = get_server_args().ep_dispatch_algorithm
+        server_args = get_server_args()
+        ep_dispatch_algorithm = server_args.ep_dispatch_algorithm
         expert_location_metadata = get_global_expert_location_metadata()
         assert expert_location_metadata is not None
 
         if ep_dispatch_algorithm is None:
             return None
+
+        npu_mc2_elastic_info = None
+        if (
+            server_args.device == "npu"
+            and server_args.enable_fault_tolerance
+            and server_args.elastic_ep_backend == "mc2"
+        ):
+            from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+            state = ElasticEPStateManager.instance()
+            if state is None or state.npu_mc2_elastic_info is None:
+                raise RuntimeError("NPU MC2 elastic info is not initialized")
+            npu_mc2_elastic_info = state.npu_mc2_elastic_info
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
@@ -58,6 +76,7 @@ class ExpertLocationDispatchInfo:
                 layer_id, :
             ],
             num_physical_experts=expert_location_metadata.num_physical_experts,
+            npu_mc2_elastic_info=npu_mc2_elastic_info,
         )
 
 
@@ -82,17 +101,32 @@ def topk_ids_logical_to_physical(
         return topk_ids
 
     if info.ep_dispatch_algorithm == "static":
-        return _topk_ids_logical_to_physical_static(topk_ids, info)
-    if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
-        return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
-    if info.ep_dispatch_algorithm == "lp":
+        physical_topk_ids = _topk_ids_logical_to_physical_static(topk_ids, info)
+    elif info.ep_dispatch_algorithm in ["dynamic", "fake"]:
+        physical_topk_ids = _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+    elif info.ep_dispatch_algorithm == "lp":
         if log2phy_prob is None:
             raise RuntimeError(
                 "ep_dispatch_algorithm='lp' but log2phy_prob is None at dispatch "
                 f"time (topk_ids.shape={tuple(topk_ids.shape)})."
             )
-        return _topk_ids_logical_to_physical_probability(topk_ids, info, log2phy_prob)
-    raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
+        physical_topk_ids = _topk_ids_logical_to_physical_probability(
+            topk_ids, info, log2phy_prob
+        )
+    else:
+        raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
+
+    if info.npu_mc2_elastic_info is not None:
+        from sglang.srt.elastic_ep.npu_mc2 import compact_mc2_physical_expert_ids
+
+        mc2_info = info.npu_mc2_elastic_info
+        physical_topk_ids = compact_mc2_physical_expert_ids(
+            physical_topk_ids,
+            elastic_info=mc2_info.tensor,
+            original_ep_size=mc2_info.original_ep_size,
+            num_local_physical_experts=mc2_info.num_local_physical_experts,
+        )
+    return physical_topk_ids
 
 
 def _topk_ids_logical_to_physical_static(

@@ -336,6 +336,23 @@ class ModelRunner:
             )
             raise
 
+        if (
+            _is_npu
+            and server_args.enable_fault_tolerance
+            and server_args.elastic_ep_backend == "mc2"
+        ):
+            from sglang.srt.fault_tolerance.npu_adapter import (
+                NPUFaultToleranceAdapter,
+            )
+
+            self._npu_fault_tolerance_adapter = NPUFaultToleranceAdapter(
+                device_id=self.gpu_id,
+                dp_rank=self.ps.dp_rank,
+            )
+            self._npu_fault_tolerance_adapter.configure_operation_timeout(
+                server_args.fault_tolerance_communication_abort_timeout
+            )
+
         # Initialize MooncakeTransferEngine BEFORE init_torch_distributed so
         # that the shared TE can be passed to the Mooncake PG backend (avoids
         # creating duplicate TransferEngines).
@@ -388,9 +405,9 @@ class ModelRunner:
         )
 
         if self.ps.pp_size > 1:
-            assert (
-                self.support_pp
-            ), "Pipeline Parallel is not compatible with this model."
+            assert self.support_pp, (
+                "Pipeline Parallel is not compatible with this model."
+            )
 
         # For weight updates
         self.init_weight_updater()
@@ -660,7 +677,15 @@ class ModelRunner:
 
     def maybe_init_elastic_ep(self):
         if self.server_args.elastic_ep_backend:
-            ElasticEPStateManager.init(self.server_args)
+            state = ElasticEPStateManager.init(self.server_args)
+            if (
+                _is_npu
+                and self.server_args.enable_fault_tolerance
+                and self.server_args.elastic_ep_backend == "mc2"
+            ):
+                state.init_npu_mc2_elastic_info(
+                    num_physical_experts=get_global_expert_location_metadata().num_physical_experts
+                )
 
     def init_token_oracle(self):
         self._token_oracle_manager = install_token_oracle_from_env(
@@ -1908,6 +1933,30 @@ class ModelRunner:
             )
         return output
 
+    def recover_npu_device_for_fault_tolerance_scale_down(self) -> None:
+        self._npu_fault_tolerance_adapter.recover_device_runtime()
+
+    def rebuild_npu_fault_tolerance_survivor_control_group(
+        self, active_mask: list[bool]
+    ) -> None:
+        from sglang.srt.fault_tolerance.npu_communication import (
+            get_npu_ft_communication,
+        )
+
+        communication = get_npu_ft_communication()
+        if communication is None:
+            raise RuntimeError("NPU fault-tolerance communication is not initialized")
+        communication.rebuild_survivor_control_group(active_mask)
+
+    def run_npu_fault_tolerance_dummy_batch(self, active_mask: list[bool]) -> None:
+        self.eager_runner.run_dummy_via_model_runner(
+            batch_size=1,
+            active_mask=active_mask,
+        )
+
+    def synchronize_npu_fault_tolerance_health_gate(self) -> None:
+        torch.get_device_module(self.device).synchronize()
+
     def apply_fault_tolerance_scale_down(self, active_mask: list[bool]) -> None:
         state = ElasticEPStateManager.instance()
         mask = torch.as_tensor(
@@ -1919,6 +1968,32 @@ class ModelRunner:
         state.active_ranks_cpu.copy_(mask.detach().cpu())
         for _ in self.eplb_manager.rebalance(force=True):
             pass
+        if _is_npu and self.server_args.elastic_ep_backend == "mc2":
+            state.update_npu_mc2_elastic_info()
+            from sglang.srt.elastic_ep.npu_mc2 import (
+                validate_mc2_scale_down_routing,
+            )
+
+            expert_location = get_global_expert_location_metadata()
+            validation_summary = validate_mc2_scale_down_routing(
+                active_mask,
+                original_ep_size=state.npu_mc2_elastic_info.original_ep_size,
+                num_local_physical_experts=(
+                    state.npu_mc2_elastic_info.num_local_physical_experts
+                ),
+                ep_dispatch_algorithm=self.server_args.ep_dispatch_algorithm,
+                logical_to_all_physical_map=(
+                    expert_location.logical_to_all_physical_map_cpu
+                ),
+                logical_to_rank_dispatch_physical_map=(
+                    expert_location.logical_to_rank_dispatch_physical_map
+                ),
+            )
+            logger.info(
+                "NPU FT MC2 routing validation complete: dp_rank=%s summary=%s",
+                self.ps.dp_rank,
+                validation_summary,
+            )
         state.snapshot_active_to_last()
 
     def update_model_fields(

@@ -28,13 +28,15 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils.common import require_mlp_tp_gather
+from sglang.srt.utils.common import is_npu, require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+_is_npu = is_npu()
+
 
 def _resolve_elastic_world_dp_size(
     dp_size: int,
@@ -139,7 +141,35 @@ class MLPSyncBatchInfo:
             self.dp_size, self.tp_size * self.cp_size, info_width
         ).contiguous()
 
-        if use_all_reduce:
+        npu_ft_communication = None
+        if _is_npu:
+            from sglang.srt.fault_tolerance.npu_communication import (
+                get_npu_ft_communication,
+            )
+
+            npu_ft_communication = get_npu_ft_communication()
+
+        if npu_ft_communication is not None:
+            from sglang.srt.fault_tolerance.npu_communication import (
+                all_gather_into_tensor_with_timeout,
+            )
+
+            local_info_cpu = local_info_tensor.detach().cpu().contiguous()
+            gathered = torch.empty(
+                len(npu_ft_communication.active_original_ranks),
+                info_width,
+                dtype=local_info_cpu.dtype,
+            )
+            all_gather_into_tensor_with_timeout(
+                gathered.flatten(),
+                local_info_cpu,
+                group=npu_ft_communication.control_group,
+                timeout_sec=npu_ft_communication.gloo_timeout_sec,
+            )
+            global_info_tensor[
+                list(npu_ft_communication.active_original_ranks), 0
+            ] = gathered.to(device=device)
+        elif use_all_reduce:
             # Admission can expose different WORLD sizes; use fixed global slots.
             global_info_tensor.zero_()
             flat_info = global_info_tensor.view(-1, info_width)

@@ -256,29 +256,52 @@ def update_expert_location_with_recovery(
     )
 
     if len(p2p_missing_logical_experts) > 0:
-        # Load the missing expert weights from disk
-        if callable(getattr(model, "generate_weight_name_filter", None)):
-            # Filter and load only missing expert weights
-            weight_name_filter = model.generate_weight_name_filter(
-                p2p_missing_logical_experts
+        generate_filter = getattr(model, "generate_weight_name_filter", None)
+        if not callable(generate_filter):
+            raise RuntimeError(
+                "[Elastic EP] Missing expert recovery requires a model-owned "
+                "generate_weight_name_filter implementation"
             )
-        else:
-            # Do a full reload from disk/DRAM
-            logger.info(
-                "[Elastic EP] Model does not implement generate_weight_name_filter. "
-                "Performing full weight reload."
-            )
-            weight_name_filter = None
+        model_weight_name_filter = generate_filter(p2p_missing_logical_experts)
+        filter_stats = {"checked": 0, "matched": 0, "matched_samples": []}
+
+        def weight_name_filter(name: str) -> bool:
+            filter_stats["checked"] += 1
+            matched = model_weight_name_filter(name)
+            if matched:
+                filter_stats["matched"] += 1
+                if len(filter_stats["matched_samples"]) < 8:
+                    filter_stats["matched_samples"].append(name)
+            return matched
 
         if expert_backup_client is not None and expert_backup_client.use_backup:
             # Load the missing weights from the DRAM backup
             expert_backup_client.update_weights(weight_name_filter)
         else:
             # Load the missing weights from disk
-            update_weights_from_disk_callable(
+            success, message = update_weights_from_disk_callable(
                 get_server_args().model_path,
                 get_server_args().load_format,
                 weight_name_filter=weight_name_filter,
+            )
+            if not success:
+                raise RuntimeError(
+                    f"[Elastic EP] Failed to recover missing experts: {message}"
+                )
+
+        logger.info(
+            "[Elastic EP] Missing expert recovery rank=%s checked=%s matched=%s "
+            "matched_samples=%s",
+            tp_rank,
+            filter_stats["checked"],
+            filter_stats["matched"],
+            filter_stats["matched_samples"],
+        )
+        if filter_stats["matched"] == 0:
+            raise RuntimeError(
+                "[Elastic EP] Missing expert recovery matched zero checkpoint "
+                f"weights on rank {tp_rank}; missing_by_layer="
+                f"{p2p_missing_logical_experts}"
             )
 
     # Re-init LPLB solvers after expert location update

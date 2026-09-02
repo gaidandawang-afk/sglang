@@ -358,6 +358,9 @@ class Scheduler(
         # Parse args
         self.server_args = server_args
         self.nccl_port = port_args.nccl_port
+        self.fault_tolerance_metadata_ipc_name = (
+            port_args.fault_tolerance_metadata_ipc_name
+        )
         self.schedule_policy = server_args.schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
@@ -944,6 +947,22 @@ class Scheduler(
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
+        if (
+            self.server_args.device == "npu"
+            and self.server_args.enable_fault_tolerance
+            and self.server_args.elastic_ep_backend == "mc2"
+        ):
+            from sglang.srt.fault_tolerance.npu_communication import (
+                init_npu_ft_communication,
+            )
+
+            init_npu_ft_communication(
+                self.fault_tolerance_metadata_ipc_name,
+                original_rank=self.ps.dp_rank,
+                original_world_size=self.ps.dp_size,
+                gloo_timeout_sec=self.server_args.fault_tolerance_gloo_timeout,
+                control_group=self.tp_cpu_group,
+            )
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use
@@ -1019,6 +1038,7 @@ class Scheduler(
         self.forward_sleep_time = None
         self._engine_paused = False
         self._ft_pause_deadline: Optional[float] = None
+        self._ft_pending_discard_reason: Optional[str] = None
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1546,7 +1566,20 @@ class Scheduler(
                 dispatch_event_loop(self)
                 return
             except Exception as exc:
-                recovered = self._ft_discard_inflight_window(exc)
+                defer_discard = (
+                    _is_npu and self.server_args.elastic_ep_backend == "mc2"
+                )
+                if defer_discard:
+                    self._ft_pending_discard_reason = str(exc)
+                    recovered = False
+                    logger.warning(
+                        "NPU FT defers in-flight request discard until device "
+                        "recovery: dp_rank=%s error=%s",
+                        self.ps.dp_rank,
+                        exc,
+                    )
+                else:
+                    recovered = self._ft_discard_inflight_window(exc)
                 should_continue = (
                     self.server_args.fault_tolerance_on_error_strategy == "continue"
                     and recovered
@@ -1581,10 +1614,20 @@ class Scheduler(
             if batch is None:
                 continue
             for req in batch.reqs:
-                if not req.finished():
+                if (
+                    not req.finished()
+                    or getattr(req, "req_pool_idx", None) is not None
+                    or getattr(req, "kv", None) is not None
+                ):
                     discarded_by_rid.setdefault(req.rid, req)
-        if self.chunked_req is not None and not self.chunked_req.finished():
-            discarded_by_rid.setdefault(self.chunked_req.rid, self.chunked_req)
+        if self.chunked_req is not None:
+            req = self.chunked_req
+            if (
+                not req.finished()
+                or getattr(req, "req_pool_idx", None) is not None
+                or getattr(req, "kv", None) is not None
+            ):
+                discarded_by_rid.setdefault(req.rid, req)
 
         success = True
         for req in discarded_by_rid.values():
@@ -4476,6 +4519,40 @@ class Scheduler(
             self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
         self._engine_paused = False
 
+    def _recover_npu_fault_tolerance_scale_down(
+        self, active_mask: list[bool]
+    ) -> None:
+        model_runner = self.tp_worker.model_runner
+        logger.info(
+            "NPU FT recovery phase=begin dp_rank=%s active_mask=%s",
+            self.ps.dp_rank,
+            active_mask,
+        )
+        model_runner.recover_npu_device_for_fault_tolerance_scale_down()
+        model_runner.rebuild_npu_fault_tolerance_survivor_control_group(active_mask)
+
+        pending_reason = self._ft_pending_discard_reason
+        if pending_reason is not None:
+            if not self._ft_discard_inflight_window(pending_reason):
+                raise RuntimeError(
+                    "NPU FT failed to discard in-flight request state after "
+                    "device recovery"
+                )
+            self._ft_pending_discard_reason = None
+
+        model_runner.apply_fault_tolerance_scale_down(active_mask)
+
+        self.schedule_stream.synchronize()
+        self.forward_stream.wait_stream(self.schedule_stream)
+        with self.forward_stream_ctx:
+            model_runner.run_npu_fault_tolerance_dummy_batch(active_mask)
+        model_runner.synchronize_npu_fault_tolerance_health_gate()
+        logger.info(
+            "NPU FT recovery phase=complete dp_rank=%s active_mask=%s",
+            self.ps.dp_rank,
+            active_mask,
+        )
+
     def handle_fault_tolerance_command(
         self, recv_req: FaultToleranceCommandReqInput
     ) -> Optional[FaultToleranceCommandReqOutput]:
@@ -4491,9 +4568,31 @@ class Scheduler(
             state.active_ranks_cpu.copy_(state.last_active_ranks.detach().cpu())
             message = "retried"
         elif recv_req.command == "scale_down":
-            self.tp_worker.model_runner.apply_fault_tolerance_scale_down(
-                recv_req.active_mask
-            )
+            if _is_npu and self.server_args.elastic_ep_backend == "mc2":
+                try:
+                    self._recover_npu_fault_tolerance_scale_down(
+                        recv_req.active_mask
+                    )
+                except Exception as exc:
+                    self._engine_paused = True
+                    message = f"NPU FT scale-down recovery failed: {exc}"
+                    logger.exception(
+                        "NPU FT recovery phase=failed request_id=%s dp_rank=%s",
+                        recv_req.request_id,
+                        rank,
+                    )
+                    if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:
+                        return None
+                    return FaultToleranceCommandReqOutput(
+                        request_id=recv_req.request_id,
+                        rank=rank,
+                        success=False,
+                        message=message,
+                    )
+            else:
+                self.tp_worker.model_runner.apply_fault_tolerance_scale_down(
+                    recv_req.active_mask
+                )
             message = "scaled down"
         else:
             logger.warning(
