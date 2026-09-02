@@ -1,9 +1,10 @@
 import ast
 import logging
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 MODULE_PATH = (
@@ -21,6 +22,18 @@ class FakeSlot:
     def value(self):
         return self.owner.values[self.index]
 
+    @property
+    def device(self):
+        return self.owner.device
+
+    @property
+    def dtype(self):
+        return self.owner.dtype
+
+    @property
+    def shape(self):
+        return ()
+
     def copy_(self, other):
         self.owner.values[self.index] = other.value
         return self
@@ -30,6 +43,8 @@ class FakeTensor:
     def __init__(self, values):
         self.values = list(values)
         self.shape = (len(self.values),)
+        self.device = SimpleNamespace(type="cuda")
+        self.dtype = "float32"
 
     def __getitem__(self, index):
         return FakeSlot(self, index)
@@ -41,6 +56,23 @@ class FakeMap:
 
     def __getitem__(self, index):
         return SimpleNamespace(tolist=lambda: list(self.rows[index]))
+
+
+class FakeNPUTensor:
+    def __init__(self, values, *, storage_offset=0, acl_format=29):
+        self.values = list(values)
+        self.shape = (2, 2)
+        self.device = SimpleNamespace(type="npu")
+        self.dtype = "bfloat16"
+        self._storage_offset = storage_offset
+        self.acl_format = acl_format
+
+    def storage_offset(self):
+        return self._storage_offset
+
+    def copy_(self, source):
+        self.values = list(source.values)
+        return self
 
 
 class EPLBProcessGroupContext:
@@ -70,7 +102,10 @@ def load_updater_functions():
         "_update_expert_weights_raw",
         "update_expert_weights_single_layer",
         "_ChunkUtils",
+        "_copy_full_expert_tensor_",
         "_deduplicate_ordered",
+        "_p2p_ops_need_npu_staging",
+        "_stage_npu_p2p_ops",
     }
     nodes = [
         node
@@ -197,3 +232,65 @@ def test_missing_expert_is_reported_when_all_original_sources_failed():
     )
 
     assert missing == [7]
+
+
+def test_npu_p2p_staging_preserves_nz_format_and_uses_offset_zero():
+    namespace = load_updater_functions()
+    require_support = Mock()
+
+    def empty_with_format(shape, *, dtype, device, acl_format):
+        return FakeNPUTensor(
+            [0, 0, 0, 0], storage_offset=0, acl_format=acl_format
+        )
+
+    torch_npu = SimpleNamespace(
+        empty_with_format=empty_with_format,
+        get_npu_format=lambda tensor: tensor.acl_format,
+    )
+    npu_utils = SimpleNamespace(
+        NPUACLFormat=SimpleNamespace(ACL_FORMAT_ND=2),
+        copy_npu_formatted_tensor_=lambda destination, source: destination.copy_(
+            source
+        ),
+        is_npu_internal_format_tensor=lambda tensor: tensor.acl_format != 2,
+        require_torch_npu_nz_p2p_support=require_support,
+    )
+    source = FakeNPUTensor([1, 2, 3, 4], storage_offset=8)
+    destination = FakeNPUTensor([0, 0, 0, 0], storage_offset=16)
+    ops = [
+        SimpleNamespace(
+            op=namespace["torch"].distributed.isend,
+            tensor=source,
+            peer=2,
+            group="original-hccl",
+            tag=0,
+        ),
+        SimpleNamespace(
+            op=namespace["torch"].distributed.irecv,
+            tensor=destination,
+            peer=2,
+            group="original-hccl",
+            tag=0,
+        ),
+    ]
+
+    with patch.dict(
+        sys.modules,
+        {
+            "torch_npu": torch_npu,
+            "sglang.srt.hardware_backend.npu.utils": npu_utils,
+        },
+    ):
+        staged_ops, recv_copy_infos = namespace["_stage_npu_p2p_ops"](ops)
+        staged_ops[1].tensor.values = [5, 6, 7, 8]
+        namespace["_copy_full_expert_tensor_"](
+            destination, staged_ops[1].tensor
+        )
+
+    require_support.assert_called_once_with()
+    assert all(op.tensor.storage_offset() == 0 for op in staged_ops)
+    assert all(op.tensor.acl_format == 29 for op in staged_ops)
+    assert staged_ops[0].tensor.values == source.values
+    assert all(op.group == "original-hccl" for op in staged_ops)
+    assert recv_copy_infos == [(staged_ops[1].tensor, destination)]
+    assert destination.values == [5, 6, 7, 8]
