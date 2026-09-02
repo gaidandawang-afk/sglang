@@ -1914,8 +1914,6 @@ class ModelRunner:
         reinit_attn_backend: bool,
         split_forward_count: int,
     ) -> ModelRunnerOutput:
-        if getattr(self, "_npu_ft_health_gate_in_progress", False):
-            return output
         state = ElasticEPStateManager.instance()
         if (
             self.server_args.enable_fault_tolerance
@@ -1960,27 +1958,16 @@ class ModelRunner:
         communication.rebuild_survivor_control_group(active_mask)
 
     def run_npu_fault_tolerance_dummy_batch(self, active_mask: list[bool]) -> None:
-        previous_health_gate_state = getattr(
-            self, "_npu_ft_health_gate_in_progress", False
+        self.eager_runner.run_dummy_via_model_runner(
+            batch_size=1,
+            active_mask=active_mask,
         )
-        self._npu_ft_health_gate_in_progress = True
-        try:
-            self.eager_runner.run_dummy_via_model_runner(
-                batch_size=1,
-                active_mask=active_mask,
-            )
-        finally:
-            self._npu_ft_health_gate_in_progress = previous_health_gate_state
 
     def synchronize_npu_fault_tolerance_health_gate(self) -> None:
         torch.get_device_module(self.device).synchronize()
 
-    def finalize_npu_fault_tolerance_scale_down(self) -> None:
-        ElasticEPStateManager.instance().snapshot_active_to_last()
-
     def apply_fault_tolerance_scale_down(self, active_mask: list[bool]) -> None:
         state = ElasticEPStateManager.instance()
-        is_npu_ft_mc2 = _is_npu and self.server_args.elastic_ep_backend == "mc2"
         mask = torch.as_tensor(
             active_mask,
             dtype=state.active_ranks.dtype,
@@ -1990,7 +1977,7 @@ class ModelRunner:
         state.active_ranks_cpu.copy_(mask.detach().cpu())
         for _ in self.eplb_manager.rebalance(force=True):
             pass
-        if is_npu_ft_mc2:
+        if _is_npu and self.server_args.elastic_ep_backend == "mc2":
             state.update_npu_mc2_elastic_info()
             from sglang.srt.elastic_ep.npu_mc2 import (
                 validate_mc2_scale_down_routing,
@@ -2016,8 +2003,7 @@ class ModelRunner:
                 self.ps.dp_rank,
                 validation_summary,
             )
-        else:
-            state.snapshot_active_to_last()
+        state.snapshot_active_to_last()
 
     def update_model_fields(
         self,
