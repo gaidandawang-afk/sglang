@@ -1019,6 +1019,7 @@ class Scheduler(
         self.forward_sleep_time = None
         self._engine_paused = False
         self._ft_pause_deadline: Optional[float] = None
+        self._ft_pending_discard_reason: Optional[str] = None
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1546,7 +1547,20 @@ class Scheduler(
                 dispatch_event_loop(self)
                 return
             except Exception as exc:
-                recovered = self._ft_discard_inflight_window(exc)
+                defer_discard = (
+                    _is_npu and self.server_args.elastic_ep_backend == "mc2"
+                )
+                if defer_discard:
+                    self._ft_pending_discard_reason = str(exc)
+                    recovered = False
+                    logger.warning(
+                        "NPU FT defers in-flight request discard until device "
+                        "recovery: dp_rank=%s error=%s",
+                        self.ps.dp_rank,
+                        exc,
+                    )
+                else:
+                    recovered = self._ft_discard_inflight_window(exc)
                 should_continue = (
                     self.server_args.fault_tolerance_on_error_strategy == "continue"
                     and recovered
@@ -4476,6 +4490,33 @@ class Scheduler(
             self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
         self._engine_paused = False
 
+    def _recover_npu_fault_tolerance_scale_down(
+        self, active_mask: list[bool]
+    ) -> None:
+        model_runner = self.tp_worker.model_runner
+        logger.info(
+            "NPU FT recovery phase=begin dp_rank=%s active_mask=%s",
+            self.ps.dp_rank,
+            active_mask,
+        )
+        model_runner.recover_npu_device_for_fault_tolerance_scale_down()
+
+        pending_reason = self._ft_pending_discard_reason
+        if pending_reason is not None:
+            if not self._ft_discard_inflight_window(pending_reason):
+                raise RuntimeError(
+                    "NPU FT failed to discard in-flight request state after "
+                    "device recovery"
+                )
+            self._ft_pending_discard_reason = None
+
+        model_runner.apply_fault_tolerance_scale_down(active_mask)
+        logger.info(
+            "NPU FT recovery phase=complete dp_rank=%s active_mask=%s",
+            self.ps.dp_rank,
+            active_mask,
+        )
+
     def handle_fault_tolerance_command(
         self, recv_req: FaultToleranceCommandReqInput
     ) -> Optional[FaultToleranceCommandReqOutput]:
@@ -4491,9 +4532,31 @@ class Scheduler(
             state.active_ranks_cpu.copy_(state.last_active_ranks.detach().cpu())
             message = "retried"
         elif recv_req.command == "scale_down":
-            self.tp_worker.model_runner.apply_fault_tolerance_scale_down(
-                recv_req.active_mask
-            )
+            if _is_npu and self.server_args.elastic_ep_backend == "mc2":
+                try:
+                    self._recover_npu_fault_tolerance_scale_down(
+                        recv_req.active_mask
+                    )
+                except Exception as exc:
+                    self._engine_paused = True
+                    message = f"NPU FT scale-down recovery failed: {exc}"
+                    logger.exception(
+                        "NPU FT recovery phase=failed request_id=%s dp_rank=%s",
+                        recv_req.request_id,
+                        rank,
+                    )
+                    if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:
+                        return None
+                    return FaultToleranceCommandReqOutput(
+                        request_id=recv_req.request_id,
+                        rank=rank,
+                        success=False,
+                        message=message,
+                    )
+            else:
+                self.tp_worker.model_runner.apply_fault_tolerance_scale_down(
+                    recv_req.active_mask
+                )
             message = "scaled down"
         else:
             logger.warning(
