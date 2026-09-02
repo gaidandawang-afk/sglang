@@ -1614,10 +1614,20 @@ class Scheduler(
             if batch is None:
                 continue
             for req in batch.reqs:
-                if not req.finished():
+                if (
+                    not req.finished()
+                    or getattr(req, "req_pool_idx", None) is not None
+                    or getattr(req, "kv", None) is not None
+                ):
                     discarded_by_rid.setdefault(req.rid, req)
-        if self.chunked_req is not None and not self.chunked_req.finished():
-            discarded_by_rid.setdefault(self.chunked_req.rid, self.chunked_req)
+        if self.chunked_req is not None:
+            req = self.chunked_req
+            if (
+                not req.finished()
+                or getattr(req, "req_pool_idx", None) is not None
+                or getattr(req, "kv", None) is not None
+            ):
+                discarded_by_rid.setdefault(req.rid, req)
 
         success = True
         for req in discarded_by_rid.values():

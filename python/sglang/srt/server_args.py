@@ -2385,10 +2385,10 @@ class ServerArgs:
         NS("parallel"),
     ] = None
     elastic_ep_backend: A[
-        Literal[None, "mooncake", "nixl"],
+        Literal[None, "mooncake", "nixl", "mc2"],
         Arg(
-            help="Specify the collective communication backend for elastic EP. Supports 'mooncake' and 'nixl'.",
-            choices=["none", "mooncake", "nixl"],
+            help="Specify the collective communication backend for elastic EP. Supports 'mooncake', 'nixl', and Ascend 'mc2'.",
+            choices=["none", "mooncake", "nixl", "mc2"],
         ),
         NS("exec.moe"),
     ] = None
@@ -9121,13 +9121,19 @@ class PortArgs:
             dist_init_host = na.host
             dist_init_port = na.port
 
-            # Reserve through port_base + 6 for the existing endpoints plus the
-            # NPU fault-tolerance metadata store.
+            # We need 5 consecutive ports from port_base for:
+            # port_base, detokenizer, rpc, metrics, scheduler.
             # In multi-node, all nodes derive ports independently from
             # dist_init_port, so the derivation must be deterministic
             # (no availability-based search). If incrementing would
             # overflow the valid TCP range, decrement instead.
-            NUM_DERIVED_PORTS = 6
+            NUM_DERIVED_PORTS = (
+                6
+                if server_args.device == "npu"
+                and server_args.enable_fault_tolerance
+                and server_args.elastic_ep_backend == "mc2"
+                else 5
+            )
             if server_args.is_ep_joiner:
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:

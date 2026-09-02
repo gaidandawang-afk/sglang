@@ -541,6 +541,33 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertEqual(scheduler.running_batch.reqs, [])
         self.assertEqual(scheduler.result_queue, deque())
 
+    def test_discard_releases_finished_requests_that_still_own_state(self):
+        finished_owned = FakeReq("finished-owned")
+        finished_owned.finished_reason = object()
+        finished_owned.req_pool_idx = 7
+        finished_owned.kv = None
+        finished_released = FakeReq("finished-released")
+        finished_released.finished_reason = object()
+        finished_released.req_pool_idx = None
+        finished_released.kv = None
+        released = []
+        self.discard.__globals__["release_kv_cache"] = lambda req, *args, **kwargs: (
+            released.append(req.rid)
+        )
+        scheduler = SimpleNamespace(
+            cur_batch_for_debug=FakeBatch([finished_owned, finished_released]),
+            last_batch=None,
+            result_queue=deque(),
+            running_batch=FakeBatch([]),
+            chunked_req=finished_owned,
+            tree_cache=object(),
+            ipc_channels=SimpleNamespace(send_to_tokenizer=Sender()),
+        )
+
+        self.assertTrue(self.discard(scheduler, RuntimeError("boom")))
+
+        self.assertEqual(released, ["finished-owned"])
+
     def make_dpc(self):
         sender = Sender()
         context = FakeContext(sender)
