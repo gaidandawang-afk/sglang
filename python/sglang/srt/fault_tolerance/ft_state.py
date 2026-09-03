@@ -89,14 +89,11 @@ class FaultToleranceState:
             or (self.strategy == "pause" and self.cluster_paused)
         )
 
-    def observe_process_active_ranks(
-        self, ranks: Iterable[int], *, active: bool
-    ) -> None:
+    def observe_process_active_ranks(self, ranks: List[int], *, active: bool) -> None:
         for rank in ranks:
             self.process_alive_global_rank_mask[rank] = active
-            if not active:
-                self.pending_recovery_global_ranks.add(rank)
         if not active:
+            self.pending_recovery_global_ranks.update(ranks)
             self.cluster_paused = True
 
     def observe_runtime_active_dp_mask(self, active_dp_mask: List[bool]) -> None:
