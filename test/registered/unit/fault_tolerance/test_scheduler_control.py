@@ -130,13 +130,9 @@ class Sender:
 class FakeContext:
     def __init__(self, sender):
         self.sender = sender
-        self.terminated = False
 
     def socket(self, socket_type):
         return self.sender
-
-    def term(self):
-        self.terminated = True
 
 
 class TestSchedulerFaultToleranceControl(unittest.TestCase):
@@ -360,8 +356,8 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
     def make_dpc(self):
         sender = Sender()
         context = FakeContext(sender)
-        self.dpc_globals["zmq"].Context = lambda: context
         dpc = SimpleNamespace(
+            context=context,
             workers=[Sender(), Sender()],
             scheduler_procs=[],
             scheduler_process_dp_ranks=[0, 1, 1],
@@ -370,7 +366,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             port_args=SimpleNamespace(tokenizer_ipc_name="tcp://node0:1"),
             send_to_tokenizer=Sender(),
             ft_control_endpoint="tcp://node1:2",
-            _watchdog_context=None,
             _watchdog_sender=None,
         )
         dpc._get_watchdog_sender = lambda: self.dpc_methods["_get_watchdog_sender"](dpc)

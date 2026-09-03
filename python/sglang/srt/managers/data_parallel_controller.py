@@ -217,7 +217,6 @@ class DataParallelController:
         self.status: List[bool] = list(self.dp_active)
         self._active_workers: List[int] = list(range(self.launch_dp_size))
         self._active_count_cache: int = self.launch_dp_size
-        self._watchdog_context = None
         self._watchdog_sender = None
 
         if server_args.enable_dp_attention:
@@ -309,21 +308,18 @@ class DataParallelController:
         )
 
     def _get_watchdog_sender(self):
-        if self._watchdog_sender is not None:
-            return self._watchdog_sender
+        if self._watchdog_sender is None:
+            sender = self.context.socket(zmq.PUSH)
+            sender.setsockopt(zmq.LINGER, 0)
+            sender.setsockopt(zmq.SNDHWM, 1)
+            sender.setsockopt(zmq.IMMEDIATE, 1)
+            sender.setsockopt(zmq.SNDTIMEO, FT_WATCHDOG_SEND_TIMEOUT_MS)
+            if "[" in self.port_args.tokenizer_ipc_name:
+                sender.setsockopt(zmq.IPV6, 1)
+            sender.connect(self.port_args.tokenizer_ipc_name)
+            self._watchdog_sender = sender
 
-        context = zmq.Context()
-        self._watchdog_context = context
-        sender = context.socket(zmq.PUSH)
-        self._watchdog_sender = sender
-        sender.setsockopt(zmq.LINGER, 0)
-        sender.setsockopt(zmq.SNDHWM, 1)
-        sender.setsockopt(zmq.IMMEDIATE, 1)
-        sender.setsockopt(zmq.SNDTIMEO, FT_WATCHDOG_SEND_TIMEOUT_MS)
-        if "[" in self.port_args.tokenizer_ipc_name:
-            sender.setsockopt(zmq.IPV6, 1)
-        sender.connect(self.port_args.tokenizer_ipc_name)
-        return sender
+        return self._watchdog_sender
 
     def _watchdog_heartbeat(self):
         return WatchdogHeartbeatOutput(
@@ -346,16 +342,9 @@ class DataParallelController:
             logger.debug("Dropping watchdog heartbeat because tokenizer is unavailable")
 
     def _close_watchdog_sender(self):
-        sender = self._watchdog_sender
-        context = self._watchdog_context
-        self._watchdog_sender = None
-        self._watchdog_context = None
-        try:
-            if sender is not None:
-                sender.close(linger=0)
-        finally:
-            if context is not None:
-                context.term()
+        if self._watchdog_sender is not None:
+            self._watchdog_sender.close(linger=0)
+            self._watchdog_sender = None
 
     def _report_process_active_ranks(self, *, active: bool) -> None:
         sock_send(
