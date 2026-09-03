@@ -196,43 +196,49 @@ class FaultToleranceManager:
         self._route_dp_mask = list(route_dp_mask)
         return ActiveRanksOutput(status=route_dp_mask)
 
-    def _restore_ready_dps_to_expected_topology(
-        self, observed_ready_dp_mask: List[bool]
-    ) -> List[int]:
+    def _auto_recover_ready_dps(self) -> List[int]:
         # Re-add removed DPs only after process and runtime recovery complete.
         st = self.state
         if st.ft_operation_in_progress:
             return []
 
-        restored_dp_ranks = []
+        process_alive_dp_mask = st.process_alive_dp_mask()
+        recovered_dp_ranks = []
         for dp_rank in range(st.dp_size):
             if st.expected_dp_mask[dp_rank]:
                 continue
-            if observed_ready_dp_mask[dp_rank]:
+            if (
+                process_alive_dp_mask[dp_rank]
+                and st.runtime_active_dp_mask[dp_rank]
+                and not any(
+                    member in st.pending_recovery_global_ranks
+                    for member in st.global_ranks_for_dp(dp_rank)
+                )
+            ):
                 st.expected_dp_mask[dp_rank] = True
-                restored_dp_ranks.append(dp_rank)
-        return restored_dp_ranks
+                recovered_dp_ranks.append(dp_rank)
+        return recovered_dp_ranks
 
-    def _update_route_after_observation(self) -> Optional[ActiveRanksOutput]:
-        # Restore expected membership, then update routes from the same observation.
+    def _update_route_after_observation(
+        self, recovered_dp_ranks: List[int]
+    ) -> Optional[ActiveRanksOutput]:
+        # Apply observed process/runtime availability to the admission route.
         st = self.state
-        observed_ready_dp_mask = st.observed_ready_dp_mask()
-        restored_dp_ranks = self._restore_ready_dps_to_expected_topology(
-            observed_ready_dp_mask
-        )
-
         if st.strategy == "continue":
+            process_alive_dp_mask = st.process_alive_dp_mask()
             return self._route_dp_update(
                 [
-                    expected and observed_ready_dp_mask[dp_rank]
+                    expected
+                    and process_alive_dp_mask[dp_rank]
+                    and st.runtime_active_dp_mask[dp_rank]
                     for dp_rank, expected in enumerate(st.expected_dp_mask)
                 ]
             )
 
-        if not restored_dp_ranks:
+        if not recovered_dp_ranks:
             return None
         route_dp_mask = list(self._route_dp_mask)
-        for dp_rank in restored_dp_ranks:
+        for dp_rank in recovered_dp_ranks:
             route_dp_mask[dp_rank] = True
         return self._route_dp_update(route_dp_mask)
 
@@ -241,14 +247,14 @@ class FaultToleranceManager:
     ) -> Optional[ActiveRanksOutput]:
         # This Scheduler report is runtime/backend readiness, not the route mask.
         self.state.observe_runtime_active_dp_mask(list(ranks.status))
-        return self._update_route_after_observation()
+        return self._update_route_after_observation(self._auto_recover_ready_dps())
 
     def observe_process_active_ranks(
         self, ranks: ProcessActiveRanksOutput
     ) -> Optional[ActiveRanksOutput]:
         self.state.observe_process_active_ranks(ranks.ranks, active=ranks.active)
         self._finish_shutdown_if_ready()
-        return self._update_route_after_observation()
+        return self._update_route_after_observation(self._auto_recover_ready_dps())
 
     def observe_watchdog_heartbeat(self, heartbeat: WatchdogHeartbeatOutput) -> None:
         existing = self._watchdog_leases.get(heartbeat.node_rank)

@@ -54,48 +54,22 @@ class FaultToleranceState:
             self.process_alive_global_rank_mask
         )
 
-    def observed_ready_dp_mask(self) -> List[bool]:
-        process_alive_dp_mask = self.process_alive_dp_mask()
-        # Pending recovery requires a fresh runtime-ready report after restart.
-        pending_dp_ranks = {
-            rank // self.global_ranks_per_dp
-            for rank in self.pending_recovery_global_ranks
-        }
-        return [
-            process_alive
-            and self.runtime_active_dp_mask[dp_rank]
-            and dp_rank not in pending_dp_ranks
-            for dp_rank, process_alive in enumerate(process_alive_dp_mask)
-        ]
-
     def expected_dp_ranks(self) -> List[int]:
         return [rank for rank, expected in enumerate(self.expected_dp_mask) if expected]
 
-    def _rank_state(
-        self,
-        rank: int,
-        status_ready_dp_mask: List[bool],
-    ) -> RankState:
-        if not self.expected_dp_mask[rank] or not status_ready_dp_mask[rank]:
+    def _rank_state(self, rank: int) -> RankState:
+        if not self.expected_dp_mask[rank] or not self.process_alive_dp_mask()[rank]:
             return RankState.DEAD
         if rank in self.unhealthy_dp_ranks:
             return RankState.UNHEALTHY
         return RankState.HEALTHY
 
     def status_response(self) -> Dict[str, Any]:
-        status_ready_dp_mask = (
-            self.observed_ready_dp_mask()
-            if self.strategy == "continue"
-            else self.process_alive_dp_mask()
-        )
         return {
             "schema_version": 1,
             "total_engines": self.dp_size,
             "engines": [
-                {
-                    "id": rank,
-                    "status": self._rank_state(rank, status_ready_dp_mask).value,
-                }
+                {"id": rank, "status": self._rank_state(rank).value}
                 for rank in range(self.dp_size)
             ],
         }
