@@ -346,6 +346,35 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.status()[1]["engines"][1]["status"], "healthy")
         self.assertEqual(update.status, [True, True])
 
+    async def test_continue_observations_keep_expected_topology_without_ft_operation(
+        self,
+    ):
+        manager = make_manager(dp_size=2, ranks_per_dp=2, strategy="continue")
+
+        update = manager.observe_process_active_ranks(
+            ProcessActiveRanksOutput(ranks=[2, 3], active=False)
+        )
+        self.assertEqual(manager.state.expected_dp_mask, [True, True])
+        self.assertEqual(update.status, [True, False])
+        self.assertEqual(manager.status()[1]["engines"][1]["status"], "dead")
+        self.assertIsNone(manager.admission_error(None))
+
+        self.assertIsNone(
+            manager.observe_active_ranks(ActiveRanksOutput(status=[True, False]))
+        )
+        self.assertIsNone(
+            manager.observe_process_active_ranks(
+                ProcessActiveRanksOutput(ranks=[2, 3], active=True)
+            )
+        )
+        update = manager.observe_active_ranks(ActiveRanksOutput(status=[True, True]))
+
+        self.assertEqual(manager.state.expected_dp_mask, [True, True])
+        self.assertEqual(update.status, [True, True])
+        self.assertFalse(manager.state.ft_operation_in_progress)
+        manager.send_to_scheduler.assert_not_awaited()
+        manager.send_to_dpc.assert_not_awaited()
+
     async def test_continue_route_intersects_runtime_process_and_expected(self):
         manager = make_manager(dp_size=2, ranks_per_dp=2, strategy="continue")
         manager.state.expected_dp_mask[1] = False

@@ -197,7 +197,7 @@ class FaultToleranceManager:
         return ActiveRanksOutput(status=route_dp_mask)
 
     def _auto_recover_ready_dps(self) -> List[int]:
-        # Rejoin expected topology only after process and runtime recovery complete.
+        # Re-add removed DPs only after process and runtime recovery complete.
         st = self.state
         if st.ft_operation_in_progress:
             return []
@@ -219,10 +219,10 @@ class FaultToleranceManager:
                 recovered_dp_ranks.append(dp_rank)
         return recovered_dp_ranks
 
-    def _update_route_for_current_strategy(
+    def _update_route_after_observation(
         self, recovered_dp_ranks: List[int]
     ) -> Optional[ActiveRanksOutput]:
-        # Continue reconciles all routes; pause only reopens completed rejoins.
+        # Apply observed process/runtime availability to the admission route.
         st = self.state
         if st.strategy == "continue":
             process_alive_dp_mask = st.process_alive_dp_mask()
@@ -247,14 +247,14 @@ class FaultToleranceManager:
     ) -> Optional[ActiveRanksOutput]:
         # This Scheduler report is runtime/backend readiness, not the route mask.
         self.state.observe_runtime_active_dp_mask(list(ranks.status))
-        return self._update_route_for_current_strategy(self._auto_recover_ready_dps())
+        return self._update_route_after_observation(self._auto_recover_ready_dps())
 
     def observe_process_active_ranks(
         self, ranks: ProcessActiveRanksOutput
     ) -> Optional[ActiveRanksOutput]:
         self.state.observe_process_active_ranks(ranks.ranks, active=ranks.active)
         self._finish_shutdown_if_ready()
-        return self._update_route_for_current_strategy(self._auto_recover_ready_dps())
+        return self._update_route_after_observation(self._auto_recover_ready_dps())
 
     def observe_watchdog_heartbeat(self, heartbeat: WatchdogHeartbeatOutput) -> None:
         existing = self._watchdog_leases.get(heartbeat.node_rank)
