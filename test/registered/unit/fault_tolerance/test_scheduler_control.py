@@ -158,6 +158,8 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 "FaultToleranceCommandReqInput": FaultToleranceCommandReqInput,
                 "FaultToleranceCommandReqOutput": FaultToleranceCommandReqOutput,
                 "FaultToleranceRankFaultOutput": FaultToleranceRankFaultOutput,
+                "FT_OPERATION_RETRY": "retry",
+                "FT_OPERATION_SCALE_DOWN": "scale_down",
                 "HTTPStatus": HTTPStatus,
                 "Optional": Optional,
                 "ScheduleBatch": FakeBatch,

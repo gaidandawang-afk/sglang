@@ -8,6 +8,10 @@ import time
 import uuid
 from typing import Dict, List, Optional, Tuple
 
+from sglang.srt.fault_tolerance.constants import (
+    FT_OPERATION_RETRY,
+    FT_OPERATION_SCALE_DOWN,
+)
 from sglang.srt.fault_tolerance.ft_state import FaultToleranceState
 from sglang.srt.fault_tolerance.protocol import FaultToleranceApplyRequest
 from sglang.srt.managers.io_struct import (
@@ -84,7 +88,7 @@ class FaultToleranceManager:
         return 200, body
 
     def submit(self, request: FaultToleranceApplyRequest) -> tuple[int, dict]:
-        if request.instruction == "scale_down" and any(
+        if request.instruction == FT_OPERATION_SCALE_DOWN and any(
             rank >= self.state.dp_size for rank in request.params.removed_dp_ranks
         ):
             return 400, {"message": "'removed_dp_ranks' contains a rank out of range."}
@@ -105,7 +109,7 @@ class FaultToleranceManager:
 
     async def _run_submitted_apply(self, request: FaultToleranceApplyRequest) -> None:
         timeout = self.server_args.fault_tolerance_timeout
-        if request.instruction == "retry":
+        if request.instruction == FT_OPERATION_RETRY:
             error = await self._apply_retry(timeout)
         else:
             error = await self._apply_scale_down(
@@ -127,7 +131,9 @@ class FaultToleranceManager:
             return "retry_requires_all_expected_processes_alive"
 
         await self._send_command_collect(
-            command="retry", target_ranks=st.expected_dp_ranks(), timeout_sec=timeout
+            command=FT_OPERATION_RETRY,
+            target_ranks=st.expected_dp_ranks(),
+            timeout_sec=timeout,
         )
         await self._publish_route_dp_mask(st.expected_dp_mask, timeout)
         st.finish_retry()
@@ -152,7 +158,7 @@ class FaultToleranceManager:
 
         await self._shutdown_dp_processes(requested, timeout)
         await self._send_command_collect(
-            command="scale_down",
+            command=FT_OPERATION_SCALE_DOWN,
             target_ranks=[
                 rank for rank, active in enumerate(candidate_dp_mask) if active
             ],

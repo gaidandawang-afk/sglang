@@ -72,6 +72,10 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.fault_tolerance.constants import (
+    FT_OPERATION_RETRY,
+    FT_OPERATION_SCALE_DOWN,
+)
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -4487,13 +4491,13 @@ class Scheduler(
         if rank not in recv_req.target_ranks:
             return None
 
-        if recv_req.command == "retry":
+        if recv_req.command == FT_OPERATION_RETRY:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
             state = ElasticEPStateManager.instance()
             state.active_ranks.copy_(state.last_active_ranks)
             state.active_ranks_cpu.copy_(state.last_active_ranks.detach().cpu())
-        elif recv_req.command == "scale_down":
+        elif recv_req.command == FT_OPERATION_SCALE_DOWN:
             self.tp_worker.model_runner.apply_fault_tolerance_scale_down(
                 recv_req.active_mask
             )
