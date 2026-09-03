@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from itertools import chain
+from itertools import chain, repeat
 from typing import Any, Dict, Iterable, List
 
 
@@ -34,16 +34,15 @@ class FaultToleranceState:
         return list(chain.from_iterable(groups))
 
     def expand_dp_mask_to_global_rank_mask(self, dp_mask: List[bool]) -> List[bool]:
-        global_ranks = range(self.global_rank_count)
-        return [dp_mask[rank // self.global_ranks_per_dp] for rank in global_ranks]
+        groups = (repeat(active, self.global_ranks_per_dp) for active in dp_mask)
+        return list(chain.from_iterable(groups))
 
-    def project_global_rank_mask_to_dp_mask(self, ranks: List[bool]) -> List[bool]:
+    def global_to_dp_mask(self, ranks: List[bool]) -> List[bool]:
         groups = map(self.global_ranks_for_dp, range(self.dp_size))
         return [all(ranks[rank] for rank in group) for group in groups]
 
     def process_alive_dp_mask(self) -> List[bool]:
-        alive = self.process_alive_global_rank_mask
-        return self.project_global_rank_mask_to_dp_mask(alive)
+        return self.global_to_dp_mask(self.process_alive_global_rank_mask)
 
     def expected_dp_ranks(self) -> List[int]:
         return [rank for rank, expected in enumerate(self.expected_dp_mask) if expected]
