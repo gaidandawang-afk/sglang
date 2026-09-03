@@ -82,6 +82,14 @@ class TestFaultToleranceState(unittest.TestCase):
         state.observe_runtime_active_dp_mask([True, True])
         self.assertEqual(state.pending_recovery_global_ranks, set())
 
+    def test_continue_status_waits_for_runtime_rejoin(self):
+        state = make_state(strategy="continue")
+        state.observe_runtime_active_dp_mask([True, False])
+        self.assertEqual(state.status_response()["engines"][1]["status"], "dead")
+
+        state.observe_runtime_active_dp_mask([True, True])
+        self.assertEqual(state.status_response()["engines"][1]["status"], "healthy")
+
     def test_excluded_dead_dp_is_not_an_unresolved_expected_dp_fault(self):
         state = make_state()
         state.expected_dp_mask[1] = False
@@ -104,7 +112,7 @@ class TestFaultToleranceState(unittest.TestCase):
         state = make_state(strategy="continue")
         state.observe_process_active_ranks([1], active=False)
         state.observe_rank_fault(0)
-        # continue never pauses admission; faults only drop requests / update status.
+        # continue never pauses admission; observed availability controls routing.
         self.assertFalse(state.is_global_admission_blocked([True, True]))
         self.assertEqual(state.unhealthy_dp_ranks, set())
         self.assertEqual(state.status_response()["engines"][1]["status"], "dead")

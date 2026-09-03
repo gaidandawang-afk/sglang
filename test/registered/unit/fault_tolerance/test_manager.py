@@ -359,21 +359,58 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.status()[1]["engines"][1]["status"], "dead")
         self.assertIsNone(manager.admission_error(None))
 
-        self.assertIsNone(
-            manager.observe_active_ranks(ActiveRanksOutput(status=[True, False]))
-        )
+        # A process-up event cannot reopen the route using stale runtime state.
         self.assertIsNone(
             manager.observe_process_active_ranks(
                 ProcessActiveRanksOutput(ranks=[2, 3], active=True)
             )
         )
+        self.assertEqual(manager.status()[1]["engines"][1]["status"], "dead")
+
+        # A fresh runtime-ready observation completes the rejoin.
         update = manager.observe_active_ranks(ActiveRanksOutput(status=[True, True]))
 
         self.assertEqual(manager.state.expected_dp_mask, [True, True])
         self.assertEqual(update.status, [True, True])
+        self.assertEqual(manager.status()[1]["engines"][1]["status"], "healthy")
         self.assertFalse(manager.state.ft_operation_in_progress)
         manager.send_to_scheduler.assert_not_awaited()
         manager.send_to_dpc.assert_not_awaited()
+
+    async def test_continue_runtime_ready_before_process_up_reopens_route_last(self):
+        manager = make_manager(dp_size=2, ranks_per_dp=2, strategy="continue")
+
+        manager.observe_process_active_ranks(
+            ProcessActiveRanksOutput(ranks=[2, 3], active=False)
+        )
+        manager.observe_active_ranks(ActiveRanksOutput(status=[True, False]))
+        self.assertIsNone(
+            manager.observe_active_ranks(ActiveRanksOutput(status=[True, True]))
+        )
+        self.assertEqual(manager.status()[1]["engines"][1]["status"], "dead")
+
+        update = manager.observe_process_active_ranks(
+            ProcessActiveRanksOutput(ranks=[2, 3], active=True)
+        )
+
+        self.assertEqual(manager.state.expected_dp_mask, [True, True])
+        self.assertEqual(update.status, [True, True])
+        self.assertEqual(manager.status()[1]["engines"][1]["status"], "healthy")
+
+    async def test_continue_runtime_observation_updates_route_without_topology_change(
+        self,
+    ):
+        manager = make_manager(strategy="continue")
+
+        update = manager.observe_active_ranks(ActiveRanksOutput(status=[True, False]))
+        self.assertEqual(manager.state.expected_dp_mask, [True, True])
+        self.assertEqual(update.status, [True, False])
+        self.assertEqual(manager.status()[1]["engines"][1]["status"], "dead")
+
+        update = manager.observe_active_ranks(ActiveRanksOutput(status=[True, True]))
+        self.assertEqual(manager.state.expected_dp_mask, [True, True])
+        self.assertEqual(update.status, [True, True])
+        self.assertEqual(manager.status()[1]["engines"][1]["status"], "healthy")
 
     async def test_continue_route_intersects_runtime_process_and_expected(self):
         manager = make_manager(dp_size=2, ranks_per_dp=2, strategy="continue")
@@ -392,6 +429,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         # Scale-down DP1 then kill it; it stays dead until it rejoins and its
         # data plane recovers, at which point "continue" re-admits it automatically.
         manager.state.finish_scale_down([1])
+        manager._route_dp_mask = [True, False]
         manager.state.observe_process_active_ranks([2, 3], active=False)
         manager.state.observe_process_active_ranks([2, 3], active=True)
         self.assertEqual(manager.state.expected_dp_mask, [True, False])
@@ -402,9 +440,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         # Runtime readiness clears pending ranks and recovers DP1 automatically.
         self.assertEqual(manager.state.pending_recovery_global_ranks, set())
         self.assertEqual(manager.state.expected_dp_mask, [True, True])
-        # The route was already all-true, so no new publish is emitted; recovery
-        # shows up purely as the DP returning to HEALTHY.
-        self.assertIsNone(update)
+        self.assertEqual(update.status, [True, True])
         self.assertEqual(manager.status()[1]["engines"][1]["status"], "healthy")
 
     async def test_watchdog_lease_expiry_marks_global_processes_down(self):
