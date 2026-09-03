@@ -74,8 +74,8 @@ class FaultToleranceState:
             ],
         }
 
-    def has_incident(self) -> bool:
-        """Return whether the committed topology has a fault requiring FT action."""
+    def has_unresolved_expected_dp_fault(self) -> bool:
+        """Return whether an expected DP is unhealthy or has lost a process."""
         process_alive_dp_mask = self.process_alive_dp_mask()
         return bool(self.unhealthy_dp_ranks) or any(
             expected and not process_alive_dp_mask[rank]

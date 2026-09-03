@@ -109,20 +109,30 @@ class FaultToleranceManager:
 
     async def _run_submitted_apply(self, request: FaultToleranceApplyRequest) -> None:
         timeout = self.server_args.fault_tolerance_timeout
+
+        if not self.state.has_unresolved_expected_dp_fault():
+            self._finish_submitted_apply(
+                request.request_id,
+                f"{request.instruction}_requires_unresolved_expected_dp_fault",
+            )
+            return
+
         if request.instruction == FT_OPERATION_RETRY:
             error = await self._apply_retry(timeout)
-        else:
+        elif request.instruction == FT_OPERATION_SCALE_DOWN:
             error = await self._apply_scale_down(
                 request.params.removed_dp_ranks, timeout
             )
-        self._last_ft_request_id = request.request_id
+
+        self._finish_submitted_apply(request.request_id, error)
+
+    def _finish_submitted_apply(self, request_id: str, error: Optional[str]) -> None:
+        self._last_ft_request_id = request_id
         self._ft_error = error
         self.state.ft_operation_in_progress = False
 
     async def _apply_retry(self, timeout: int) -> Optional[str]:
         st = self.state
-        if not st.unhealthy_dp_ranks:
-            return "retry_requires_unhealthy_rank"
         process_alive_dp_mask = st.process_alive_dp_mask()
         if any(
             expected and not process_alive_dp_mask[rank]
@@ -142,8 +152,6 @@ class FaultToleranceManager:
     async def _apply_scale_down(self, ranks: List[int], timeout: int) -> Optional[str]:
         st = self.state
         requested = set(ranks)
-        if not st.has_incident():
-            return "scale_down_requires_incident"
         if not requested:
             return "scale_down_requires_ranks"
         if any(not st.expected_dp_mask[rank] for rank in requested):

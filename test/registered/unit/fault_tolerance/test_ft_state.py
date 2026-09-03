@@ -55,7 +55,7 @@ class TestFaultToleranceState(unittest.TestCase):
                 {"id": 1, "status": "unhealthy"},
             ],
         )
-        self.assertTrue(state.has_incident())
+        self.assertTrue(state.has_unresolved_expected_dp_fault())
 
     def test_non_expected_dp_stays_dead_until_manager_reopens_it(self):
         state = make_state()
@@ -82,14 +82,14 @@ class TestFaultToleranceState(unittest.TestCase):
         state.observe_runtime_active_dp_mask([True, True])
         self.assertEqual(state.pending_recovery_global_ranks, set())
 
-    def test_excluded_dead_dp_does_not_create_new_incident(self):
+    def test_excluded_dead_dp_is_not_an_unresolved_expected_dp_fault(self):
         state = make_state()
         state.expected_dp_mask[1] = False
         state.observe_process_active_ranks([1], active=False)
 
-        self.assertFalse(state.has_incident())
+        self.assertFalse(state.has_unresolved_expected_dp_fault())
 
-    def test_pause_admission_uses_incident_and_operation(self):
+    def test_pause_admission_uses_cluster_pause_and_operation(self):
         state = make_state()
         self.assertFalse(state.should_reject_admission([True, True]))
         state.observe_rank_fault(0)

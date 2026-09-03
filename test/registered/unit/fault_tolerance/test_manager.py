@@ -86,9 +86,33 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
             [True, True, False, True], 1
         )
 
+    async def test_operations_require_unresolved_expected_dp_fault(self):
+        cases = [
+            (
+                {"instruction": "retry", "params": {}, "request_id": "retry-healthy"},
+                "retry_requires_unresolved_expected_dp_fault",
+            ),
+            (
+                {
+                    "instruction": "scale_down",
+                    "params": {"removed_dp_ranks": [1]},
+                    "request_id": "scale-down-healthy",
+                },
+                "scale_down_requires_unresolved_expected_dp_fault",
+            ),
+        ]
+
+        for request, expected_error in cases:
+            with self.subTest(instruction=request["instruction"]):
+                manager = make_manager()
+                status, _ = await submit_and_finish(manager, request)
+
+                self.assertEqual(status, 202)
+                for engine in manager.status()[1]["engines"]:
+                    self.assertEqual(engine["ft_error"], expected_error)
+
     async def test_retry_rejects_process_loss(self):
         manager = make_manager()
-        manager.state.unhealthy_dp_ranks.add(0)
         manager.state.observe_process_active_ranks([1], active=False)
 
         status, _ = await submit_and_finish(
