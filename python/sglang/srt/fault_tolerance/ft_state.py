@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from itertools import chain
 from typing import Any, Dict, Iterable, List
 
 
@@ -29,8 +30,8 @@ class FaultToleranceState:
         return range(start, start + self.global_ranks_per_dp)
 
     def global_ranks_for_dps(self, dp_ranks: Iterable[int]) -> List[int]:
-        groups = [self.global_ranks_for_dp(dp) for dp in sorted(set(dp_ranks))]
-        return [rank for group in groups for rank in group]
+        groups = map(self.global_ranks_for_dp, sorted(set(dp_ranks)))
+        return list(chain.from_iterable(groups))
 
     def expand_dp_mask_to_global_rank_mask(self, dp_mask: List[bool]) -> List[bool]:
         global_ranks = range(self.global_rank_count)
