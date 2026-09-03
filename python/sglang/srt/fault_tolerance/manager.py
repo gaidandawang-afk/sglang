@@ -34,12 +34,12 @@ FT_REQUEST_ACCEPTED_MESSAGE = (
 
 @dataclasses.dataclass
 class PendingFTCommand:
-    target_ranks: set[int]
+    remaining_ranks: set[int]
     future: asyncio.Future
-    acked: set[int] = dataclasses.field(default_factory=set)
 
-    def finish_if_ready(self) -> None:
-        if not self.future.done() and self.acked >= self.target_ranks:
+    def acknowledge(self, rank: int) -> None:
+        self.remaining_ranks.discard(rank)
+        if not self.remaining_ranks:
             self.future.set_result(None)
 
 
@@ -284,8 +284,7 @@ class FaultToleranceManager:
         if pending is None:
             logger.warning("Unknown fault tolerance command ack: rank=%s", output.rank)
             return
-        pending.acked.add(output.rank)
-        pending.finish_if_ready()
+        pending.acknowledge(output.rank)
 
     def handle_active_ranks_update_output(
         self, output: ActiveRanksUpdateReqOutput
@@ -346,7 +345,7 @@ class FaultToleranceManager:
             return
         request_id = uuid.uuid4().hex
         pending = PendingFTCommand(
-            target_ranks=targets, future=self.event_loop.create_future()
+            remaining_ranks=targets, future=self.event_loop.create_future()
         )
         self._pending_commands[request_id] = pending
         req = FaultToleranceCommandReqInput(
