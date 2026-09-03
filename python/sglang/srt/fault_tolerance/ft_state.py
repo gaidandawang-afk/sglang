@@ -92,25 +92,31 @@ class FaultToleranceState:
     def observe_process_active_ranks(
         self, ranks: Iterable[int], *, active: bool
     ) -> None:
+        ranks = set(ranks)
+        if any(rank < 0 or rank >= self.global_rank_count for rank in ranks):
+            raise ValueError(f"Global rank out of range: {sorted(ranks)}")
         for rank in ranks:
-            if 0 <= rank < self.global_rank_count:
-                self.process_alive_global_rank_mask[rank] = active
+            self.process_alive_global_rank_mask[rank] = active
         if not active:
-            self.pending_recovery_global_ranks.update(
-                rank for rank in ranks if 0 <= rank < self.global_rank_count
-            )
+            self.pending_recovery_global_ranks.update(ranks)
             self.cluster_paused = True
 
     def observe_runtime_active_dp_mask(self, active_dp_mask: List[bool]) -> None:
+        if len(active_dp_mask) != self.dp_size:
+            raise ValueError(
+                f"Expected {self.dp_size} DP states, got {len(active_dp_mask)}"
+            )
         self.runtime_active_dp_mask = list(active_dp_mask)
         for dp_rank, active in enumerate(self.runtime_active_dp_mask):
-            if active and dp_rank < self.dp_size:
+            if active:
                 self.pending_recovery_global_ranks.difference_update(
                     self.global_ranks_for_dp(dp_rank)
                 )
 
     def observe_rank_fault(self, rank: int) -> None:
-        if self.strategy == "pause" and 0 <= rank < self.dp_size:
+        if rank < 0 or rank >= self.dp_size:
+            raise ValueError(f"DP rank out of range: {rank}")
+        if self.strategy == "pause":
             self.unhealthy_dp_ranks.add(rank)
             self.cluster_paused = True
 

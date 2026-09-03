@@ -37,6 +37,15 @@ class TestFaultToleranceState(unittest.TestCase):
         self.assertEqual(state.process_alive_dp_mask(), [True, False])
         self.assertEqual(state.status_response()["engines"][1]["status"], "dead")
 
+    def test_invalid_internal_ranks_fail_fast(self):
+        state = make_state()
+        with self.assertRaises(ValueError):
+            state.observe_process_active_ranks([2], active=False)
+        with self.assertRaises(ValueError):
+            state.observe_runtime_active_dp_mask([True])
+        with self.assertRaises(ValueError):
+            state.observe_rank_fault(-1)
+
     def test_sparse_expected_mask_expands_to_whole_dp_blocks(self):
         state = make_state(dp_size=4, ranks_per_dp=2)
         self.assertEqual(
