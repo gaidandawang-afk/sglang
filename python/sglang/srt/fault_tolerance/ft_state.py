@@ -98,11 +98,11 @@ class FaultToleranceState:
 
     def observe_runtime_active_dp_mask(self, active_dp_mask: List[bool]) -> None:
         self.runtime_active_dp_mask = active_dp_mask
-        for dp_rank, active in enumerate(self.runtime_active_dp_mask):
-            if active:
-                self.pending_recovery_global_ranks.difference_update(
-                    self.global_ranks_for_dp(dp_rank)
-                )
+        self.pending_recovery_global_ranks = {
+            rank
+            for rank in self.pending_recovery_global_ranks
+            if not active_dp_mask[rank // self.global_ranks_per_dp]
+        }
 
     def observe_rank_fault(self, rank: int) -> None:
         if self.strategy == "pause":
