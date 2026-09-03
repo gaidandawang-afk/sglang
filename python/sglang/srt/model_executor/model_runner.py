@@ -1914,9 +1914,10 @@ class ModelRunner:
         )
         state.active_ranks.copy_(mask)
         state.active_ranks_cpu.copy_(mask.detach().cpu())
-        for _ in self.eplb_manager.rebalance(force=True):
-            pass
-        state.snapshot_active_to_last()
+        maybe_rebalance_after_rank_fault(
+            eplb_manager=self.eplb_manager,
+            force=True,
+        )
 
     def update_model_fields(
         self,
