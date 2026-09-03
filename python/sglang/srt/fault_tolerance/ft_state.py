@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from enum import Enum
-from itertools import chain, repeat
 from typing import Any, Dict, Iterable, List
 
 
@@ -30,19 +29,30 @@ class FaultToleranceState:
         return range(start, start + self.global_ranks_per_dp)
 
     def global_ranks_for_dps(self, dp_ranks: Iterable[int]) -> List[int]:
-        groups = map(self.global_ranks_for_dp, sorted(set(dp_ranks)))
-        return list(chain.from_iterable(groups))
+        return [
+            rank
+            for dp in sorted(set(dp_ranks))
+            for rank in self.global_ranks_for_dp(dp)
+        ]
 
     def expand_dp_mask_to_global_rank_mask(self, dp_mask: List[bool]) -> List[bool]:
-        groups = (repeat(active, self.global_ranks_per_dp) for active in dp_mask)
-        return list(chain.from_iterable(groups))
+        return [
+            dp_mask[rank // self.global_ranks_per_dp]
+            for rank in range(self.global_rank_count)
+        ]
 
-    def global_to_dp_mask(self, ranks: List[bool]) -> List[bool]:
-        groups = map(self.global_ranks_for_dp, range(self.dp_size))
-        return [all(ranks[rank] for rank in group) for group in groups]
+    def project_global_rank_mask_to_dp_mask(
+        self, global_rank_mask: List[bool]
+    ) -> List[bool]:
+        return [
+            all(global_rank_mask[rank] for rank in self.global_ranks_for_dp(dp))
+            for dp in range(self.dp_size)
+        ]
 
     def process_alive_dp_mask(self) -> List[bool]:
-        return self.global_to_dp_mask(self.process_alive_global_rank_mask)
+        return self.project_global_rank_mask_to_dp_mask(
+            self.process_alive_global_rank_mask
+        )
 
     def expected_dp_ranks(self) -> List[int]:
         return [rank for rank, expected in enumerate(self.expected_dp_mask) if expected]
