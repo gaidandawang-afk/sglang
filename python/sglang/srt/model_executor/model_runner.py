@@ -68,7 +68,10 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
-from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.eplb.expert_location_updater import (
+    ExpertLocationUpdater,
+    get_npu_eplb_p2p_staging_mode,
+)
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
@@ -335,6 +338,16 @@ class ModelRunner:
                 f"Context: {self.device=} {ps.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {ps.tp_rank=} {ps.tp_size=}"
             )
             raise
+
+        if (
+            _is_npu
+            and server_args.enable_fault_tolerance
+            and server_args.elastic_ep_backend == "mc2"
+            and server_args.fault_tolerance_communication_abort_timeout > 0
+        ):
+            torch.npu.set_op_timeout_ms(
+                server_args.fault_tolerance_communication_abort_timeout * 1000
+            )
 
         # Initialize MooncakeTransferEngine BEFORE init_torch_distributed so
         # that the shared TE can be passed to the Mooncake PG backend (avoids
@@ -660,7 +673,11 @@ class ModelRunner:
 
     def maybe_init_elastic_ep(self):
         if self.server_args.elastic_ep_backend:
-            ElasticEPStateManager.init(self.server_args)
+            state = ElasticEPStateManager.init(self.server_args)
+            if _is_npu and self.server_args.elastic_ep_backend == "mc2":
+                state.init_npu_mc2_elastic_info(
+                    num_physical_experts=get_global_expert_location_metadata().num_physical_experts
+                )
 
     def init_token_oracle(self):
         self._token_oracle_manager = install_token_oracle_from_env(
@@ -1908,8 +1925,159 @@ class ModelRunner:
             )
         return output
 
+    def recover_npu_device_for_fault_tolerance_scale_down(self) -> None:
+        import torch_npu
+
+        device_id = self.gpu_id
+        logger.info(
+            "NPU FT device recovery step=bind_device phase=begin dp_rank=%s "
+            "device_id=%s",
+            self.ps.dp_rank,
+            device_id,
+        )
+        torch.npu.set_device(torch.device("npu", device_id))
+        bound_device = torch_npu.npu.current_device()
+        logger.info(
+            "NPU FT device recovery step=bind_device phase=complete dp_rank=%s "
+            "configured_device=%s bound_device=%s",
+            self.ps.dp_rank,
+            device_id,
+            bound_device,
+        )
+        logger.info(
+            "NPU FT device recovery step=stop_device phase=begin dp_rank=%s "
+            "device_id=%s",
+            self.ps.dp_rank,
+            device_id,
+        )
+        stop_result = torch_npu.npu.stop_device(device_id)
+        logger.info(
+            "NPU FT device recovery step=stop_device phase=complete dp_rank=%s "
+            "device_id=%s result=%s",
+            self.ps.dp_rank,
+            device_id,
+            stop_result,
+        )
+        logger.info(
+            "NPU FT device recovery step=recover_torch_npu_stream_pool "
+            "phase=skipped dp_rank=%s device_id=%s reason=ablation",
+            self.ps.dp_rank,
+            device_id,
+        )
+        logger.info(
+            "NPU FT device recovery step=restart_device phase=begin dp_rank=%s "
+            "device_id=%s",
+            self.ps.dp_rank,
+            device_id,
+        )
+        restart_result = torch_npu.npu.restart_device(device_id)
+        logger.info(
+            "NPU FT device recovery step=restart_device phase=complete dp_rank=%s "
+            "device_id=%s result=%s",
+            self.ps.dp_rank,
+            device_id,
+            restart_result,
+        )
+        logger.info(
+            "NPU FT device recovery step=reinit_process_group phase=begin "
+            "dp_rank=%s device_id=%s rebuild_link=false",
+            self.ps.dp_rank,
+            device_id,
+        )
+        torch_npu.distributed.reinit_process_group(None, False)
+        logger.info(
+            "NPU FT device recovery step=reinit_process_group phase=complete "
+            "dp_rank=%s device_id=%s rebuild_link=false",
+            self.ps.dp_rank,
+            device_id,
+        )
+        logger.info(
+            "NPU FT device recovery step=post_reinit_synchronize phase=begin "
+            "dp_rank=%s device_id=%s",
+            self.ps.dp_rank,
+            device_id,
+        )
+        torch.npu.synchronize()
+        logger.info(
+            "NPU FT device recovery step=post_reinit_synchronize phase=complete "
+            "dp_rank=%s device_id=%s",
+            self.ps.dp_rank,
+            device_id,
+        )
+
+    def run_npu_fault_tolerance_dummy_batch(self, active_mask: list[bool]) -> None:
+        logger.info(
+            "NPU FT dummy step=prepare_metadata phase=complete dp_rank=%s "
+            "batch_size=1 query_len=1 seq_len=1 reserved_req_pool_index=0 "
+            "reserved_kv_page=0",
+            self.ps.dp_rank,
+        )
+        logger.info(
+            "NPU FT dummy step=model_runner_forward phase=begin dp_rank=%s "
+            "active_mask=%s",
+            self.ps.dp_rank,
+            active_mask,
+        )
+        output = self.eager_runner.run_dummy_via_model_runner(
+            batch_size=1,
+            active_mask=active_mask,
+        )
+        logger.info(
+            "NPU FT dummy step=model_runner_forward phase=complete dp_rank=%s "
+            "graph_replayed=%s",
+            self.ps.dp_rank,
+            output.can_run_graph,
+        )
+        state = ElasticEPStateManager.instance()
+        if (
+            state.npu_mc2_elastic_info is not None
+            and state.npu_mc2_elastic_info.dispatch_validation_pending
+        ):
+            logger.warning(
+                "NPU FT MC2 dispatch step=validate_expert_ids phase=skipped "
+                "dp_rank=%s reason=graph_replay_or_no_mc2_dispatch",
+                self.ps.dp_rank,
+            )
+            state.npu_mc2_elastic_info.consume_dispatch_validation()
+
+    def synchronize_npu_fault_tolerance_health_gate(self) -> None:
+        logger.info(
+            "NPU FT health gate step=device_synchronize phase=begin dp_rank=%s",
+            self.ps.dp_rank,
+        )
+        torch.get_device_module(self.device).synchronize()
+        logger.info(
+            "NPU FT health gate step=device_synchronize phase=complete dp_rank=%s",
+            self.ps.dp_rank,
+        )
+
     def apply_fault_tolerance_scale_down(self, active_mask: list[bool]) -> None:
         state = ElasticEPStateManager.instance()
+        is_npu_ft_mc2 = _is_npu and self.server_args.elastic_ep_backend == "mc2"
+        if is_npu_ft_mc2:
+            from sglang.srt.fault_tolerance.npu_communication import (
+                get_npu_ft_communication,
+            )
+
+            logger.info(
+                "NPU FT elastic step=rebuild_survivor_groups phase=begin "
+                "dp_rank=%s active_mask=%s",
+                self.ps.dp_rank,
+                active_mask,
+            )
+            get_npu_ft_communication().rebuild_survivor_groups(
+                active_mask,
+                torch.device("npu", self.gpu_id),
+            )
+            logger.info(
+                "NPU FT elastic step=rebuild_survivor_groups phase=complete "
+                "dp_rank=%s",
+                self.ps.dp_rank,
+            )
+        logger.info(
+            "NPU FT elastic step=update_active_mask phase=begin dp_rank=%s",
+            self.ps.dp_rank,
+        )
         mask = torch.as_tensor(
             active_mask,
             dtype=state.active_ranks.dtype,
@@ -1917,9 +2085,121 @@ class ModelRunner:
         )
         state.active_ranks.copy_(mask)
         state.active_ranks_cpu.copy_(mask.detach().cpu())
-        for _ in self.eplb_manager.rebalance(force=True):
-            pass
+        logger.info(
+            "NPU FT elastic step=update_active_mask phase=complete dp_rank=%s "
+            "active_mask=%s",
+            self.ps.dp_rank,
+            active_mask,
+        )
+        if is_npu_ft_mc2:
+            logger.info(
+                "NPU FT elastic step=rebalance_experts phase=begin dp_rank=%s "
+                "original_mc2_hccl_group=reused p2p_staging_mode=%s",
+                self.ps.dp_rank,
+                get_npu_eplb_p2p_staging_mode(),
+            )
+            for _ in self.eplb_manager.rebalance(force=True):
+                pass
+            logger.info(
+                "NPU FT elastic step=rebalance_experts phase=complete dp_rank=%s "
+                "original_mc2_hccl_group=reused",
+                self.ps.dp_rank,
+            )
+            logger.info(
+                "NPU FT elastic step=update_mc2_elastic_info phase=begin "
+                "dp_rank=%s",
+                self.ps.dp_rank,
+            )
+            state.update_npu_mc2_elastic_info()
+            from sglang.srt.elastic_ep.npu_mc2 import (
+                build_mc2_elastic_info,
+                validate_mc2_scale_down_routing,
+            )
+
+            mc2_info = state.npu_mc2_elastic_info
+            actual_elastic_info = mc2_info.tensor.detach().cpu()
+            expected_elastic_info = build_mc2_elastic_info(
+                active_mask,
+                original_ep_size=mc2_info.original_ep_size,
+                num_local_physical_experts=mc2_info.num_local_physical_experts,
+            )
+            logger.info(
+                "NPU FT elastic step=update_mc2_elastic_info phase=complete "
+                "dp_rank=%s original_hccl_group=reused elastic_info=%s "
+                "expected_elastic_info=%s",
+                self.ps.dp_rank,
+                actual_elastic_info.tolist(),
+                expected_elastic_info.tolist(),
+            )
+            if not torch.equal(actual_elastic_info, expected_elastic_info):
+                logger.error(
+                    "NPU FT elastic step=update_mc2_elastic_info phase=failed "
+                    "dp_rank=%s reason=payload_mismatch",
+                    self.ps.dp_rank,
+                )
+                raise RuntimeError(
+                    "NPU FT MC2 elastic_info does not match active ranks: "
+                    f"actual={actual_elastic_info.tolist()} "
+                    f"expected={expected_elastic_info.tolist()}"
+                )
+
+            expert_location = get_global_expert_location_metadata()
+            logger.info(
+                "NPU FT elastic step=validate_mc2_routing phase=begin "
+                "dp_rank=%s ep_dispatch_algorithm=%s",
+                self.ps.dp_rank,
+                self.server_args.ep_dispatch_algorithm,
+            )
+            try:
+                routing_summary = validate_mc2_scale_down_routing(
+                    active_mask,
+                    original_ep_size=mc2_info.original_ep_size,
+                    num_local_physical_experts=(
+                        mc2_info.num_local_physical_experts
+                    ),
+                    ep_dispatch_algorithm=self.server_args.ep_dispatch_algorithm,
+                    logical_to_all_physical_map=(
+                        expert_location.logical_to_all_physical_map
+                    ),
+                    logical_to_all_physical_map_num_valid=(
+                        expert_location.logical_to_all_physical_map_num_valid
+                    ),
+                    logical_to_rank_dispatch_physical_map=(
+                        expert_location.logical_to_rank_dispatch_physical_map
+                    ),
+                )
+            except Exception as exc:
+                logger.error(
+                    "NPU FT elastic step=validate_mc2_routing phase=failed "
+                    "dp_rank=%s error=%s",
+                    self.ps.dp_rank,
+                    exc,
+                )
+                raise
+            logger.info(
+                "NPU FT elastic step=validate_mc2_routing phase=complete "
+                "dp_rank=%s summary=%s",
+                self.ps.dp_rank,
+                routing_summary,
+            )
+            mc2_info.arm_dispatch_validation()
+            logger.info(
+                "NPU FT MC2 dispatch step=validate_expert_ids phase=armed "
+                "dp_rank=%s",
+                self.ps.dp_rank,
+            )
+        else:
+            for _ in self.eplb_manager.rebalance(force=True):
+                pass
+        logger.info(
+            "NPU FT elastic step=snapshot_active_mask phase=begin dp_rank=%s",
+            self.ps.dp_rank,
+        )
         state.snapshot_active_to_last()
+        logger.info(
+            "NPU FT elastic step=snapshot_active_mask phase=complete dp_rank=%s",
+            self.ps.dp_rank,
+        )
 
     def update_model_fields(
         self,

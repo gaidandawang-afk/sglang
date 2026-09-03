@@ -68,6 +68,30 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 logger = logging.getLogger(__name__)
 
 
+def _npu_mc2_elastic_info_kwargs(topk_ids=None, topk_weights=None):
+    from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+    from sglang.srt.runtime_context import get_server_args
+
+    server_args = get_server_args()
+    if server_args.enable_fault_tolerance and server_args.elastic_ep_backend == "mc2":
+        mc2_info = ElasticEPStateManager.instance().npu_mc2_elastic_info
+        if topk_ids is not None and mc2_info.consume_dispatch_validation():
+            from sglang.srt.elastic_ep.npu_mc2 import (
+                validate_mc2_dispatch_expert_ids,
+            )
+
+            validate_mc2_dispatch_expert_ids(
+                topk_ids,
+                expert_weights=topk_weights,
+                elastic_info=mc2_info.tensor,
+                original_ep_size=mc2_info.original_ep_size,
+                num_local_physical_experts=mc2_info.num_local_physical_experts,
+                ids_are_compacted=server_args.ep_dispatch_algorithm is not None,
+            )
+        return {"elastic_info": mc2_info.tensor}
+    return {}
+
+
 def _is_mnnvl_fabric_supported() -> bool:
     if not is_flashinfer_available():
         return False
@@ -746,6 +770,20 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
+        npu_mc2_elastic_info_kwargs = (
+            _npu_mc2_elastic_info_kwargs(topk_ids, topk_weights)
+            if _is_npu
+            else {}
+        )
+        npu_ft_comm = None
+        if _is_npu:
+            from sglang.srt.fault_tolerance.npu_communication import (
+                get_npu_ft_communication,
+            )
+
+            npu_ft_comm = get_npu_ft_communication()
+            if npu_ft_comm is not None:
+                npu_ft_comm.record_device_dispatch_enter()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
@@ -763,8 +801,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 **fp8_deepgemm_scale_opts,
+                **npu_mc2_elastic_info_kwargs,
             )
         )
+        if npu_ft_comm is not None:
+            npu_ft_comm.record_device_dispatch_host_return()
         return packed_recv_hidden, self.packed_recv_count, event, hook
 
     def combine_a(
@@ -835,6 +876,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 **overlap_args_dict,
+                **(_npu_mc2_elastic_info_kwargs() if _is_npu else {}),
             )
 
         self.packed_recv_count = self.handle = None
