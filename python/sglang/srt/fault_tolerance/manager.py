@@ -190,12 +190,14 @@ class FaultToleranceManager:
     def _route_dp_update(
         self, route_dp_mask: List[bool]
     ) -> Optional[ActiveRanksOutput]:
+        # Cache a changed route mask and return the update for TokenizerManager.
         if route_dp_mask == self._route_dp_mask:
             return None
         self._route_dp_mask = list(route_dp_mask)
         return ActiveRanksOutput(status=route_dp_mask)
 
     def _auto_recover_ready_dps(self) -> List[int]:
+        # Rejoin expected topology only after process and runtime recovery complete.
         st = self.state
         if st.ft_operation_in_progress:
             return []
@@ -217,9 +219,10 @@ class FaultToleranceManager:
                 recovered_dp_ranks.append(dp_rank)
         return recovered_dp_ranks
 
-    def _route_after_observation(
+    def _update_route_for_current_strategy(
         self, recovered_dp_ranks: List[int]
     ) -> Optional[ActiveRanksOutput]:
+        # Continue reconciles all routes; pause only reopens completed rejoins.
         st = self.state
         if st.strategy == "continue":
             process_alive_dp_mask = st.process_alive_dp_mask()
@@ -242,16 +245,16 @@ class FaultToleranceManager:
     def observe_active_ranks(
         self, ranks: ActiveRanksOutput
     ) -> Optional[ActiveRanksOutput]:
-        # Scheduler-originated ActiveRanksOutput.status is a DP-rank mask.
+        # This Scheduler report is runtime/backend readiness, not the route mask.
         self.state.observe_runtime_active_dp_mask(list(ranks.status))
-        return self._route_after_observation(self._auto_recover_ready_dps())
+        return self._update_route_for_current_strategy(self._auto_recover_ready_dps())
 
     def observe_process_active_ranks(
         self, ranks: ProcessActiveRanksOutput
     ) -> Optional[ActiveRanksOutput]:
         self.state.observe_process_active_ranks(ranks.ranks, active=ranks.active)
         self._finish_shutdown_if_ready()
-        return self._route_after_observation(self._auto_recover_ready_dps())
+        return self._update_route_for_current_strategy(self._auto_recover_ready_dps())
 
     def observe_watchdog_heartbeat(self, heartbeat: WatchdogHeartbeatOutput) -> None:
         existing = self._watchdog_leases.get(heartbeat.node_rank)
