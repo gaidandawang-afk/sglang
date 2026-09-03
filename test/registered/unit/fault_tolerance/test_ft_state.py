@@ -91,21 +91,21 @@ class TestFaultToleranceState(unittest.TestCase):
 
     def test_pause_admission_uses_cluster_pause_and_operation(self):
         state = make_state()
-        self.assertFalse(state.should_reject_admission([True, True]))
+        self.assertFalse(state.is_global_admission_blocked([True, True]))
         state.observe_rank_fault(0)
         self.assertTrue(state.cluster_paused)
-        self.assertTrue(state.should_reject_admission([True, True]))
+        self.assertTrue(state.is_global_admission_blocked([True, True]))
         state.finish_retry()
         self.assertFalse(state.cluster_paused)
         state.ft_operation_in_progress = True
-        self.assertTrue(state.should_reject_admission([True, True]))
+        self.assertTrue(state.is_global_admission_blocked([True, True]))
 
     def test_continue_admission_is_not_paused_by_faults(self):
         state = make_state(strategy="continue")
         state.observe_process_active_ranks([1], active=False)
         state.observe_rank_fault(0)
         # continue never pauses admission; faults only drop requests / update status.
-        self.assertFalse(state.should_reject_admission([True, True]))
+        self.assertFalse(state.is_global_admission_blocked([True, True]))
         self.assertEqual(state.unhealthy_dp_ranks, set())
         self.assertEqual(state.status_response()["engines"][1]["status"], "dead")
 

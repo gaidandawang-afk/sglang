@@ -82,7 +82,7 @@ class FaultToleranceState:
             for rank, expected in enumerate(self.expected_dp_mask)
         )
 
-    def should_reject_admission(self, route_dp_mask: List[bool]) -> bool:
+    def is_global_admission_blocked(self, route_dp_mask: List[bool]) -> bool:
         return (
             not any(route_dp_mask)
             or self.ft_operation_in_progress
