@@ -370,6 +370,24 @@ class DataParallelController:
         self.dp_budget.update_budget(obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
+        if self.server_args.elastic_ep_backend is not None:
+            if len(ranks.status) != self.max_dp_size:
+                logger.warning(
+                    "[Elastic EP][DPC] active rank status len=%d != max_dp_size=%d; "
+                    "ignoring update",
+                    len(ranks.status),
+                    self.max_dp_size,
+                )
+                return
+            self.status = [
+                self.dp_active[i] and bool(ranks.status[i])
+                for i in range(self.max_dp_size)
+            ]
+            self._refresh_active_workers()
+            if self.server_args.enable_fault_tolerance and ranks.request_id is not None:
+                ack = ActiveRanksUpdateReqOutput(request_id=ranks.request_id)
+                sock_send(self.send_to_tokenizer, ack)
+            return
         if len(ranks.status) != self.max_dp_size:
             logger.warning(
                 "[DPC] update_active_ranks: status len=%d != max_dp_size=%d; "
@@ -378,22 +396,7 @@ class DataParallelController:
                 self.max_dp_size,
             )
             return
-        if self.server_args.elastic_ep_backend is not None:
-            self.status = [
-                self.dp_active[i] and bool(ranks.status[i])
-                for i in range(self.max_dp_size)
-            ]
-        else:
-            self.status = list(ranks.status)
-        self._refresh_active_workers()
-
-        if ranks.request_id is not None and self.send_to_tokenizer is not None:
-            sock_send(
-                self.send_to_tokenizer,
-                ActiveRanksUpdateReqOutput(
-                    request_id=ranks.request_id,
-                )
-            )
+        self.status = list(ranks.status)
 
     def add_elastic_workers(self, slot_offset: int, slot_count: int):
         """Activate a range of pre-bound worker slots."""
