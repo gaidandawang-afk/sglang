@@ -570,15 +570,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             message=_anthropic_validation_message(exc.errors()),
         )
 
-    if request.url.path == "/fault_tolerance/apply":
-        error = exc.errors()[0]
-        message = (
-            f"Invalid instruction: '{error['ctx']['tag']}'."
-            if error["type"] == "union_tag_invalid"
-            else error["msg"]
-        )
-        return _fault_tolerance_error_response(HTTPStatus.BAD_REQUEST, message)
-
     exc_str = str(exc)
     errors_str = str(exc.errors())
 
