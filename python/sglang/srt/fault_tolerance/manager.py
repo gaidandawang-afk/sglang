@@ -6,9 +6,10 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from sglang.srt.fault_tolerance.ft_state import FaultToleranceState
+from sglang.srt.fault_tolerance.protocol import FaultToleranceApplyRequest
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     ActiveRanksUpdateReqOutput,
@@ -29,30 +30,6 @@ WATCHDOG_LEASE_TIMEOUT_SEC = 60
 FT_REQUEST_ACCEPTED_MESSAGE = (
     "Request accepted; poll /fault_tolerance/status for updates."
 )
-_ALLOWED_INSTRUCTIONS = {"retry", "scale_down"}
-
-
-def validate_apply_payload(obj: Any, dp_size: int) -> Tuple[str, Dict[str, Any], str]:
-    if not isinstance(obj, dict):
-        raise ValueError("Request body must be a JSON object.")
-    instruction = obj.get("instruction")
-    if not instruction:
-        raise ValueError("'instruction' is required.")
-    if instruction not in _ALLOWED_INSTRUCTIONS:
-        raise ValueError(f"Invalid instruction: '{instruction}'.")
-    params = obj.get("params", {})
-    if not isinstance(params, dict):
-        raise ValueError("'params' must be an object.")
-    if instruction == "scale_down":
-        ranks = params.get("removed_dp_ranks")
-        if not isinstance(ranks, list) or any(type(rank) is not int for rank in ranks):
-            raise ValueError("'removed_dp_ranks' must be a list of integers.")
-        if any(rank < 0 or rank >= dp_size for rank in ranks):
-            raise ValueError("'removed_dp_ranks' contains a rank out of range.")
-    request_id = obj.get("request_id", "")
-    if not isinstance(request_id, str):
-        raise ValueError("'request_id' must be a string.")
-    return instruction, params, request_id
 
 
 @dataclasses.dataclass
@@ -106,44 +83,36 @@ class FaultToleranceManager:
                     engine["ft_error"] = self._ft_error
         return 200, body
 
-    def submit(self, obj: Any) -> tuple[int, dict]:
-        try:
-            instruction, params, request_id = validate_apply_payload(
-                obj, self.state.dp_size
-            )
-        except ValueError as exc:
-            return 400, {"message": str(exc)}
+    def submit(self, request: FaultToleranceApplyRequest) -> tuple[int, dict]:
+        if request.instruction == "scale_down" and any(
+            rank >= self.state.dp_size for rank in request.params.removed_dp_ranks
+        ):
+            return 400, {"message": "'removed_dp_ranks' contains a rank out of range."}
         # One centralized SGLang request controls all DP engines atomically.
         if self.state.ft_operation_in_progress:
             return 409, {"message": "ft_operation_in_progress"}
 
         self.state.ft_operation_in_progress = True
         try:
-            self._create_task(
-                self._run_submitted_apply(instruction, params, request_id)
-            )
+            self._create_task(self._run_submitted_apply(request))
         except Exception:
             self.state.ft_operation_in_progress = False
             raise
         return 202, {
             "message": FT_REQUEST_ACCEPTED_MESSAGE,
-            "request_id": request_id,
+            "request_id": request.request_id,
         }
 
-    async def _run_submitted_apply(
-        self, instruction: str, params: Dict[str, Any], request_id: str
-    ) -> None:
+    async def _run_submitted_apply(self, request: FaultToleranceApplyRequest) -> None:
         timeout = self.server_args.fault_tolerance_timeout
-        if instruction == "retry":
+        if request.instruction == "retry":
             error = await self._apply_retry(timeout)
         else:
-            error = await self._apply_scale_down(params["removed_dp_ranks"], timeout)
-        if error is None:
-            self._last_ft_request_id = request_id
-            self._ft_error = None
-        else:
-            self._last_ft_request_id = request_id
-            self._ft_error = error
+            error = await self._apply_scale_down(
+                request.params.removed_dp_ranks, timeout
+            )
+        self._last_ft_request_id = request.request_id
+        self._ft_error = error
         self.state.ft_operation_in_progress = False
 
     async def _apply_retry(self, timeout: int) -> Optional[str]:

@@ -17,6 +17,14 @@ from sglang.srt.managers.io_struct import (
 )
 
 
+def make_request(obj):
+    return SimpleNamespace(
+        instruction=obj["instruction"],
+        params=SimpleNamespace(**obj.get("params", {})),
+        request_id=obj.get("request_id", ""),
+    )
+
+
 def make_manager(*, dp_size=2, ranks_per_dp=1, strategy="pause"):
     manager = FaultToleranceManager(
         server_args=SimpleNamespace(
@@ -33,7 +41,7 @@ def make_manager(*, dp_size=2, ranks_per_dp=1, strategy="pause"):
 
 
 async def submit_and_finish(manager, obj):
-    status, response = manager.submit(obj)
+    status, response = manager.submit(make_request(obj))
     tasks = list(manager.asyncio_tasks)
     if tasks:
         await asyncio.gather(*tasks)
@@ -182,16 +190,6 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.state.pending_recovery_global_ranks, set())
         self.assertEqual(manager.status()[1]["engines"][1]["status"], "healthy")
 
-    async def test_recover_instruction_is_not_an_ft_api(self):
-        manager = make_manager()
-
-        status, response = manager.submit(
-            {"instruction": "recover", "params": {"removed_dp_ranks": [1]}}
-        )
-
-        self.assertEqual(status, 400)
-        self.assertEqual(response["message"], "Invalid instruction: 'recover'.")
-
     async def test_submit_uses_vllm_accepted_response_and_rejects_concurrency(self):
         manager = make_manager()
         manager.state.unhealthy_dp_ranks.add(0)
@@ -207,7 +205,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager._publish_route_dp_mask = AsyncMock()
 
         status, response = manager.submit(
-            {"instruction": "retry", "request_id": "request-1"}
+            make_request({"instruction": "retry", "request_id": "request-1"})
         )
 
         self.assertEqual(status, 202)
@@ -224,7 +222,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         await command_started.wait()
 
         busy_status, busy_response = manager.submit(
-            {"instruction": "retry", "request_id": "request-2"}
+            make_request({"instruction": "retry", "request_id": "request-2"})
         )
         self.assertEqual(busy_status, 409)
         self.assertEqual(busy_response["message"], "ft_operation_in_progress")
@@ -260,7 +258,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager._failstop = Mock(side_effect=RuntimeError("failstop"))
 
         status, _ = manager.submit(
-            {"instruction": "retry", "request_id": "request-fail"}
+            make_request({"instruction": "retry", "request_id": "request-fail"})
         )
         tasks = list(manager.asyncio_tasks)
 
@@ -271,41 +269,20 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(manager.state.ft_operation_in_progress)
         self.assertIsNone(manager._ft_error)
 
-    async def test_apply_envelope_validation_matches_vllm(self):
+    async def test_scale_down_rejects_rank_above_dp_size(self):
         manager = make_manager()
-        invalid_requests = [
-            ([], "Request body must be a JSON object."),
-            ({}, "'instruction' is required."),
-            ({"instruction": "retry", "params": []}, "'params' must be an object."),
-            (
-                {"instruction": "scale_down", "params": {}},
-                "'removed_dp_ranks' must be a list of integers.",
-            ),
-            (
-                {
-                    "instruction": "scale_down",
-                    "params": {"removed_dp_ranks": [True]},
-                },
-                "'removed_dp_ranks' must be a list of integers.",
-            ),
-            (
-                {
-                    "instruction": "scale_down",
-                    "params": {"removed_dp_ranks": [4]},
-                },
-                "'removed_dp_ranks' contains a rank out of range.",
-            ),
-            (
-                {"instruction": "retry", "request_id": 1},
-                "'request_id' must be a string.",
-            ),
-        ]
-
-        for request, expected_error in invalid_requests:
-            with self.subTest(request=request):
-                status, response = manager.submit(request)
-                self.assertEqual(status, 400)
-                self.assertEqual(response["message"], expected_error)
+        request = make_request(
+            {
+                "instruction": "scale_down",
+                "params": {"removed_dp_ranks": [4]},
+            }
+        )
+        status, response = manager.submit(request)
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            response["message"],
+            "'removed_dp_ranks' contains a rank out of range.",
+        )
 
     async def test_runtime_ready_before_process_up_still_auto_recovers(self):
         manager = make_manager()

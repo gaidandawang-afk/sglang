@@ -109,6 +109,7 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
+from sglang.srt.fault_tolerance.protocol import FaultToleranceApplyRequest
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -568,6 +569,15 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             error_type="invalid_request_error",
             message=_anthropic_validation_message(exc.errors()),
         )
+
+    if request.url.path == "/fault_tolerance/apply":
+        error = exc.errors()[0]
+        message = (
+            f"Invalid instruction: '{error['ctx']['tag']}'."
+            if error["type"] == "union_tag_invalid"
+            else error["msg"]
+        )
+        return _fault_tolerance_error_response(HTTPStatus.BAD_REQUEST, message)
 
     exc_str = str(exc)
     errors_str = str(exc.errors())
@@ -1673,21 +1683,12 @@ def _fault_tolerance_error_response(status_code: int, message: str):
     )
 
 
-@app.post("/fault_tolerance/apply")
+@app.post(
+    "/fault_tolerance/apply",
+    dependencies=[Depends(validate_json_request)],
+)
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def fault_tolerance_apply(request: Request):
-    content_type = request.headers.get("content-type", "").lower()
-    if content_type.split(";", maxsplit=1)[0] != "application/json":
-        return _fault_tolerance_error_response(
-            HTTPStatus.BAD_REQUEST,
-            "Unsupported Media Type: Only 'application/json' is allowed",
-        )
-    try:
-        obj = await request.json()
-    except ValueError:
-        return _fault_tolerance_error_response(
-            HTTPStatus.BAD_REQUEST, "Invalid JSON format"
-        )
+async def fault_tolerance_apply(obj: FaultToleranceApplyRequest):
     status_code, body = _global_state.tokenizer_manager.fault_tolerance_apply(obj)
     if status_code != HTTPStatus.ACCEPTED:
         return _fault_tolerance_error_response(status_code, body["message"])

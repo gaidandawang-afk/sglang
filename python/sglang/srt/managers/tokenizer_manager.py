@@ -34,7 +34,17 @@ from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from http import HTTPStatus
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import fastapi
 import pybase64
@@ -50,6 +60,7 @@ from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.fault_tolerance.manager import FaultToleranceManager
+from sglang.srt.fault_tolerance.protocol import FaultToleranceApplyRequest
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -1831,7 +1842,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return 503, {"message": "fault_tolerance_disabled"}
         return self.fault_tolerance.status()
 
-    def fault_tolerance_apply(self, obj: Dict[str, Any]):
+    def fault_tolerance_apply(self, obj: FaultToleranceApplyRequest):
         if self.fault_tolerance is None:
             return 503, {"message": "fault_tolerance_disabled"}
         return self.fault_tolerance.submit(obj)
