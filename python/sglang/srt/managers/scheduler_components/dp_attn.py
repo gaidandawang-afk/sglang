@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
+
 def _resolve_elastic_world_dp_size(
     dp_size: int,
     *,

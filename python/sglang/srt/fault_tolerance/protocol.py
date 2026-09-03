@@ -32,17 +32,6 @@ FaultToleranceApplyRequest = Annotated[
 ]
 
 _APPLY_REQUEST_ADAPTER = TypeAdapter(FaultToleranceApplyRequest)
-_VALIDATION_ERROR_MESSAGES = {
-    "json_invalid": "Invalid JSON format",
-    "dict_type": "Request body must be a JSON object.",
-    "union_tag_not_found": "'instruction' is required.",
-    "model_type": "'params' must be an object.",
-    "missing": "'removed_dp_ranks' must be a list of integers.",
-    "list_type": "'removed_dp_ranks' must be a list of integers.",
-    "int_type": "'removed_dp_ranks' must be a list of integers.",
-    "greater_than_equal": "'removed_dp_ranks' contains a rank out of range.",
-    "string_type": "'request_id' must be a string.",
-}
 
 
 def parse_apply_request(body: bytes) -> FaultToleranceApplyRequest:
@@ -53,5 +42,5 @@ def parse_apply_request(body: bytes) -> FaultToleranceApplyRequest:
         if error["type"] == "union_tag_invalid":
             message = f"Invalid instruction: '{error['ctx']['tag']}'."
         else:
-            message = _VALIDATION_ERROR_MESSAGES.get(error["type"], error["msg"])
+            message = error["msg"]
         raise ValueError(message) from None
