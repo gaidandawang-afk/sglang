@@ -489,6 +489,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.fault_tolerance: Optional[FaultToleranceManager] = None
         if not self.server_args.enable_fault_tolerance:
             return
+
+        # Scheduler commands reuse the primary DPC and its scheduler connections.
+        # Per-node DPC control only stops locally owned scheduler processes.
         self.fault_tolerance = FaultToleranceManager(
             server_args=self.server_args,
             send_to_scheduler=self._async_dispatch_to_scheduler,

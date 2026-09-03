@@ -157,6 +157,7 @@ class FaultToleranceManager:
         if any(not st.expected_dp_mask[rank] for rank in requested):
             return "scale_down_requires_expected_ranks"
 
+        # DP ranks that remain active after the scale-down.
         candidate_dp_mask = [
             expected and rank not in requested
             for rank, expected in enumerate(st.expected_dp_mask)
