@@ -109,7 +109,7 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
-from sglang.srt.fault_tolerance.protocol import FaultToleranceApplyRequest
+from sglang.srt.fault_tolerance.protocol import parse_apply_request
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -1674,12 +1674,20 @@ def _fault_tolerance_error_response(status_code: int, message: str):
     )
 
 
-@app.post(
-    "/fault_tolerance/apply",
-    dependencies=[Depends(validate_json_request)],
-)
+@app.post("/fault_tolerance/apply")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def fault_tolerance_apply(obj: FaultToleranceApplyRequest):
+async def fault_tolerance_apply(request: Request):
+    content_type = request.headers.get("content-type", "").lower()
+    if content_type.split(";", maxsplit=1)[0] != "application/json":
+        return _fault_tolerance_error_response(
+            HTTPStatus.BAD_REQUEST,
+            "Unsupported Media Type: Only 'application/json' is allowed",
+        )
+    try:
+        obj = parse_apply_request(await request.body())
+    except ValueError as exc:
+        return _fault_tolerance_error_response(HTTPStatus.BAD_REQUEST, str(exc))
+
     status_code, body = _global_state.tokenizer_manager.fault_tolerance_apply(obj)
     if status_code != HTTPStatus.ACCEPTED:
         return _fault_tolerance_error_response(status_code, body["message"])
