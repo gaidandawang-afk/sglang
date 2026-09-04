@@ -108,13 +108,3 @@ class FaultToleranceState:
         if self.strategy == "pause":
             self.unhealthy_dp_ranks.add(rank)
             self.cluster_paused = True
-
-    def finish_retry(self) -> None:
-        self.unhealthy_dp_ranks.clear()
-        self.cluster_paused = False
-
-    def finish_scale_down(self, ranks: Iterable[int]) -> None:
-        for rank in ranks:
-            self.expected_dp_mask[rank] = False
-        self.unhealthy_dp_ranks.clear()
-        self.cluster_paused = False

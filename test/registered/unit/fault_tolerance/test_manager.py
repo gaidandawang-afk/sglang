@@ -195,7 +195,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
 
     async def test_pause_runtime_ready_automatically_reopens_route(self):
         manager = make_manager()
-        manager.state.finish_scale_down([1])
+        manager.state.expected_dp_mask[1] = False
         manager._route_dp_mask = [True, False]
         manager.observe_process_active_ranks(
             ProcessActiveRanksOutput(ranks=[1], active=False)
@@ -261,6 +261,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager._last_ft_request_id = "old-request"
         manager._ft_error = "old-error"
         manager.state.unhealthy_dp_ranks.add(0)
+        manager.state.cluster_paused = True
         manager._send_command_collect = AsyncMock()
         manager._publish_route_dp_mask = AsyncMock()
 
@@ -272,6 +273,8 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         for engine in manager.status()[1]["engines"]:
             self.assertEqual(engine["last_ft_request_id"], "new-request")
             self.assertNotIn("ft_error", engine)
+        self.assertEqual(manager.state.unhealthy_dp_ranks, set())
+        self.assertFalse(manager.state.cluster_paused)
 
     async def test_lower_execution_failure_keeps_failstop_behavior(self):
         manager = make_manager()
@@ -310,7 +313,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
 
     async def test_runtime_ready_before_process_up_still_auto_recovers(self):
         manager = make_manager()
-        manager.state.finish_scale_down([1])
+        manager.state.expected_dp_mask[1] = False
         manager._route_dp_mask = [True, False]
         manager.observe_process_active_ranks(
             ProcessActiveRanksOutput(ranks=[1], active=False)
@@ -391,7 +394,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager = make_manager(dp_size=2, ranks_per_dp=2, strategy="continue")
         # Scale-down DP1 then kill it; it stays dead until it rejoins and its
         # data plane recovers, at which point "continue" re-admits it automatically.
-        manager.state.finish_scale_down([1])
+        manager.state.expected_dp_mask[1] = False
         manager.state.observe_process_active_ranks([2, 3], active=False)
         manager.state.observe_process_active_ranks([2, 3], active=True)
         self.assertEqual(manager.state.expected_dp_mask, [True, False])

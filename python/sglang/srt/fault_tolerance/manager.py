@@ -124,6 +124,9 @@ class FaultToleranceManager:
                 request.params.removed_dp_ranks, timeout
             )
 
+        if error is None:
+            self.state.unhealthy_dp_ranks.clear()
+            self.state.cluster_paused = False
         self._finish_submitted_apply(request.request_id, error)
 
     def _finish_submitted_apply(self, request_id: str, error: Optional[str]) -> None:
@@ -146,7 +149,6 @@ class FaultToleranceManager:
             timeout_sec=timeout,
         )
         await self._publish_route_dp_mask(st.expected_dp_mask, timeout)
-        st.finish_retry()
         return None
 
     async def _apply_scale_down(self, ranks: List[int], timeout: int) -> Optional[str]:
@@ -177,7 +179,8 @@ class FaultToleranceManager:
             ),
         )
         await self._publish_route_dp_mask(candidate_dp_mask, timeout)
-        st.finish_scale_down(requested)
+        for rank in requested:
+            st.expected_dp_mask[rank] = False
         return None
 
     def admission_error(self, routed_dp_rank: Optional[int]) -> Optional[str]:

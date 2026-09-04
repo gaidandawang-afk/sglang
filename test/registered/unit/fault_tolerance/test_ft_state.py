@@ -95,7 +95,7 @@ class TestFaultToleranceState(unittest.TestCase):
         state.observe_rank_fault(0)
         self.assertTrue(state.cluster_paused)
         self.assertTrue(state.is_global_admission_blocked([True, True]))
-        state.finish_retry()
+        state.cluster_paused = False
         self.assertFalse(state.cluster_paused)
         state.ft_operation_in_progress = True
         self.assertTrue(state.is_global_admission_blocked([True, True]))
