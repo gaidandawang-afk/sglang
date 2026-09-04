@@ -155,7 +155,6 @@ class DataParallelController:
 
         # Init inter-process communication
         self.context = zmq.Context(1 + server_args.dp_size)
-        self.recv_from_tokenizer = None
         if server_args.node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -241,8 +240,8 @@ class DataParallelController:
                     for rank in self.scheduler_process_global_ranks
                 ],
                 on_exit=self._handle_scheduler_process_exit,
-                on_poll=self._report_watchdog_heartbeat,
-                on_thread_stop=self._close_watchdog_sender,
+                on_poll=self._watchdog_poll,
+                on_thread_stop=self._close_watchdog_sockets,
                 interval=FT_WATCHDOG_POLL_INTERVAL,
                 fail_stop_on_exit=False,
                 report_clean_exit=True,
@@ -341,10 +340,21 @@ class DataParallelController:
         except zmq.Again:
             logger.debug("Dropping watchdog heartbeat because tokenizer is unavailable")
 
-    def _close_watchdog_sender(self):
+    def _watchdog_poll(self):
+        # After startup, only the watchdog thread receives from this socket.
+        try:
+            request = sock_recv(self.recv_from_ft_controller, flags=zmq.NOBLOCK)
+        except zmq.Again:
+            pass
+        else:
+            self.shutdown_dp(request)
+        self._report_watchdog_heartbeat()
+
+    def _close_watchdog_sockets(self):
         if self._watchdog_sender is not None:
             self._watchdog_sender.close(linger=0)
             self._watchdog_sender = None
+        self.recv_from_ft_controller.close(linger=0)
 
     def _report_process_active_ranks(self, *, active: bool) -> None:
         sock_send(
@@ -490,7 +500,6 @@ class DataParallelController:
                     ),
                 ),
                 (FaultToleranceCommandReqInput, self.send_fault_tolerance_command),
-                (FaultToleranceDPCShutdownReqInput, self.shutdown_dp),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -952,20 +961,14 @@ class DataParallelController:
         sock_send(self.workers[target_worker], req)
 
     def event_loop(self):
-        poller = zmq.Poller()
-        sockets = [
-            socket
-            for socket in (self.recv_from_tokenizer, self.recv_from_ft_controller)
-            if socket is not None
-        ]
-        for socket in sockets:
-            poller.register(socket, zmq.POLLIN)
         while True:
-            self.soft_watchdog.feed()
-            ready = dict(poller.poll(timeout=100))
-            for socket in sockets:
-                if socket in ready:
-                    self._request_dispatcher(sock_recv(socket))
+            while True:
+                self.soft_watchdog.feed()
+                try:
+                    recv_req = sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
+                except zmq.ZMQError:
+                    break
+                self._request_dispatcher(recv_req)
 
 def run_data_parallel_controller_process(
     server_args: ServerArgs,
@@ -1008,9 +1011,7 @@ def run_data_parallel_controller_process(
             }
         )
         # The primary owns routing for the expanded scheduler set.
-        if (
-            server_args.node_rank == 0 and not server_args.is_ep_scale_joiner
-        ) or server_args.enable_fault_tolerance:
+        if server_args.node_rank == 0 and not server_args.is_ep_scale_joiner:
             controller.event_loop()
         for proc in controller.scheduler_procs:
             proc.join()

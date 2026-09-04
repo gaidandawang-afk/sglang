@@ -107,6 +107,7 @@ def load_class_methods(path, class_name, method_names, namespace):
 class Sender:
     def __init__(self):
         self.sent = []
+        self.received = []
         self.options = []
         self.endpoint = None
         self.closed = False
@@ -116,6 +117,11 @@ class Sender:
 
     def send_output(self, value, *args):
         self.sent.append((value, *args))
+
+    def recv_pyobj(self, flags=0):
+        if not self.received:
+            raise RuntimeError
+        return self.received.pop(0)
 
     def setsockopt(self, option, value):
         self.options.append((option, value))
@@ -179,6 +185,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             "WatchdogHeartbeatOutput": WatchdogHeartbeatOutput,
             "FT_WATCHDOG_SEND_TIMEOUT_MS": 60_000,
             "logger": logging.getLogger(__name__),
+            "sock_recv": lambda socket, flags=0: socket.recv_pyobj(flags),
             "sock_send": lambda socket, value, flags=0: socket.send_pyobj(value, flags),
             "zmq": SimpleNamespace(
                 Context=None,
@@ -203,7 +210,8 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 "_watchdog_heartbeat",
                 "_report_initial_watchdog_heartbeat",
                 "_report_watchdog_heartbeat",
-                "_close_watchdog_sender",
+                "_watchdog_poll",
+                "_close_watchdog_sockets",
                 "_report_process_active_ranks",
             },
             cls.dpc_globals,
@@ -365,11 +373,16 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             server_args=SimpleNamespace(node_rank=1),
             port_args=SimpleNamespace(tokenizer_ipc_name="tcp://node0:1"),
             send_to_tokenizer=Sender(),
+            recv_from_ft_controller=Sender(),
             ft_control_endpoint="tcp://node1:2",
             _watchdog_sender=None,
         )
         dpc._get_watchdog_sender = lambda: self.dpc_methods["_get_watchdog_sender"](dpc)
         dpc._watchdog_heartbeat = lambda: self.dpc_methods["_watchdog_heartbeat"](dpc)
+        dpc._report_watchdog_heartbeat = lambda: self.dpc_methods[
+            "_report_watchdog_heartbeat"
+        ](dpc)
+        dpc.shutdown_dp = lambda request: self.dpc_methods["shutdown_dp"](dpc, request)
         return dpc, sender
 
     def test_watchdog_reports_global_rank_and_endpoint(self):
@@ -384,18 +397,21 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertEqual(heartbeat.ranks, [0, 2, 3])
         self.assertEqual(heartbeat.control_endpoint, "tcp://node1:2")
 
-    def test_shutdown_kills_every_local_member_of_target_dp(self):
-        dpc, _ = self.make_dpc()
+    def test_watchdog_shutdown_kills_every_local_member_of_target_dp(self):
+        dpc, sender = self.make_dpc()
         dpc.scheduler_procs = [
             SimpleNamespace(is_alive=lambda: True, kill=Mock()) for _ in range(3)
         ]
-        request = FaultToleranceDPCShutdownReqInput(target_dp_ranks=[1])
+        dpc.recv_from_ft_controller.received.append(
+            FaultToleranceDPCShutdownReqInput(target_dp_ranks=[1])
+        )
 
-        self.dpc_methods["shutdown_dp"](dpc, request)
+        self.dpc_methods["_watchdog_poll"](dpc)
 
         dpc.scheduler_procs[0].kill.assert_not_called()
         dpc.scheduler_procs[1].kill.assert_called_once()
         dpc.scheduler_procs[2].kill.assert_called_once()
+        self.assertIsInstance(sender.sent[-1], WatchdogHeartbeatOutput)
 
 
 if __name__ == "__main__":
