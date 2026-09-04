@@ -133,7 +133,7 @@ def release_kv_cache(
     req: Req,
     tree_cache: BasePrefixCache,
     is_insert: bool = True,
-    allow_overallocated: bool = False,
+    allow_non_spec_overallocated: bool = False,
 ):
     # the two resources currently have the same lifecycle, thus simplify logic below
     assert (req.req_pool_idx is None) == (req.kv is None)
@@ -170,7 +170,7 @@ def release_kv_cache(
         start_p,
         end_p,
         tree_cache,
-        allow_overallocated=allow_overallocated,
+        allow_non_spec_overallocated=allow_non_spec_overallocated,
     )
 
     # If the prefix cache doesn't manage mamba states, we must free them here.
@@ -193,7 +193,7 @@ def _release_overallocated_kv_indices(
     end_p: int,
     tree_cache: BasePrefixCache,
     *,
-    allow_overallocated: bool = False,
+    allow_non_spec_overallocated: bool = False,
 ) -> None:
     global_server_args = get_server_args()
     page_size = global_server_args.page_size
@@ -204,7 +204,7 @@ def _release_overallocated_kv_indices(
     if (
         spec_algo is None
         and not global_server_args.strip_thinking_cache
-        and not allow_overallocated
+        and not allow_non_spec_overallocated
     ):
         assert (
             start_p == end_p

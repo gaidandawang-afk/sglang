@@ -1602,7 +1602,7 @@ class Scheduler(
                     req,
                     self.tree_cache,
                     is_insert=False,
-                    allow_overallocated=True,
+                    allow_non_spec_overallocated=True,
                 )
                 abort_reason = FINISH_ABORT(
                     message=f"Request discarded after scheduler exception: {exc}",
