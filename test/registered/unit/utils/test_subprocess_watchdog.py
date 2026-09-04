@@ -338,6 +338,22 @@ class TestSubprocessWatchdog(CustomTestCase):
 
         self.assertEqual(stop_threads, [watchdog_thread_id])
 
+    def test_thread_start_hook_runs_in_watchdog_thread(self):
+        process = self._spawn(healthy_worker)
+        start_seen = threading.Event()
+        start_threads = []
+
+        class TestWatchdog(SubprocessWatchdog):
+            def _on_thread_start(self):
+                start_threads.append(threading.get_ident())
+                start_seen.set()
+
+        self._monitor = TestWatchdog(processes=[process], interval=0.01)
+        self._monitor.start()
+
+        self.assertTrue(start_seen.wait(timeout=1.0))
+        self.assertEqual(start_threads, [self._monitor._thread.ident])
+
 
 if __name__ == "__main__":
     import unittest

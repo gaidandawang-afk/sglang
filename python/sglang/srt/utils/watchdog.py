@@ -215,8 +215,12 @@ class SubprocessWatchdog:
             self._thread.join(timeout=self._interval * 2)
             self._thread = None
 
+    def _on_thread_start(self) -> None:
+        pass
+
     def _monitor_loop(self) -> None:
         try:
+            self._on_thread_start()
             while not self._stop_event.wait(self._interval):
                 if self._check_processes():
                     return
