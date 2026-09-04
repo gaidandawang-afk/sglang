@@ -1042,7 +1042,7 @@ class ServerArgs:
         int,
         "Timeout in seconds for each fault-tolerance control phase.",
         NS("parallel"),
-    ] = 300
+    ] = 60
     fault_tolerance_pause_timeout: A[
         float,
         "Fail-stop timeout in seconds for an unattended fault-tolerance pause.",
