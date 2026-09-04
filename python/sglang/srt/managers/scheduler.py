@@ -1597,11 +1597,12 @@ class Scheduler(
                     req.kv_committed_len,
                     len(req.origin_input_ids) + len(req.output_ids),
                 )
+                # A failed forward may leave allocated but uncommitted KV slots.
                 release_kv_cache(
                     req,
                     self.tree_cache,
                     is_insert=False,
-                    allow_non_spec_overallocated=True,
+                    allow_overallocated=True,
                 )
                 abort_reason = FINISH_ABORT(
                     message=f"Request discarded after scheduler exception: {exc}",
