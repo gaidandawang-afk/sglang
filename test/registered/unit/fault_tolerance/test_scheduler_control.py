@@ -193,9 +193,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 "Optional": Optional,
                 "maybe_rebalance_after_rank_fault": cls.rebalance,
                 "torch": SimpleNamespace(
-                    as_tensor=lambda value, **_: (
-                        value if isinstance(value, FakeTensor) else FakeTensor(value)
-                    )
+                    as_tensor=lambda value, **_: FakeTensor(value)
                 ),
             },
         )

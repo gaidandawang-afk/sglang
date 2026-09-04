@@ -1910,12 +1910,13 @@ class ModelRunner:
     ) -> None:
         """Restore the last rank mask, or apply a new one and rebalance."""
         state = ElasticEPStateManager.instance()
-        _mask = state.last_active_ranks if active_mask is None else active_mask
-        active_ranks = torch.as_tensor(
-            _mask,
-            dtype=state.active_ranks.dtype,
-            device=state.active_ranks.device,
-        )
+        active_ranks = state.last_active_ranks
+        if active_mask is not None:
+            active_ranks = torch.as_tensor(
+                active_mask,
+                dtype=state.active_ranks.dtype,
+                device=state.active_ranks.device,
+            )
         state.active_ranks.copy_(active_ranks)
         state.active_ranks_cpu.copy_(active_ranks.detach().cpu())
         if active_mask is not None:
