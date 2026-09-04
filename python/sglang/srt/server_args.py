@@ -1040,9 +1040,9 @@ class ServerArgs:
     ] = "pause"
     fault_tolerance_timeout: A[
         int,
-        "Timeout in seconds for fault-tolerance control commands.",
+        "Timeout in seconds for each fault-tolerance control phase.",
         NS("parallel"),
-    ] = 60
+    ] = 300
     fault_tolerance_pause_timeout: A[
         float,
         "Fail-stop timeout in seconds for an unattended fault-tolerance pause.",

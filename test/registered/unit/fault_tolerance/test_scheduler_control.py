@@ -177,7 +177,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             "FaultToleranceDPCShutdownReqInput": FaultToleranceDPCShutdownReqInput,
             "ProcessActiveRanksOutput": ProcessActiveRanksOutput,
             "WatchdogHeartbeatOutput": WatchdogHeartbeatOutput,
-            "FT_WATCHDOG_SEND_TIMEOUT_MS": 1000,
+            "FT_WATCHDOG_SEND_TIMEOUT_MS": 60_000,
             "logger": logging.getLogger(__name__),
             "sock_send": lambda socket, value, flags=0: socket.send_pyobj(value, flags),
             "zmq": SimpleNamespace(
@@ -379,6 +379,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.dpc_methods["_report_watchdog_heartbeat"](dpc)
 
         down, heartbeat = sender.sent
+        self.assertIn(("sndtimeo", 60_000), sender.options)
         self.assertEqual(down.ranks, [2])
         self.assertEqual(heartbeat.ranks, [0, 2, 3])
         self.assertEqual(heartbeat.control_endpoint, "tcp://node1:2")

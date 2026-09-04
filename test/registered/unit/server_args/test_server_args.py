@@ -1807,6 +1807,9 @@ class TestGrpcServerArgs(CustomTestCase):
 
 
 class TestFaultToleranceArgs(CustomTestCase):
+    def test_default_control_timeout_is_five_minutes(self):
+        self.assertEqual(ServerArgs(model_path="dummy").fault_tolerance_timeout, 300)
+
     def _args(self, **overrides):
         enable_dp_attention = overrides.pop("enable_dp_attention", True)
         args = SimpleNamespace(
