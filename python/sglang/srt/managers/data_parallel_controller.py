@@ -32,7 +32,6 @@ from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
-    ActiveRanksUpdateReqOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
@@ -40,6 +39,7 @@ from sglang.srt.managers.io_struct import (
     FaultToleranceCommandReqInput,
     ProcessActiveRanksOutput,
     ProfileReq,
+    RouteUpdateAck,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
@@ -292,7 +292,7 @@ class DataParallelController:
             ]
             self._refresh_active_workers()
             if self.server_args.enable_fault_tolerance and ranks.request_id is not None:
-                ack = ActiveRanksUpdateReqOutput(request_id=ranks.request_id)
+                ack = RouteUpdateAck(request_id=ranks.request_id)
                 sock_send(self.send_to_tokenizer, ack)
             return
         if len(ranks.status) != self.max_dp_size:

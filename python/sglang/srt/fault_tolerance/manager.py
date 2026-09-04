@@ -19,12 +19,12 @@ from sglang.srt.fault_tolerance.ft_state import FaultToleranceState
 from sglang.srt.fault_tolerance.protocol import FaultToleranceApplyRequest
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
-    ActiveRanksUpdateReqOutput,
     FaultToleranceCommandReqInput,
     FaultToleranceCommandReqOutput,
     FaultToleranceDPCShutdownReqInput,
     FaultToleranceRankFaultOutput,
     ProcessActiveRanksOutput,
+    RouteUpdateAck,
     WatchdogHeartbeatOutput,
     async_sock_send,
 )
@@ -88,10 +88,7 @@ class FaultToleranceManager:
     def init_request_dispatcher(self) -> TypeBasedDispatcher:
         return TypeBasedDispatcher(
             [
-                (
-                    ActiveRanksUpdateReqOutput,
-                    self.handle_active_ranks_update_output,
-                ),
+                (RouteUpdateAck, self.handle_route_update_ack),
                 (FaultToleranceCommandReqOutput, self.handle_command_output),
                 (FaultToleranceRankFaultOutput, self.handle_rank_fault),
                 (WatchdogHeartbeatOutput, self.observe_watchdog_heartbeat),
@@ -347,9 +344,7 @@ class FaultToleranceManager:
             return
         pending.acknowledge(output.rank)
 
-    def handle_active_ranks_update_output(
-        self, output: ActiveRanksUpdateReqOutput
-    ) -> None:
+    def handle_route_update_ack(self, output: RouteUpdateAck) -> None:
         future = self._pending_active_rank_updates.get(output.request_id)
         if future is None or future.done():
             return
