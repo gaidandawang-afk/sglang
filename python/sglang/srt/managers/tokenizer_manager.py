@@ -68,7 +68,6 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
-    ActiveRanksUpdateReqOutput,
     BaseBatchReq,
     BaseReq,
     BatchEmbeddingOutput,
@@ -80,8 +79,6 @@ from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
-    FaultToleranceCommandReqOutput,
-    FaultToleranceRankFaultOutput,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -97,7 +94,6 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
-    WatchdogHeartbeatOutput,
     async_sock_recv,
     async_sock_send,
     sock_send,
@@ -495,9 +491,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             send_to_scheduler=self._async_dispatch_to_scheduler,
         )
 
-    def observe_watchdog_heartbeat(self, heartbeat: WatchdogHeartbeatOutput) -> None:
-        self.fault_tolerance.observe_watchdog_heartbeat(heartbeat)
-
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
         # Request logging
@@ -655,31 +648,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Same skip-detokenizer forwarding case as above.
             (ConfigureLoggingReq, lambda x: None),
             (ActiveRanksOutput, self.update_active_ranks),
+            (ProcessActiveRanksOutput, self.update_process_active_ranks),
             (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
         ]
-        if self.fault_tolerance is not None:
-            handlers.extend(
-                [
-                    (
-                        ActiveRanksUpdateReqOutput,
-                        self.fault_tolerance.handle_active_ranks_update_output,
-                    ),
-                    (
-                        FaultToleranceCommandReqOutput,
-                        self.fault_tolerance.handle_command_output,
-                    ),
-                    (
-                        FaultToleranceRankFaultOutput,
-                        self.fault_tolerance.handle_rank_fault,
-                    ),
-                    (ProcessActiveRanksOutput, self.update_process_active_ranks),
-                    (
-                        WatchdogHeartbeatOutput,
-                        self.observe_watchdog_heartbeat,
-                    ),
-                ]
-            )
         self._result_dispatcher = TypeBasedDispatcher(handlers)
+        if self.fault_tolerance is not None:
+            self._result_dispatcher += self.fault_tolerance.init_request_dispatcher()
         self.init_communicators(self.server_args)
 
         self.sampling_params_class = SamplingParams
@@ -2975,9 +2949,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return responses[0]
 
     def update_process_active_ranks(self, ranks: ProcessActiveRanksOutput):
-        active_ranks = self.fault_tolerance.observe_process_active_ranks(ranks)
-        if active_ranks is not None:
-            self._dispatch_to_scheduler(active_ranks)
+        if self.fault_tolerance is not None:
+            active_ranks = self.fault_tolerance.observe_process_active_ranks(ranks)
+            if active_ranks is not None:
+                self._dispatch_to_scheduler(active_ranks)
 
     def _handle_open_session_req_output(self, recv_obj):
         future = self.session_futures.get(recv_obj.session_id)

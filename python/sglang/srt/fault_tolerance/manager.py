@@ -30,7 +30,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket
-from sglang.utils import get_exception_traceback
+from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +84,19 @@ class FaultToleranceManager:
             )
         self.event_loop = loop
         self.asyncio_tasks = set()
+
+    def init_request_dispatcher(self) -> TypeBasedDispatcher:
+        return TypeBasedDispatcher(
+            [
+                (
+                    ActiveRanksUpdateReqOutput,
+                    self.handle_active_ranks_update_output,
+                ),
+                (FaultToleranceCommandReqOutput, self.handle_command_output),
+                (FaultToleranceRankFaultOutput, self.handle_rank_fault),
+                (WatchdogHeartbeatOutput, self.observe_watchdog_heartbeat),
+            ]
+        )
 
     def status(self) -> tuple[int, dict]:
         body = self.state.status_response()
