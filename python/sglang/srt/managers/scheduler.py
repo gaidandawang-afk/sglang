@@ -4488,21 +4488,14 @@ class Scheduler(
             return None
 
         if recv_req.command == FT_OPERATION_RETRY:
-            from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
-
-            state = ElasticEPStateManager.instance()
-            state.active_ranks.copy_(state.last_active_ranks)
-            state.active_ranks_cpu.copy_(state.last_active_ranks.detach().cpu())
+            active_mask = None
         elif recv_req.command == FT_OPERATION_SCALE_DOWN:
-            self.tp_worker.model_runner.apply_fault_tolerance_scale_down(
-                recv_req.active_mask
-            )
+            active_mask = recv_req.active_mask
         else:
-            logger.warning(
-                "FT scheduler received unknown command: %s", recv_req.command
-            )
+            logger.warning("FT unknown command: %s", recv_req.command)
             return None
 
+        self.tp_worker.model_runner.update_fault_tolerance_active_ranks(active_mask)
         self._engine_paused = False
         self._ft_pause_deadline = None
 

@@ -1905,19 +1905,24 @@ class ModelRunner:
             )
         return output
 
-    def apply_fault_tolerance_scale_down(self, active_mask: list[bool]) -> None:
+    def update_fault_tolerance_active_ranks(
+        self, active_mask: Optional[list[bool]] = None
+    ) -> None:
+        """Restore the last rank mask, or apply a new one and rebalance."""
         state = ElasticEPStateManager.instance()
-        mask = torch.as_tensor(
-            active_mask,
+        _mask = state.last_active_ranks if active_mask is None else active_mask
+        active_ranks = torch.as_tensor(
+            _mask,
             dtype=state.active_ranks.dtype,
             device=state.active_ranks.device,
         )
-        state.active_ranks.copy_(mask)
-        state.active_ranks_cpu.copy_(mask.detach().cpu())
-        maybe_rebalance_after_rank_fault(
-            eplb_manager=self.eplb_manager,
-            force=True,
-        )
+        state.active_ranks.copy_(active_ranks)
+        state.active_ranks_cpu.copy_(active_ranks.detach().cpu())
+        if active_mask is not None:
+            maybe_rebalance_after_rank_fault(
+                eplb_manager=self.eplb_manager,
+                force=True,
+            )
 
     def update_model_fields(
         self,

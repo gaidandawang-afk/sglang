@@ -1,14 +1,13 @@
 import ast
 import logging
-import sys
 import threading
 import unittest
 from collections import deque
 from http import HTTPStatus
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Optional, Tuple
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -57,6 +56,8 @@ class FinishAbort:
 class FakeTensor:
     def __init__(self, value):
         self.value = list(value)
+        self.dtype = "dtype"
+        self.device = "device"
 
     def copy_(self, other):
         self.value = list(other.value)
@@ -179,6 +180,29 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         cls.discard = staticmethod(scheduler["_ft_discard_inflight_window"])
         cls.process_overlap = staticmethod(scheduler["_process_next_overlap_result"])
 
+        cls.elastic_ep_state = None
+        cls.rebalance = Mock()
+        model_runner = load_class_methods(
+            REPO_ROOT / "python/sglang/srt/model_executor/model_runner.py",
+            "ModelRunner",
+            {"update_fault_tolerance_active_ranks"},
+            {
+                "ElasticEPStateManager": SimpleNamespace(
+                    instance=lambda: cls.elastic_ep_state
+                ),
+                "Optional": Optional,
+                "maybe_rebalance_after_rank_fault": cls.rebalance,
+                "torch": SimpleNamespace(
+                    as_tensor=lambda value, **_: (
+                        value if isinstance(value, FakeTensor) else FakeTensor(value)
+                    )
+                ),
+            },
+        )
+        cls.update_active_ranks = staticmethod(
+            model_runner["update_fault_tolerance_active_ranks"]
+        )
+
         cls.ft_watchdog_globals = {
             "FaultToleranceDPCShutdownReqInput": FaultToleranceDPCShutdownReqInput,
             "ProcessActiveRanksOutput": ProcessActiveRanksOutput,
@@ -220,7 +244,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         cls.ft_watchdog_methods = ft_watchdog
 
     def make_scheduler(self, *, leader=True):
-        model_runner = SimpleNamespace(apply_fault_tolerance_scale_down=Mock())
+        model_runner = SimpleNamespace(update_fault_tolerance_active_ranks=Mock())
         return SimpleNamespace(
             ps=SimpleNamespace(
                 dp_rank=1,
@@ -233,30 +257,53 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         )
 
     def test_retry_restores_last_mask_without_replacing_tensors(self):
-        state = SimpleNamespace(
+        self.elastic_ep_state = SimpleNamespace(
             active_ranks=FakeTensor([1, 0]),
             active_ranks_cpu=FakeTensor([1, 0]),
             last_active_ranks=FakeTensor([1, 1]),
         )
-        manager = SimpleNamespace(instance=lambda: state)
-        module = ModuleType("sglang.srt.elastic_ep.elastic_ep")
-        module.ElasticEPStateManager = manager
-        modules = {
-            "sglang": ModuleType("sglang"),
-            "sglang.srt": ModuleType("sglang.srt"),
-            "sglang.srt.elastic_ep": ModuleType("sglang.srt.elastic_ep"),
-            "sglang.srt.elastic_ep.elastic_ep": module,
-        }
+        self.__class__.elastic_ep_state = self.elastic_ep_state
+        self.rebalance.reset_mock()
+        runner = SimpleNamespace(eplb_manager=object())
+        active_ranks = self.elastic_ep_state.active_ranks
+        active_ranks_cpu = self.elastic_ep_state.active_ranks_cpu
+
+        self.update_active_ranks(runner)
+
+        self.assertIs(self.elastic_ep_state.active_ranks, active_ranks)
+        self.assertIs(self.elastic_ep_state.active_ranks_cpu, active_ranks_cpu)
+        self.assertEqual(active_ranks.value, [1, 1])
+        self.assertEqual(active_ranks_cpu.value, [1, 1])
+        self.rebalance.assert_not_called()
+
+    def test_new_mask_updates_ranks_and_rebalances(self):
+        self.__class__.elastic_ep_state = SimpleNamespace(
+            active_ranks=FakeTensor([1, 1]),
+            active_ranks_cpu=FakeTensor([1, 1]),
+            last_active_ranks=FakeTensor([1, 1]),
+        )
+        self.rebalance.reset_mock()
+        runner = SimpleNamespace(eplb_manager=object())
+
+        self.update_active_ranks(runner, [True, False])
+
+        self.assertEqual(self.elastic_ep_state.active_ranks.value, [True, False])
+        self.assertEqual(self.elastic_ep_state.active_ranks_cpu.value, [True, False])
+        self.rebalance.assert_called_once_with(
+            eplb_manager=runner.eplb_manager, force=True
+        )
+
+    def test_retry_command_updates_mask_and_unpauses(self):
         scheduler = self.make_scheduler()
         request = FaultToleranceCommandReqInput(
             request_id="r", command="retry", target_ranks=[1], active_mask=None
         )
 
-        with patch.dict(sys.modules, modules):
-            output = self.handle_command(scheduler, request)
+        output = self.handle_command(scheduler, request)
 
-        self.assertEqual(state.active_ranks.value, [1, 1])
-        self.assertEqual(state.active_ranks_cpu.value, [1, 1])
+        scheduler.tp_worker.model_runner.update_fault_tolerance_active_ranks.assert_called_once_with(
+            None
+        )
         self.assertFalse(scheduler._engine_paused)
         self.assertIsNone(scheduler._ft_pause_deadline)
         self.assertEqual((output.request_id, output.rank), ("r", 1))
@@ -272,10 +319,10 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         output = self.handle_command(scheduler, request)
 
-        apply_scale_down = (
-            scheduler.tp_worker.model_runner.apply_fault_tolerance_scale_down
+        update_active_ranks = (
+            scheduler.tp_worker.model_runner.update_fault_tolerance_active_ranks
         )
-        apply_scale_down.assert_called_once_with([True, False])
+        update_active_ranks.assert_called_once_with([True, False])
         self.assertEqual((output.request_id, output.rank), ("s", 1))
         self.assertFalse(scheduler._engine_paused)
 
@@ -288,10 +335,10 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             active_mask=[True, False],
         )
         self.assertIsNone(self.handle_command(scheduler, request))
-        apply_scale_down = (
-            scheduler.tp_worker.model_runner.apply_fault_tolerance_scale_down
+        update_active_ranks = (
+            scheduler.tp_worker.model_runner.update_fault_tolerance_active_ranks
         )
-        apply_scale_down.assert_called_once()
+        update_active_ranks.assert_called_once()
 
     def test_exception_self_pause_starts_deadline_before_reporting(self):
         events = []
