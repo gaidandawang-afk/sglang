@@ -8,6 +8,9 @@ import time
 import uuid
 from typing import Dict, List, Optional, Tuple
 
+import zmq
+import zmq.asyncio
+
 from sglang.srt.fault_tolerance.constants import (
     FT_OPERATION_RETRY,
     FT_OPERATION_SCALE_DOWN,
@@ -23,8 +26,10 @@ from sglang.srt.managers.io_struct import (
     FaultToleranceRankFaultOutput,
     ProcessActiveRanksOutput,
     WatchdogHeartbeatOutput,
+    async_sock_send,
 )
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.network import get_zmq_socket
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -48,10 +53,12 @@ class PendingFTCommand:
 
 
 class FaultToleranceManager:
-    def __init__(self, *, server_args, send_to_scheduler, send_to_dpc):
+    def __init__(self, *, server_args, zmq_context, send_to_scheduler):
         self.server_args = server_args
+        self._zmq_context = zmq_context
         self.send_to_scheduler = send_to_scheduler
-        self.send_to_dpc = send_to_dpc
+        self.send_to_watchdog: Dict[int, zmq.asyncio.Socket] = {}
+        self._watchdog_endpoints: Dict[int, str] = {}
         self.state = FaultToleranceState(
             dp_size=server_args.dp_size,
             strategy=server_args.fault_tolerance_on_error_strategy,
@@ -268,6 +275,26 @@ class FaultToleranceManager:
                 self._watchdog_lease_sweep_loop()
             )
 
+        endpoint = heartbeat.control_endpoint
+        if (
+            not endpoint
+            or self._watchdog_endpoints.get(heartbeat.node_rank) == endpoint
+        ):
+            return
+
+        new = get_zmq_socket(self._zmq_context, zmq.PUSH, endpoint, False)
+        old = self.send_to_watchdog.get(heartbeat.node_rank)
+        self.send_to_watchdog[heartbeat.node_rank] = new
+        self._watchdog_endpoints[heartbeat.node_rank] = endpoint
+        if old is not None:
+            old.close(linger=0)
+
+    async def _send_watchdog_command(
+        self, nodes: List[int], request: FaultToleranceDPCShutdownReqInput
+    ) -> None:
+        for node in nodes:
+            await async_sock_send(self.send_to_watchdog[node], request)
+
     async def _watchdog_lease_sweep_loop(self) -> None:
         try:
             while self._watchdog_leases:
@@ -409,7 +436,7 @@ class FaultToleranceManager:
         future = self.event_loop.create_future()
         self._shutdown_waiter = (targets, future)
         try:
-            await self.send_to_dpc(
+            await self._send_watchdog_command(
                 nodes,
                 FaultToleranceDPCShutdownReqInput(
                     target_dp_ranks=sorted(target_dp_ranks)

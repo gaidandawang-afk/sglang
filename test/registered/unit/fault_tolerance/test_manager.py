@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from contextlib import suppress
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from sglang.srt.fault_tolerance.manager import (
     WATCHDOG_LEASE_TIMEOUT_SEC,
@@ -33,9 +33,10 @@ def make_manager(*, dp_size=2, ranks_per_dp=1, strategy="pause"):
             fault_tolerance_on_error_strategy=strategy,
             fault_tolerance_timeout=1,
         ),
+        zmq_context=Mock(),
         send_to_scheduler=AsyncMock(),
-        send_to_dpc=AsyncMock(),
     )
+    manager._send_watchdog_command = AsyncMock()
     manager.bind_event_loop(asyncio.get_running_loop())
     return manager
 
@@ -376,7 +377,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(update.status, [True, True])
         self.assertFalse(manager.state.ft_operation_in_progress)
         manager.send_to_scheduler.assert_not_awaited()
-        manager.send_to_dpc.assert_not_awaited()
+        manager._send_watchdog_command.assert_not_awaited()
 
     async def test_continue_route_intersects_runtime_process_and_expected(self):
         manager = make_manager(dp_size=2, ranks_per_dp=2, strategy="continue")
@@ -413,7 +414,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
     async def test_watchdog_lease_expiry_marks_global_processes_down(self):
         manager = make_manager(dp_size=2, ranks_per_dp=2, strategy="continue")
         manager.observe_watchdog_heartbeat(
-            WatchdogHeartbeatOutput(node_rank=1, ranks=[2, 3])
+            WatchdogHeartbeatOutput(node_rank=1, ranks=[2, 3], control_endpoint=None)
         )
         last_seen, ranks = manager._watchdog_leases[1]
 
@@ -429,6 +430,41 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         manager.send_to_scheduler.assert_awaited_once()
         await self._stop_watchdog(manager)
 
+    async def test_watchdog_endpoint_replaces_control_socket(self):
+        manager = make_manager()
+        old, new = Mock(), Mock()
+        with patch(
+            "sglang.srt.fault_tolerance.manager.get_zmq_socket",
+            side_effect=[old, new],
+        ) as create_socket:
+            manager.observe_watchdog_heartbeat(
+                WatchdogHeartbeatOutput(
+                    node_rank=1,
+                    ranks=[1],
+                    control_endpoint="tcp://node1:1",
+                )
+            )
+            manager.observe_watchdog_heartbeat(
+                WatchdogHeartbeatOutput(
+                    node_rank=1,
+                    ranks=[1],
+                    control_endpoint="tcp://node1:1",
+                )
+            )
+            manager.observe_watchdog_heartbeat(
+                WatchdogHeartbeatOutput(
+                    node_rank=1,
+                    ranks=[1],
+                    control_endpoint="tcp://node1:2",
+                )
+            )
+
+        self.assertEqual(create_socket.call_count, 2)
+        self.assertIs(manager.send_to_watchdog[1], new)
+        self.assertEqual(manager._watchdog_endpoints[1], "tcp://node1:2")
+        old.close.assert_called_once_with(linger=0)
+        await self._stop_watchdog(manager)
+
     async def test_shutdown_completion_comes_from_process_down_events(self):
         manager = make_manager(dp_size=2, ranks_per_dp=2)
         manager._watchdog_leases = {
@@ -438,8 +474,8 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
 
         task = asyncio.create_task(manager._shutdown_dp_processes({1}, 1))
         await asyncio.sleep(0)
-        manager.send_to_dpc.assert_awaited_once()
-        nodes, request = manager.send_to_dpc.await_args.args
+        manager._send_watchdog_command.assert_awaited_once()
+        nodes, request = manager._send_watchdog_command.await_args.args
         self.assertEqual(nodes, [1])
         self.assertEqual(request.target_dp_ranks, [1])
 
