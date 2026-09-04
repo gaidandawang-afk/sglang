@@ -275,9 +275,6 @@ class DataParallelController:
                 sock_send(worker, obj)
 
     def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
-        # FT commands are DP-scoped. Each target socket belongs to that DP's
-        # attention leader. Do not gate command delivery on route status because
-        # recovery may need to resume a DP while its route is still inactive.
         for rank in obj.target_ranks:
             worker = self.workers[rank]
             if worker is None:
