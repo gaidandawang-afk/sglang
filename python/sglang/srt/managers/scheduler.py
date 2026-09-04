@@ -2952,10 +2952,6 @@ class Scheduler(
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
             new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
-            if self._engine_paused:
-                return NextBatchPlan(
-                    batch_to_run=new_batch, running_batch=running_batch
-                )
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
