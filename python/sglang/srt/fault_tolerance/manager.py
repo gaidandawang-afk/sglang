@@ -24,7 +24,7 @@ from sglang.srt.managers.io_struct import (
     FaultToleranceDPCShutdownReqInput,
     FaultToleranceRankFaultOutput,
     ProcessActiveRanksOutput,
-    RouteUpdateAck,
+    RouteUpdateAckOutput,
     WatchdogHeartbeatOutput,
     async_sock_send,
 )
@@ -88,7 +88,7 @@ class FaultToleranceManager:
     def init_request_dispatcher(self) -> TypeBasedDispatcher:
         return TypeBasedDispatcher(
             [
-                (RouteUpdateAck, self.handle_route_update_ack),
+                (RouteUpdateAckOutput, self.handle_route_update_ack),
                 (FaultToleranceCommandReqOutput, self.handle_command_output),
                 (FaultToleranceRankFaultOutput, self.handle_rank_fault),
                 (WatchdogHeartbeatOutput, self.observe_watchdog_heartbeat),
@@ -344,7 +344,7 @@ class FaultToleranceManager:
             return
         pending.acknowledge(output.rank)
 
-    def handle_route_update_ack(self, output: RouteUpdateAck) -> None:
+    def handle_route_update_ack(self, output: RouteUpdateAckOutput) -> None:
         future = self._pending_active_rank_updates.get(output.request_id)
         if future is None or future.done():
             return

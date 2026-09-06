@@ -1842,7 +1842,7 @@ class FaultToleranceDPCShutdownReqInput(BaseReq, kw_only=True):
     target_dp_ranks: List[int]
 
 
-class RouteUpdateAck(BaseReq, kw_only=True):
+class RouteUpdateAckOutput(BaseReq, kw_only=True):
     request_id: str
 
 

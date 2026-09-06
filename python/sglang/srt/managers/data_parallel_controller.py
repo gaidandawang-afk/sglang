@@ -39,7 +39,7 @@ from sglang.srt.managers.io_struct import (
     FaultToleranceCommandReqInput,
     ProcessActiveRanksOutput,
     ProfileReq,
-    RouteUpdateAck,
+    RouteUpdateAckOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
@@ -292,7 +292,7 @@ class DataParallelController:
             ]
             self._refresh_active_workers()
             if self.server_args.enable_fault_tolerance and ranks.request_id is not None:
-                ack = RouteUpdateAck(request_id=ranks.request_id)
+                ack = RouteUpdateAckOutput(request_id=ranks.request_id)
                 sock_send(self.send_to_tokenizer, ack)
             return
         if len(ranks.status) != self.max_dp_size:
