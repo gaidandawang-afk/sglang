@@ -27,14 +27,19 @@ import setproctitle
 import zmq
 
 from sglang.srt.environ import envs
+from sglang.srt.fault_tolerance.dpc_watchdog import DPCFaultToleranceWatchdog
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
     ElasticScaleUpdateReq,
+    FaultToleranceCommandReqInput,
+    ProcessActiveRanksOutput,
     ProfileReq,
+    RouteUpdateAckOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
@@ -150,6 +155,11 @@ class DataParallelController:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
+        self.send_to_tokenizer = None
+        if server_args.enable_fault_tolerance:
+            self.send_to_tokenizer = get_zmq_socket(
+                self.context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+            )
 
         # Dispatch method
         self.round_robin_counter = 0
@@ -189,6 +199,8 @@ class DataParallelController:
 
         # Launch data parallel workers
         self.scheduler_procs = []
+        self.scheduler_process_dp_ranks: List[int] = []
+        self.scheduler_process_global_ranks: List[int] = []
         self.workers: List[Optional[zmq.Socket]] = [None] * self.max_dp_size
         self.status: List[bool] = list(self.dp_active)
         self._active_workers: List[int] = list(range(self.launch_dp_size))
@@ -206,6 +218,21 @@ class DataParallelController:
         else:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
+
+        self._scheduler_watchdog = None
+        if server_args.enable_fault_tolerance and self.scheduler_procs:
+            self._scheduler_watchdog = DPCFaultToleranceWatchdog(
+                context=self.context,
+                tokenizer_endpoint=port_args.tokenizer_ipc_name,
+                node_rank=server_args.node_rank,
+                processes=self.scheduler_procs,
+                process_dp_ranks=self.scheduler_process_dp_ranks,
+                process_global_ranks=self.scheduler_process_global_ranks,
+            )
+            self._scheduler_watchdog.start()
+            sock_send(self.send_to_tokenizer, self._scheduler_watchdog.heartbeat())
+            if server_args.ep_join_mode == "recover":
+                self._report_process_active_ranks(active=True)
 
         self.init_dispatcher()
 
@@ -230,6 +257,25 @@ class DataParallelController:
             if worker is not None:
                 sock_send(worker, obj)
 
+    def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
+        for rank in obj.target_ranks:
+            worker = self.workers[rank]
+            if worker is None:
+                raise ValueError(f"DP rank {rank} has no scheduler socket")
+            sock_send(worker, obj)
+
+    def _report_process_active_ranks(self, *, active: bool) -> None:
+        sock_send(
+            self.send_to_tokenizer,
+            ProcessActiveRanksOutput(
+                ranks=sorted(self.scheduler_process_global_ranks),
+                active=active,
+            ),
+        )
+
+    def handle_load_update_req(self, obj):
+        self.dp_budget.update_budget(obj)
+
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         if self.server_args.elastic_ep_backend is not None:
             if len(ranks.status) != self.max_dp_size:
@@ -245,6 +291,9 @@ class DataParallelController:
                 for i in range(self.max_dp_size)
             ]
             self._refresh_active_workers()
+            if self.server_args.enable_fault_tolerance and ranks.request_id is not None:
+                ack = RouteUpdateAckOutput(request_id=ranks.request_id)
+                sock_send(self.send_to_tokenizer, ack)
             return
         if len(ranks.status) != self.max_dp_size:
             logger.warning(
@@ -323,7 +372,10 @@ class DataParallelController:
 
         time_stats.set_dp_dispatch_time()
         req.time_stats = wrap_as_pickle(time_stats)
-        self.dispatching(req)
+        if self.server_args.enable_fault_tolerance and not self._active_workers:
+            self._reject_req(req, "no active DP rank")
+        else:
+            self.dispatching(req)
         req.time_stats = time_stats
         req.time_stats.set_dp_dispatch_finish_time()
 
@@ -355,6 +407,7 @@ class DataParallelController:
                         msg.slot_offset, msg.slot_count
                     ),
                 ),
+                (FaultToleranceCommandReqInput, self.send_fault_tolerance_command),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -722,6 +775,16 @@ class DataParallelController:
                     ):
                         proc.start()
                 self.scheduler_procs.append(proc)
+                if server_args.enable_fault_tolerance:
+                    self.scheduler_process_dp_ranks.append(dp_rank)
+                    rank_offset = (
+                        server_args.ep_join_rank_offset
+                        if server_args.is_ep_scale_joiner
+                        else 0
+                    )
+                    self.scheduler_process_global_ranks.append(
+                        rank_offset + server_args.tp_size * pp_rank + tp_rank
+                    )
                 scheduler_pipe_readers.append(reader)
 
         # Wait for model to finish loading
@@ -741,11 +804,22 @@ class DataParallelController:
                 or rank not in self._active_workers
                 or self.workers[rank] is None
             ):
+                if self.server_args.enable_fault_tolerance:
+                    self._reject_req(req, f"routed_dp_rank={rank} is inactive")
+                    return True
                 raise ValueError(f"DP rank {rank} is not active.")
             logger.debug(f"Direct routing to DP rank {rank}")
             sock_send(self.workers[rank], req)
             return True
         return False
+
+    def _reject_req(self, req: Req, message: str):
+        logger.warning("Rejecting DP request %s: %s", getattr(req, "rid", ""), message)
+        if self.send_to_tokenizer is not None:
+            sock_send(
+                self.send_to_tokenizer,
+                AbortReq(rid=req.rid, abort_message=message)
+            )
 
     def round_robin_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
@@ -803,7 +877,6 @@ class DataParallelController:
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
-
 
 def run_data_parallel_controller_process(
     server_args: ServerArgs,

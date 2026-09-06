@@ -1028,6 +1028,26 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "auto"
+    enable_fault_tolerance: A[
+        bool,
+        "Enable the DP-only fault-tolerance control plane.",
+        NS("parallel"),
+    ] = False
+    fault_tolerance_on_error_strategy: A[
+        Literal["pause", "continue"],
+        "Fault-tolerance strategy for scheduler exceptions.",
+        NS("parallel"),
+    ] = "pause"
+    fault_tolerance_timeout: A[
+        int,
+        "Timeout in seconds for each fault-tolerance control phase.",
+        NS("parallel"),
+    ] = 60
+    fault_tolerance_pause_timeout: A[
+        float,
+        "Fail-stop timeout in seconds for an unattended fault-tolerance pause.",
+        NS("parallel"),
+    ] = 300
     attn_cp_size: A[
         int,
         Arg(
@@ -3535,6 +3555,9 @@ class ServerArgs:
         self._handle_elastic_ep()
         self._validate_experimental_sgl_marlin()
 
+        # Validate FT only after MoE and Elastic EP settings have settled.
+        self._handle_fault_tolerance()
+
         # Handle pipeline parallelism.
         self._handle_pipeline_parallelism()
 
@@ -3771,6 +3794,22 @@ class ServerArgs:
                 else "round_robin"
             )
             return
+
+    def _handle_fault_tolerance(self):
+        if not self.enable_fault_tolerance:
+            return
+        resolved = self._resolved()
+        assert self.dp_size > 1, "Fault tolerance requires --dp-size greater than 1."
+        assert (
+            resolved.enable_dp_attention
+        ), "Fault tolerance requires --enable-dp-attention."
+        assert (
+            self.disaggregation_mode == "null"
+        ), "Fault tolerance does not support disaggregation."
+        assert self.fault_tolerance_on_error_strategy in ("pause", "continue")
+        assert (
+            self.fault_tolerance_timeout > 0 and self.fault_tolerance_pause_timeout > 0
+        )
 
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""

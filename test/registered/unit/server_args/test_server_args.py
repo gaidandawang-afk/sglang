@@ -730,6 +730,38 @@ class TestPortArgs(unittest.TestCase):
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
         self.assertIsInstance(port_args.nccl_port, int)
 
+    @patch("sglang.srt.server_args.wait_port_available")
+    def test_recovery_joiner_reports_to_primary_tokenizer(self, _mock_wait_port):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.port = 30000
+        server_args.nccl_port = 25010
+        server_args.enable_dp_attention = True
+        server_args.nnodes = 4
+        server_args.node_rank = 3
+        server_args.dist_init_addr = "192.168.1.1:25000"
+        server_args.ep_join_mode = "recover"
+
+        port_args = PortArgs.init_new(server_args)
+
+        self.assertEqual(port_args.tokenizer_ipc_name, "tcp://192.168.1.1:25001")
+        self.assertEqual(port_args.detokenizer_ipc_name, "tcp://192.168.1.1:30234")
+
+    @patch("sglang.srt.server_args.wait_port_available")
+    def test_scale_joiner_keeps_private_tokenizer_port(self, _mock_wait_port):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.port = 30000
+        server_args.nccl_port = 25010
+        server_args.enable_dp_attention = True
+        server_args.nnodes = 4
+        server_args.node_rank = 3
+        server_args.dist_init_addr = "192.168.1.1:25000"
+        server_args.ep_join_mode = "scale"
+
+        port_args = PortArgs.init_new(server_args)
+
+        self.assertEqual(port_args.tokenizer_ipc_name, "tcp://192.168.1.1:30233")
+        self.assertEqual(port_args.detokenizer_ipc_name, "tcp://192.168.1.1:30234")
+
     def test_init_new_with_malformed_ipv4_address(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
@@ -1772,6 +1804,53 @@ class TestGrpcServerArgs(CustomTestCase):
             set(kwargs), {"host", "port", "runtime_handle", "worker_threads"}
         )
         self.assertNotIn("max_prefill_tokens", kwargs)
+
+
+class TestFaultToleranceArgs(CustomTestCase):
+    def test_default_control_timeout_is_one_minute(self):
+        self.assertEqual(ServerArgs(model_path="dummy").fault_tolerance_timeout, 60)
+
+    def _args(self, **overrides):
+        enable_dp_attention = overrides.pop("enable_dp_attention", True)
+        args = SimpleNamespace(
+            enable_fault_tolerance=True,
+            dp_size=2,
+            disaggregation_mode="null",
+            fault_tolerance_on_error_strategy="pause",
+            fault_tolerance_timeout=60,
+            fault_tolerance_pause_timeout=300,
+            _resolved=lambda: SimpleNamespace(enable_dp_attention=enable_dp_attention),
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_required_external_args(self):
+        invalid = [
+            {"dp_size": 1},
+            {"enable_dp_attention": False},
+            {"disaggregation_mode": "decode"},
+        ]
+        for overrides in invalid:
+            with self.subTest(overrides=overrides), self.assertRaises(AssertionError):
+                ServerArgs._handle_fault_tolerance(self._args(**overrides))
+
+    def test_new_timeouts_must_be_positive(self):
+        for field in ("fault_tolerance_timeout", "fault_tolerance_pause_timeout"):
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                ServerArgs._handle_fault_tolerance(self._args(**{field: 0}))
+
+    def test_unrelated_compatibility_fields_are_not_checked(self):
+        args = self._args()
+        args.enable_eplb = False
+        args.elastic_ep_backend = None
+        args.ep_join_mode = "scale"
+        args.max_ep_size = 8
+        args.pp_size = 2
+        args.device = "npu"
+        args.tokenizer_worker_num = 2
+        args.use_ray = True
+        ServerArgs._handle_fault_tolerance(args)
 
 
 class TestTwoBatchOverlapBackend(CustomTestCase):

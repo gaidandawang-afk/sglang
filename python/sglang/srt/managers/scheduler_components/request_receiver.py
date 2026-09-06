@@ -170,6 +170,7 @@ class SchedulerRequestReceiver:
             _local_ctrl = (
                 self.server_args.enable_dp_attention_local_control_broadcast
                 or self.server_args.is_ep_scale_joiner
+                or self.server_args.enable_fault_tolerance
             )
             if _local_ctrl:
                 if self.ps.attn_tp_size != 1:

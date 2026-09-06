@@ -1,7 +1,9 @@
 import copy
 import unittest
 
-from sglang.srt.managers.io_struct import GenerateReqInput
+import msgspec
+
+from sglang.srt.managers.io_struct import GenerateReqInput, RouteUpdateAckOutput
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -16,6 +18,15 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+
+
+class TestRouteUpdateAckOutput(unittest.TestCase):
+    def test_request_id_survives_ipc_round_trip(self):
+        ack = RouteUpdateAckOutput(request_id="retry-route-1")
+        decoded = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(ack), type=RouteUpdateAckOutput
+        )
+        self.assertEqual(decoded.request_id, "retry-route-1")
 
 
 class TestGenerateReqInputNormalization(CustomTestCase):
