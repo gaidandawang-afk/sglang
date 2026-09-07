@@ -1651,7 +1651,7 @@ async def continue_generation(
     )
 
 
-@app.get("/v1/fault_tolerance/status")
+@app.get("/fault_tolerance/status")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def fault_tolerance_status(request: Request):
     status_code, body = _global_state.tokenizer_manager.fault_tolerance_status()
@@ -1674,7 +1674,7 @@ def _fault_tolerance_error_response(status_code: int, message: str):
     )
 
 
-@app.post("/v1/fault_tolerance/apply")
+@app.post("/fault_tolerance/apply")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def fault_tolerance_apply(request: Request):
     content_type = request.headers.get("content-type", "").lower()

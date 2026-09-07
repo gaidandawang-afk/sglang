@@ -238,7 +238,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
             response,
             {
                 "message": (
-                    "Request accepted; poll /v1/fault_tolerance/status for updates."
+                    "Request accepted; poll /fault_tolerance/status for updates."
                 ),
                 "request_id": "request-1",
             },

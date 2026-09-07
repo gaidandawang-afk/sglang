@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 WATCHDOG_LEASE_SWEEP_INTERVAL_SEC = 1
 WATCHDOG_LEASE_TIMEOUT_SEC = 60
 FT_REQUEST_ACCEPTED_MESSAGE = (
-    "Request accepted; poll /v1/fault_tolerance/status for updates."
+    "Request accepted; poll /fault_tolerance/status for updates."
 )
 
 
