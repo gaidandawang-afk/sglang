@@ -1023,6 +1023,7 @@ class Scheduler(
         self.forward_sleep_time = None
         self._engine_paused = False
         self._ft_pause_deadline: Optional[float] = None
+        self._ft_result_queue: Optional[Deque] = None
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1550,7 +1551,7 @@ class Scheduler(
                 dispatch_event_loop(self)
                 return
             except Exception as exc:
-                if getattr(self, "_ft_result_queue", None) is None:
+                if self._ft_result_queue is None:
                     self._ft_result_queue = getattr(self, "result_queue", None)
                 abort_succeeded = self._ft_abort_inflight_window()
                 if self.server_args.fault_tolerance_on_error_strategy == "continue":
@@ -1577,11 +1578,8 @@ class Scheduler(
             self.last_batch,
             self.running_batch,
         ]
-        result_queue = getattr(self, "_ft_result_queue", None)
-        if result_queue is None:
-            result_queue = getattr(self, "result_queue", None)
-        if result_queue is not None:
-            window_batches.extend(batch for batch, _ in result_queue)
+        if self._ft_result_queue is not None:
+            window_batches.extend(batch for batch, _ in self._ft_result_queue)
 
         def should_discard(req):
             owns_state = req.req_pool_idx is not None or req.kv is not None
@@ -1640,14 +1638,11 @@ class Scheduler(
                 logger.exception("FT failed to discard request state")
                 success = False
 
-        result_queue = getattr(self, "_ft_result_queue", None)
-        if result_queue is None:
-            result_queue = getattr(self, "result_queue", None)
         self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
         if self.chunked_req is not None and self.chunked_req.rid in discarded_reqs:
             self.chunked_req = None
-        if result_queue is not None:
-            result_queue.clear()
+        if self._ft_result_queue is not None:
+            self._ft_result_queue.clear()
         self._ft_result_queue = None
         self.cur_batch_for_debug = None
         self.last_batch = None
