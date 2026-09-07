@@ -200,6 +200,123 @@ def npu_format_cast(
     return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
 
 
+def require_torch_npu_nz_p2p_support() -> None:
+    """Reject TorchNPU releases with the known coalesced NZ receive bug."""
+
+    import torch_npu
+    from packaging.version import InvalidVersion, Version
+
+    raw_version = getattr(torch_npu, "__version__", "")
+    try:
+        version = Version(raw_version)
+    except InvalidVersion as exc:
+        raise RuntimeError(
+            f"Cannot validate TorchNPU NZ P2P support from version {raw_version!r}"
+        ) from exc
+
+    release = version.release
+    supported = release > (2, 10, 0) or (
+        release == (2, 10, 0) and (version.post or 0) >= 2
+    )
+    if not supported:
+        raise RuntimeError(
+            "EPLB NZ P2P requires torch-npu>=2.10.0.post2; "
+            f"found {raw_version or 'unknown'}"
+        )
+
+
+def is_npu_internal_format_tensor(tensor: torch.Tensor) -> bool:
+    if tensor.device.type != "npu":
+        return False
+
+    import torch_npu
+
+    return torch_npu.get_npu_format(tensor) != int(NPUACLFormat.ACL_FORMAT_ND)
+
+
+def copy_npu_formatted_tensor_(
+    destination: torch.Tensor, source: torch.Tensor
+) -> torch.Tensor:
+    """Copy equal-layout full expert tensors into their exact storage blocks."""
+
+    if destination.device.type != "npu" or source.device.type != "npu":
+        raise ValueError("formatted NPU copy requires two NPU tensors")
+    if (
+        destination.shape != source.shape
+        or destination.dtype != source.dtype
+        or destination.device != source.device
+    ):
+        raise ValueError(
+            "formatted NPU copy requires matching tensors: "
+            f"destination={destination.shape}/{destination.dtype}/{destination.device} "
+            f"source={source.shape}/{source.dtype}/{source.device}"
+        )
+
+    import torch_npu
+
+    destination_format = torch_npu.get_npu_format(destination)
+    source_format = torch_npu.get_npu_format(source)
+    if destination_format != source_format:
+        raise ValueError(
+            "formatted NPU copy requires matching formats: "
+            f"destination={destination_format} source={source_format}"
+        )
+
+    def make_offset_zero_alias(tensor: torch.Tensor) -> torch.Tensor:
+        tensor_format = torch_npu.get_npu_format(tensor)
+        alias = torch_npu.empty_with_format(
+            tuple(tensor.shape),
+            dtype=tensor.dtype,
+            device=tensor.device,
+            acl_format=tensor_format,
+        )
+        if alias.storage_offset() != 0:
+            raise RuntimeError("failed to allocate an offset-zero NPU formatted alias")
+        if torch_npu.get_npu_format(alias) != tensor_format:
+            raise RuntimeError("NPU formatted alias did not preserve the tensor format")
+
+        torch_npu.npu_change_data_ptr(alias, tensor, int(tensor.storage_offset()))
+        if alias.storage_offset() != 0 or alias.data_ptr() != tensor.data_ptr():
+            raise RuntimeError(
+                "NPU formatted alias does not point at the requested tensor block: "
+                f"alias_offset={alias.storage_offset()} "
+                f"alias_ptr={alias.data_ptr()} tensor_ptr={tensor.data_ptr()}"
+            )
+        return alias
+
+    destination_alias = make_offset_zero_alias(destination)
+    source_alias = make_offset_zero_alias(source)
+    destination_storage_size = torch_npu.get_storage_size(destination_alias)
+    source_storage_size = torch_npu.get_storage_size(source_alias)
+    if destination_storage_size != source_storage_size:
+        raise ValueError(
+            "formatted NPU copy requires matching physical storage sizes: "
+            f"destination={destination_storage_size} source={source_storage_size}"
+        )
+
+    return torch.ops.npu.copy_memory_(destination_alias, source_alias, False)
+
+
+def copy_to_npu_formatted_tensor_(
+    destination: torch.Tensor, source: torch.Tensor
+) -> torch.Tensor:
+    """Convert an ND full expert, then write the destination's exact slot."""
+
+    if not is_npu_internal_format_tensor(destination):
+        return destination.copy_(source)
+
+    import torch_npu
+
+    formatted_source = torch_npu.empty_with_format(
+        tuple(destination.shape),
+        dtype=destination.dtype,
+        device=destination.device,
+        acl_format=torch_npu.get_npu_format(destination),
+    )
+    formatted_source.copy_(source)
+    return copy_npu_formatted_tensor_(destination, formatted_source)
+
+
 def get_indexer_weight_stream():
     global indexer_weight_stream
     if indexer_weight_stream is None:
