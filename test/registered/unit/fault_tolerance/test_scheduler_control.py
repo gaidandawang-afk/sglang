@@ -77,6 +77,8 @@ class FakeReq:
         self.origin_input_ids = origin_input_ids or []
         self.output_ids = output_ids or []
         self.kv_committed_len = committed
+        self.req_pool_idx = None
+        self.kv = None
 
     def finished(self):
         return self.finished_reason is not None
@@ -252,6 +254,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             tp_worker=SimpleNamespace(model_runner=model_runner),
             _engine_paused=True,
             _ft_pause_deadline=130.0,
+            _ft_discard_inflight_window=Mock(return_value=True),
         )
 
     def test_retry_restores_last_mask_without_replacing_tensors(self):
@@ -299,6 +302,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         output = self.handle_command(scheduler, request)
 
+        scheduler._ft_discard_inflight_window.assert_called_once_with("retry")
         scheduler.tp_worker.model_runner.update_fault_tolerance_active_ranks.assert_called_once_with(
             None
         )
@@ -320,6 +324,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         update_active_ranks = (
             scheduler.tp_worker.model_runner.update_fault_tolerance_active_ranks
         )
+        scheduler._ft_discard_inflight_window.assert_called_once_with("scale_down")
         update_active_ranks.assert_called_once_with([True, False])
         self.assertEqual((output.request_id, output.rank), ("s", 1))
         self.assertFalse(scheduler._engine_paused)
@@ -349,8 +354,9 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         self.run_ft_loop.__globals__["dispatch_event_loop"] = dispatch
         sender = SimpleNamespace(send_output=lambda *_: events.append("report"))
+        discard = Mock(return_value=True)
         scheduler = SimpleNamespace(
-            _ft_discard_inflight_window=lambda exc: True,
+            _ft_discard_inflight_window=discard,
             ipc_channels=SimpleNamespace(send_to_tokenizer=sender),
             ps=SimpleNamespace(dp_rank=0),
             server_args=SimpleNamespace(
@@ -364,6 +370,38 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             self.run_ft_loop(scheduler)
         self.assertTrue(scheduler._engine_paused)
         self.assertEqual(scheduler._ft_pause_deadline, 130.0)
+        discard.assert_not_called()
+        self.assertEqual(events, ["fault", "report"])
+
+    def test_continue_discards_immediately(self):
+        events = []
+
+        def dispatch(_):
+            if not events:
+                events.append("fault")
+                raise RuntimeError("boom")
+            raise KeyboardInterrupt()
+
+        self.run_ft_loop.__globals__["dispatch_event_loop"] = dispatch
+        sender = SimpleNamespace(send_output=lambda *_: events.append("report"))
+        discard = Mock(return_value=True)
+        scheduler = SimpleNamespace(
+            _ft_discard_inflight_window=discard,
+            ipc_channels=SimpleNamespace(send_to_tokenizer=sender),
+            ps=SimpleNamespace(dp_rank=0),
+            server_args=SimpleNamespace(
+                fault_tolerance_on_error_strategy="continue",
+                fault_tolerance_pause_timeout=30,
+            ),
+            _engine_paused=False,
+            _ft_pause_deadline=None,
+        )
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_ft_loop(scheduler)
+
+        discard.assert_called_once()
+        self.assertFalse(scheduler._engine_paused)
         self.assertEqual(events, ["fault", "report"])
 
     def test_pause_deadline_notifies_node_main_once(self):
@@ -406,6 +444,28 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertEqual(current.kv_committed_len, 11)
         self.assertEqual(scheduler.running_batch.reqs, [])
         self.assertEqual(scheduler.result_queue, deque())
+
+    def test_discard_releases_finished_request_that_still_owns_state(self):
+        owned = FakeReq("owned")
+        owned.finished_reason = object()
+        owned.req_pool_idx = 1
+        owned.kv = object()
+        released = []
+        self.discard.__globals__["release_kv_cache"] = lambda req, *args, **kwargs: (
+            released.append(req.rid)
+        )
+        scheduler = SimpleNamespace(
+            cur_batch_for_debug=FakeBatch([owned]),
+            last_batch=None,
+            result_queue=deque(),
+            running_batch=FakeBatch([]),
+            chunked_req=None,
+            tree_cache=object(),
+            ipc_channels=SimpleNamespace(send_to_tokenizer=Sender()),
+        )
+
+        self.assertTrue(self.discard(scheduler, RuntimeError("boom")))
+        self.assertEqual(released, ["owned"])
 
     def make_ft_watchdog(self):
         sender = Sender()

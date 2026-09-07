@@ -1550,10 +1550,9 @@ class Scheduler(
                 dispatch_event_loop(self)
                 return
             except Exception as exc:
-                recovered = self._ft_discard_inflight_window(exc)
                 should_continue = (
                     self.server_args.fault_tolerance_on_error_strategy == "continue"
-                    and recovered
+                    and self._ft_discard_inflight_window(exc)
                 )
                 if not should_continue:
                     self._engine_paused = True
@@ -1567,10 +1566,8 @@ class Scheduler(
                         message=str(exc),
                     )
                 )
-                if should_continue:
-                    continue
 
-    def _ft_discard_inflight_window(self, exc: Exception) -> bool:
+    def _ft_discard_inflight_window(self, reason) -> bool:
         window_batches = [
             self.cur_batch_for_debug,
             self.last_batch,
@@ -1580,14 +1577,18 @@ class Scheduler(
         if result_queue is not None:
             window_batches.extend(batch for batch, _ in result_queue)
 
+        def should_discard(req):
+            owns_state = req.req_pool_idx is not None or req.kv is not None
+            return not req.finished() or owns_state
+
         discarded_by_rid = {}
         for batch in window_batches:
             if batch is None:
                 continue
             for req in batch.reqs:
-                if not req.finished():
+                if should_discard(req):
                     discarded_by_rid.setdefault(req.rid, req)
-        if self.chunked_req is not None and not self.chunked_req.finished():
+        if self.chunked_req is not None and should_discard(self.chunked_req):
             discarded_by_rid.setdefault(self.chunked_req.rid, self.chunked_req)
 
         success = True
@@ -1605,7 +1606,7 @@ class Scheduler(
                     allow_non_spec_overallocated=True,
                 )
                 abort_reason = FINISH_ABORT(
-                    message=f"Request discarded after scheduler exception: {exc}",
+                    message=f"Request discarded during fault tolerance: {reason}",
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                     err_type="SchedulerFault",
                 )
@@ -1629,9 +1630,9 @@ class Scheduler(
         self.cur_batch_for_debug = None
         self.last_batch = None
         logger.warning(
-            "FT discarded %d in-flight request(s) after scheduler exception: %s",
+            "FT discarded %d in-flight request(s): %s",
             len(discarded_by_rid),
-            exc,
+            reason,
         )
         return success
 
@@ -4495,6 +4496,9 @@ class Scheduler(
         else:
             logger.warning("FT unknown command: %s", recv_req.command)
             return None
+
+        if not self._ft_discard_inflight_window(recv_req.command):
+            raise RuntimeError("FT failed to discard in-flight request state")
 
         self.tp_worker.model_runner.update_fault_tolerance_active_ranks(active_mask)
         self._engine_paused = False
