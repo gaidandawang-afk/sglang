@@ -1,11 +1,13 @@
 import unittest
+from collections import deque
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from sglang.srt.fault_tolerance.ft_state import FaultToleranceState
 from sglang.srt.fault_tolerance.manager import FaultToleranceManager
 from sglang.srt.fault_tolerance.protocol import parse_apply_request
 from sglang.srt.managers.io_struct import ActiveRanksOutput, ProcessActiveRanksOutput
+from sglang.srt.managers.scheduler import Scheduler
 
 
 def make_manager(*, dp_size=2, ranks_per_dp=1, strategy="pause"):
@@ -100,6 +102,68 @@ class TestFaultTolerance(unittest.IsolatedAsyncioTestCase):
         up = manager.observe_active_ranks(ActiveRanksOutput(status=[True, True]))
         self.assertEqual(up.status, [True, True])
         manager.send_to_scheduler.assert_not_awaited()
+
+    def test_abort_precedes_resource_cleanup(self):
+        req = Mock(
+            rid="request-1",
+            req_pool_idx=1,
+            kv=object(),
+            kv_committed_len=3,
+            origin_input_ids=[1, 2],
+            output_ids=[3],
+            finished_reason=None,
+        )
+        req.finished.side_effect = lambda: req.finished_reason is not None
+        batch = SimpleNamespace(reqs=[req])
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.cur_batch_for_debug = batch
+        scheduler.last_batch = batch
+        scheduler.running_batch = batch
+        scheduler.chunked_req = req
+        scheduler.result_queue = deque([(batch, object())])
+        scheduler.tree_cache = Mock()
+        scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=Mock())
+
+        with patch(
+            "sglang.srt.managers.scheduler.release_kv_cache"
+        ) as release_kv_cache:
+            self.assertTrue(scheduler._ft_abort_inflight_window())
+            release_kv_cache.assert_not_called()
+            self.assertIs(scheduler.running_batch, batch)
+            self.assertTrue(scheduler.result_queue)
+
+            self.assertTrue(scheduler._ft_discard_inflight_window())
+            release_kv_cache.assert_called_once_with(
+                req,
+                scheduler.tree_cache,
+                is_insert=False,
+                allow_non_spec_overallocated=True,
+            )
+
+        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
+        self.assertFalse(scheduler.running_batch.reqs)
+        self.assertFalse(scheduler.result_queue)
+        self.assertIsNone(scheduler.chunked_req)
+
+    def test_recovery_precedes_discard(self):
+        events = []
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.ps = SimpleNamespace(dp_rank=0, attn_tp_rank=0, attn_cp_rank=0)
+        scheduler.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                update_fault_tolerance_active_ranks=lambda _: events.append("recover")
+            )
+        )
+        scheduler._ft_discard_inflight_window = lambda: events.append("discard") or True
+        scheduler._engine_paused = True
+        scheduler._ft_pause_deadline = 1
+
+        scheduler.handle_fault_tolerance_command(
+            SimpleNamespace(command="retry", target_ranks=[0], request_id="retry-1")
+        )
+
+        self.assertEqual(events, ["recover", "discard"])
+        self.assertFalse(scheduler._engine_paused)
 
 
 if __name__ == "__main__":

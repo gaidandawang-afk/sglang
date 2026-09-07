@@ -1550,10 +1550,12 @@ class Scheduler(
                 dispatch_event_loop(self)
                 return
             except Exception as exc:
-                should_continue = (
-                    self.server_args.fault_tolerance_on_error_strategy == "continue"
-                    and self._ft_discard_inflight_window()
-                )
+                abort_succeeded = self._ft_abort_inflight_window()
+                if self.server_args.fault_tolerance_on_error_strategy == "continue":
+                    discard_succeeded = self._ft_discard_inflight_window()
+                    should_continue = abort_succeeded and discard_succeeded
+                else:
+                    should_continue = False
                 if not should_continue:
                     self._engine_paused = True
                     self._ft_pause_deadline = (
@@ -1567,7 +1569,7 @@ class Scheduler(
                     )
                 )
 
-    def _ft_discard_inflight_window(self) -> bool:
+    def _ft_inflight_reqs(self) -> Dict[str, Req]:
         window_batches = [
             self.cur_batch_for_debug,
             self.last_batch,
@@ -1590,21 +1592,12 @@ class Scheduler(
                     discarded_by_rid.setdefault(req.rid, req)
         if self.chunked_req is not None and should_discard(self.chunked_req):
             discarded_by_rid.setdefault(self.chunked_req.rid, self.chunked_req)
+        return discarded_by_rid
 
+    def _ft_abort_inflight_window(self) -> bool:
         success = True
-        for req in discarded_by_rid.values():
+        for req in self._ft_inflight_reqs().values():
             try:
-                req.kv_committed_len = min(
-                    req.kv_committed_len,
-                    len(req.origin_input_ids) + len(req.output_ids),
-                )
-                # A failed forward may leave allocated but uncommitted KV slots.
-                release_kv_cache(
-                    req,
-                    self.tree_cache,
-                    is_insert=False,
-                    allow_non_spec_overallocated=True,
-                )
                 abort_reason = FINISH_ABORT(
                     message="Request discarded during fault tolerance recovery.",
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE,
@@ -1619,17 +1612,39 @@ class Scheduler(
                     req,
                 )
             except Exception:
+                logger.exception("FT failed to abort in-flight request")
+                success = False
+        return success
+
+    def _ft_discard_inflight_window(self) -> bool:
+        discarded_reqs = self._ft_inflight_reqs()
+        success = True
+        for req in discarded_reqs.values():
+            try:
+                req.kv_committed_len = min(
+                    req.kv_committed_len,
+                    len(req.origin_input_ids) + len(req.output_ids),
+                )
+                # A failed forward may leave allocated but uncommitted KV slots.
+                release_kv_cache(
+                    req,
+                    self.tree_cache,
+                    is_insert=False,
+                    allow_non_spec_overallocated=True,
+                )
+            except Exception:
                 logger.exception("FT failed to discard request state")
                 success = False
 
+        result_queue = getattr(self, "result_queue", None)
         self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
-        if self.chunked_req is not None and self.chunked_req.rid in discarded_by_rid:
+        if self.chunked_req is not None and self.chunked_req.rid in discarded_reqs:
             self.chunked_req = None
         if result_queue is not None:
             result_queue.clear()
         self.cur_batch_for_debug = None
         self.last_batch = None
-        logger.warning("FT discarded %d in-flight request(s)", len(discarded_by_rid))
+        logger.warning("FT discarded %d in-flight request(s)", len(discarded_reqs))
         return success
 
     def _process_next_overlap_result(self) -> None:
@@ -1692,9 +1707,10 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        self.result_queue: Deque[
-            Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
-        ] = deque()
+        if not hasattr(self, "result_queue"):
+            self.result_queue: Deque[
+                Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
+            ] = deque()
 
         def pop_and_process():
             # Process the results of the last batch
@@ -4493,10 +4509,9 @@ class Scheduler(
             logger.warning("FT unknown command: %s", recv_req.command)
             return None
 
+        self.tp_worker.model_runner.update_fault_tolerance_active_ranks(active_mask)
         if not self._ft_discard_inflight_window():
             raise RuntimeError("FT failed to discard in-flight request state")
-
-        self.tp_worker.model_runner.update_fault_tolerance_active_ranks(active_mask)
         self._engine_paused = False
         self._ft_pause_deadline = None
 
