@@ -1550,6 +1550,8 @@ class Scheduler(
                 dispatch_event_loop(self)
                 return
             except Exception as exc:
+                if getattr(self, "_ft_result_queue", None) is None:
+                    self._ft_result_queue = getattr(self, "result_queue", None)
                 abort_succeeded = self._ft_abort_inflight_window()
                 if self.server_args.fault_tolerance_on_error_strategy == "continue":
                     discard_succeeded = self._ft_discard_inflight_window()
@@ -1575,7 +1577,9 @@ class Scheduler(
             self.last_batch,
             self.running_batch,
         ]
-        result_queue = getattr(self, "result_queue", None)
+        result_queue = getattr(self, "_ft_result_queue", None)
+        if result_queue is None:
+            result_queue = getattr(self, "result_queue", None)
         if result_queue is not None:
             window_batches.extend(batch for batch, _ in result_queue)
 
@@ -1636,12 +1640,15 @@ class Scheduler(
                 logger.exception("FT failed to discard request state")
                 success = False
 
-        result_queue = getattr(self, "result_queue", None)
+        result_queue = getattr(self, "_ft_result_queue", None)
+        if result_queue is None:
+            result_queue = getattr(self, "result_queue", None)
         self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
         if self.chunked_req is not None and self.chunked_req.rid in discarded_reqs:
             self.chunked_req = None
         if result_queue is not None:
             result_queue.clear()
+        self._ft_result_queue = None
         self.cur_batch_for_debug = None
         self.last_batch = None
         logger.warning("FT discarded %d in-flight request(s)", len(discarded_reqs))
@@ -1707,10 +1714,9 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        if not hasattr(self, "result_queue"):
-            self.result_queue: Deque[
-                Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
-            ] = deque()
+        self.result_queue: Deque[
+            Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
+        ] = deque()
 
         def pop_and_process():
             # Process the results of the last batch

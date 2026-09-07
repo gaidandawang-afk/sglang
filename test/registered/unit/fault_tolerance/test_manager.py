@@ -120,7 +120,9 @@ class TestFaultTolerance(unittest.IsolatedAsyncioTestCase):
         scheduler.last_batch = batch
         scheduler.running_batch = batch
         scheduler.chunked_req = req
-        scheduler.result_queue = deque([(batch, object())])
+        failed_result_queue = deque([(batch, object())])
+        scheduler._ft_result_queue = failed_result_queue
+        scheduler.result_queue = deque()
         scheduler.tree_cache = Mock()
         scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=Mock())
 
@@ -130,7 +132,7 @@ class TestFaultTolerance(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(scheduler._ft_abort_inflight_window())
             release_kv_cache.assert_not_called()
             self.assertIs(scheduler.running_batch, batch)
-            self.assertTrue(scheduler.result_queue)
+            self.assertTrue(failed_result_queue)
 
             self.assertTrue(scheduler._ft_discard_inflight_window())
             release_kv_cache.assert_called_once_with(
@@ -142,7 +144,8 @@ class TestFaultTolerance(unittest.IsolatedAsyncioTestCase):
 
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
         self.assertFalse(scheduler.running_batch.reqs)
-        self.assertFalse(scheduler.result_queue)
+        self.assertFalse(failed_result_queue)
+        self.assertIsNone(scheduler._ft_result_queue)
         self.assertIsNone(scheduler.chunked_req)
 
     def test_recovery_precedes_discard(self):
