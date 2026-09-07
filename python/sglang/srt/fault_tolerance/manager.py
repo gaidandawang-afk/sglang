@@ -98,10 +98,9 @@ class FaultToleranceManager:
     def status(self) -> tuple[int, dict]:
         body = self.state.status_response()
         if self._last_ft_request_id is not None:
-            for engine in body["engines"]:
-                engine["last_ft_request_id"] = self._last_ft_request_id
-                if self._ft_error is not None:
-                    engine["ft_error"] = self._ft_error
+            body["last_ft_request_id"] = self._last_ft_request_id
+            if self._ft_error is not None:
+                body["ft_error"] = self._ft_error
         return 200, body
 
     def submit(self, request: FaultToleranceApplyRequest) -> tuple[int, dict]:

@@ -41,6 +41,15 @@ class TestFaultTolerance(unittest.IsolatedAsyncioTestCase):
             [True, True, False, False],
         )
 
+        manager = make_manager()
+        manager._finish_submitted_apply("request-1", None)
+        status = manager.status()[1]
+        self.assertEqual(status["last_ft_request_id"], "request-1")
+        self.assertNotIn("ft_error", status)
+        self.assertNotIn("last_ft_request_id", status["engines"][0])
+        manager._finish_submitted_apply("request-2", "failed")
+        self.assertEqual(manager.status()[1]["ft_error"], "failed")
+
     async def test_retry_uses_expected_topology(self):
         manager = make_manager(dp_size=4)
         manager.state.expected_dp_mask = [True, True, False, True]
