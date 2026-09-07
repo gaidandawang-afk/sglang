@@ -362,6 +362,9 @@ class Scheduler(
         # Parse args
         self.server_args = server_args
         self.nccl_port = port_args.nccl_port
+        self.fault_tolerance_metadata_ipc_name = (
+            port_args.fault_tolerance_metadata_ipc_name
+        )
         self.schedule_policy = server_args.schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
@@ -948,6 +951,22 @@ class Scheduler(
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
+        if (
+            self.server_args.device == "npu"
+            and self.server_args.enable_fault_tolerance
+            and self.server_args.elastic_ep_backend == "mc2"
+        ):
+            from sglang.srt.fault_tolerance.npu_communication import (
+                init_npu_ft_communication,
+            )
+
+            init_npu_ft_communication(
+                self.fault_tolerance_metadata_ipc_name,
+                original_rank=self.ps.dp_rank,
+                original_world_size=self.ps.dp_size,
+                gloo_timeout_sec=self.server_args.fault_tolerance_gloo_timeout,
+                control_group=self.tp_cpu_group,
+            )
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use
@@ -4510,9 +4529,27 @@ class Scheduler(
             logger.warning("FT unknown command: %s", recv_req.command)
             return None
 
-        self.tp_worker.model_runner.update_fault_tolerance_active_ranks(active_mask)
+        model_runner = self.tp_worker.model_runner
+        recover_npu = _is_npu and self.server_args.elastic_ep_backend == "mc2"
+        if recover_npu:
+            model_runner.recover_npu_device_for_fault_tolerance()
+            if active_mask is not None:
+                model_runner.rebuild_npu_fault_tolerance_survivor_control_group(
+                    active_mask
+                )
+
+        model_runner.update_fault_tolerance_active_ranks(active_mask)
         if not self._ft_discard_inflight_window():
             raise RuntimeError("FT failed to discard in-flight request state")
+
+        if recover_npu and active_mask is not None:
+            model_runner.update_npu_fault_tolerance_mc2(active_mask)
+            self.schedule_stream.synchronize()
+            self.forward_stream.wait_stream(self.schedule_stream)
+            with self.forward_stream_ctx:
+                model_runner.run_npu_fault_tolerance_dummy_batch(active_mask)
+            model_runner.synchronize_npu_fault_tolerance_health_gate()
+
         self._engine_paused = False
         self._ft_pause_deadline = None
 

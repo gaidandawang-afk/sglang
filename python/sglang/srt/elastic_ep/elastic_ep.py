@@ -13,9 +13,10 @@ from sglang.srt.eplb.expert_location import (
     broadcast_global_expert_location_metadata_for_recovery,
 )
 from sglang.srt.managers.schedule_batch import ServerArgs
-from sglang.srt.utils import is_cpu, is_cuda
+from sglang.srt.utils import is_cpu, is_cuda, is_npu
 
 if TYPE_CHECKING:
+    from sglang.srt.elastic_ep.npu_mc2 import NpuMC2ElasticInfo
     from sglang.srt.eplb.eplb_manager import EPLBManager
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ class ElasticEPState:
     original_ep_size: int = 0
     has_scaled: bool = False
     ep_join_rank_offset: int = 0
+    npu_mc2_elastic_info: Optional["NpuMC2ElasticInfo"] = None
 
     def is_active_equal_last(self) -> bool:
         return torch.equal(self.active_ranks, self.last_active_ranks)
@@ -72,6 +74,22 @@ class ElasticEPState:
             self.active_ranks[: self.effective_ep_size] = 1
             self.snapshot_active_to_last()
             self.sync_active_to_cpu()
+
+    def init_npu_mc2_elastic_info(self, *, num_physical_experts: int) -> torch.Tensor:
+        from sglang.srt.elastic_ep.npu_mc2 import NpuMC2ElasticInfo
+
+        self.npu_mc2_elastic_info = NpuMC2ElasticInfo.create(
+            self.active_ranks_cpu,
+            original_ep_size=self.original_ep_size,
+            num_physical_experts=num_physical_experts,
+            device=self.active_ranks.device,
+        )
+        return self.npu_mc2_elastic_info.tensor
+
+    def update_npu_mc2_elastic_info(self) -> None:
+        if self.npu_mc2_elastic_info is None:
+            raise RuntimeError("NPU MC2 elastic info is not initialized")
+        self.npu_mc2_elastic_info.update(self.active_ranks_cpu)
 
 
 class ElasticEPStateManager:
@@ -139,10 +157,12 @@ class ElasticEPStateManager:
     def _select_device() -> torch.device:
         if is_cuda():
             return torch.device("cuda")
+        elif is_npu():
+            return torch.device("npu")
         elif is_cpu():
             return torch.device("cpu")
         else:
-            raise NotImplementedError("Only CUDA and CPU support elastic ep now.")
+            raise NotImplementedError("Only CUDA, NPU, and CPU support elastic ep now.")
 
     @classmethod
     def _build_state(

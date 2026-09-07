@@ -156,6 +156,20 @@ class DataParallelController:
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
         self.send_to_tokenizer = None
+        self.npu_ft_store = None
+        if (
+            server_args.device == "npu"
+            and server_args.enable_fault_tolerance
+            and server_args.elastic_ep_backend == "mc2"
+        ):
+            from sglang.srt.fault_tolerance.npu_communication import (
+                create_npu_ft_store,
+            )
+
+            endpoint = port_args.fault_tolerance_metadata_ipc_name
+            if not endpoint:
+                raise ValueError("NPU fault-tolerance metadata endpoint is missing")
+            self.npu_ft_store = create_npu_ft_store(endpoint)
         if server_args.enable_fault_tolerance:
             self.send_to_tokenizer = get_zmq_socket(
                 self.context, zmq.PUSH, port_args.tokenizer_ipc_name, False
