@@ -1552,7 +1552,7 @@ class Scheduler(
             except Exception as exc:
                 should_continue = (
                     self.server_args.fault_tolerance_on_error_strategy == "continue"
-                    and self._ft_discard_inflight_window(exc)
+                    and self._ft_discard_inflight_window()
                 )
                 if not should_continue:
                     self._engine_paused = True
@@ -1567,7 +1567,7 @@ class Scheduler(
                     )
                 )
 
-    def _ft_discard_inflight_window(self, reason) -> bool:
+    def _ft_discard_inflight_window(self) -> bool:
         window_batches = [
             self.cur_batch_for_debug,
             self.last_batch,
@@ -1606,7 +1606,7 @@ class Scheduler(
                     allow_non_spec_overallocated=True,
                 )
                 abort_reason = FINISH_ABORT(
-                    message=f"Request discarded during fault tolerance: {reason}",
+                    message="Request discarded during fault tolerance recovery.",
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                     err_type="SchedulerFault",
                 )
@@ -1629,11 +1629,7 @@ class Scheduler(
             result_queue.clear()
         self.cur_batch_for_debug = None
         self.last_batch = None
-        logger.warning(
-            "FT discarded %d in-flight request(s): %s",
-            len(discarded_by_rid),
-            reason,
-        )
+        logger.warning("FT discarded %d in-flight request(s)", len(discarded_by_rid))
         return success
 
     def _process_next_overlap_result(self) -> None:
@@ -4497,7 +4493,7 @@ class Scheduler(
             logger.warning("FT unknown command: %s", recv_req.command)
             return None
 
-        if not self._ft_discard_inflight_window(recv_req.command):
+        if not self._ft_discard_inflight_window():
             raise RuntimeError("FT failed to discard in-flight request state")
 
         self.tp_worker.model_runner.update_fault_tolerance_active_ranks(active_mask)
