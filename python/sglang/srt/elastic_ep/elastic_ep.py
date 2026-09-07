@@ -501,9 +501,13 @@ def maybe_recover_ep_ranks(
     return False
 
 
-def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
+def maybe_rebalance_after_rank_fault(
+    *, eplb_manager: EPLBManager, force: bool = False
+) -> bool:
     elastic_ep_state = ElasticEPStateManager.instance()
-    if elastic_ep_state is None or elastic_ep_state.is_active_equal_last():
+    if elastic_ep_state is None or (
+        not force and elastic_ep_state.is_active_equal_last()
+    ):
         return False
     group = get_world_group()
     if torch.distributed.get_backend(group.cpu_group) == "mooncake-cpu":
@@ -516,7 +520,7 @@ def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
     elastic_ep_state.snapshot_active_to_last()
     elastic_ep_state.sync_active_to_cpu()
     logger.info("EPLB due to rank faults")
-    gen = eplb_manager.rebalance()
+    gen = eplb_manager.rebalance(force=force)
     while True:
         try:
             next(gen)
