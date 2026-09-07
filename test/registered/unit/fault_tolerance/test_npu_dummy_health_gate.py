@@ -85,11 +85,12 @@ def test_recovery_dummy_is_one_valid_token_through_model_runner_forward():
 
 
 def test_model_runner_health_gate_delegates_dummy_and_synchronizes_device():
+    collapse_physical_rank_status = Mock(return_value=[True, False])
     dummy = load_method(
         MODEL_RUNNER_PATH,
         "ModelRunner",
         "run_npu_fault_tolerance_dummy_batch",
-        {},
+        {"collapse_physical_rank_status": collapse_physical_rank_status},
     )
     synchronize = Mock()
     health_sync = load_method(
@@ -105,11 +106,16 @@ def test_model_runner_health_gate_delegates_dummy_and_synchronizes_device():
         },
     )
     eager_runner = SimpleNamespace(run_dummy_via_model_runner=Mock())
-    model_runner = SimpleNamespace(eager_runner=eager_runner, device="npu:1")
+    model_runner = SimpleNamespace(
+        eager_runner=eager_runner,
+        device="npu:1",
+        ps=SimpleNamespace(attn_tp_size=2, attn_cp_size=1),
+    )
 
-    dummy(model_runner, [True, False])
+    dummy(model_runner, [True, True, False, False])
     health_sync(model_runner)
 
+    collapse_physical_rank_status.assert_called_once_with([True, True, False, False], 2)
     eager_runner.run_dummy_via_model_runner.assert_called_once_with(
         batch_size=1, active_mask=[True, False]
     )

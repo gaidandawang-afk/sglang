@@ -51,6 +51,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
     try_admit_scale_ranks,
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
+from sglang.srt.elastic_ep.topology import collapse_physical_rank_status
 from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
@@ -1968,7 +1969,9 @@ class ModelRunner:
     def run_npu_fault_tolerance_dummy_batch(self, active_mask: list[bool]) -> None:
         self.eager_runner.run_dummy_via_model_runner(
             batch_size=1,
-            active_mask=active_mask,
+            active_mask=collapse_physical_rank_status(
+                active_mask, self.ps.attn_tp_size * self.ps.attn_cp_size
+            ),
         )
 
     def synchronize_npu_fault_tolerance_health_gate(self) -> None:
