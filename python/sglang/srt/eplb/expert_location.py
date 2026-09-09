@@ -19,7 +19,7 @@ import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, List, Optional
+from typing import TYPE_CHECKING, Iterable, List, Optional, Sequence
 
 import torch
 import torch.distributed
@@ -215,6 +215,146 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map=logical_to_all_physical_map.to(
                 server_args.device
             ),
+        )
+
+    @staticmethod
+    def init_for_fault_recovery(
+        server_args: ServerArgs,
+        old_metadata: "ExpertLocationMetadata",
+        active_ranks: Sequence[bool] | torch.Tensor,
+        moe_ep_rank: Optional[int] = None,
+    ) -> "ExpertLocationMetadata":
+        """Build a survivor-only layout with the minimum required movement.
+
+        Existing survivor slots are preserved. A slot changes only when a
+        logical expert has no surviving replica, in which case one redundant
+        survivor slot is reassigned to that expert.
+        """
+        if isinstance(active_ranks, torch.Tensor):
+            active_rank_values = active_ranks.detach().cpu().tolist()
+        else:
+            active_rank_values = list(active_ranks)
+
+        if len(active_rank_values) != old_metadata.ep_size:
+            raise ValueError(
+                "active_ranks length must match expert metadata EP size "
+                f"({old_metadata.ep_size}), got {len(active_rank_values)}"
+            )
+
+        num_local_physical_experts = old_metadata.num_local_physical_experts
+        active_original_ranks = [
+            rank for rank, active in enumerate(active_rank_values) if active
+        ]
+        active_physical_ids_by_rank = {
+            rank: list(
+                range(
+                    rank * num_local_physical_experts,
+                    (rank + 1) * num_local_physical_experts,
+                )
+            )
+            for rank in active_original_ranks
+        }
+        active_physical_ids = [
+            physical_id
+            for rank in active_original_ranks
+            for physical_id in active_physical_ids_by_rank[rank]
+        ]
+        num_logical_experts = old_metadata.num_logical_experts
+        if len(active_physical_ids) < num_logical_experts:
+            raise RuntimeError(
+                "insufficient survivor expert slots for fault recovery: "
+                f"active_slots={len(active_physical_ids)}, "
+                f"logical_experts={num_logical_experts}"
+            )
+
+        physical_to_logical_map_cpu = old_metadata.physical_to_logical_map_cpu.clone()
+        logical_to_physical_by_layer = []
+        max_replica_count = 0
+        for layer_id in range(old_metadata.num_layers):
+            layer_map = physical_to_logical_map_cpu[layer_id]
+            replica_counts = torch.bincount(
+                layer_map[active_physical_ids].to(torch.int64),
+                minlength=num_logical_experts,
+            )
+            missing_logical_ids = torch.nonzero(
+                replica_counts == 0,
+                as_tuple=False,
+            ).flatten()
+
+            replacement_rank_cursor = 0
+            for missing_logical_id_tensor in missing_logical_ids:
+                missing_logical_id = int(missing_logical_id_tensor.item())
+                replacement_physical_id = None
+                for rank_offset in range(len(active_original_ranks)):
+                    rank_index = (replacement_rank_cursor + rank_offset) % len(
+                        active_original_ranks
+                    )
+                    candidate_rank = active_original_ranks[rank_index]
+                    replacement_physical_id = next(
+                        (
+                            physical_id
+                            for physical_id in active_physical_ids_by_rank[
+                                candidate_rank
+                            ]
+                            if replica_counts[int(layer_map[physical_id].item())] > 1
+                        ),
+                        None,
+                    )
+                    if replacement_physical_id is not None:
+                        replacement_rank_cursor = (rank_index + 1) % len(
+                            active_original_ranks
+                        )
+                        break
+
+                if replacement_physical_id is None:
+                    raise RuntimeError(
+                        "unable to reserve a survivor slot for missing logical "
+                        f"expert {missing_logical_id} in layer {layer_id}"
+                    )
+
+                replaced_logical_id = int(layer_map[replacement_physical_id].item())
+                layer_map[replacement_physical_id] = missing_logical_id
+                replica_counts[replaced_logical_id] -= 1
+                replica_counts[missing_logical_id] += 1
+
+            layer_logical_to_physical = [[] for _ in range(num_logical_experts)]
+            for physical_id in active_physical_ids:
+                logical_id = int(layer_map[physical_id].item())
+                layer_logical_to_physical[logical_id].append(physical_id)
+            max_replica_count = max(
+                max_replica_count,
+                max(len(locations) for locations in layer_logical_to_physical),
+            )
+            logical_to_physical_by_layer.append(layer_logical_to_physical)
+
+        logical_to_all_physical_map_cpu = torch.full(
+            (
+                old_metadata.num_layers,
+                num_logical_experts,
+                max_replica_count,
+            ),
+            -1,
+            dtype=physical_to_logical_map_cpu.dtype,
+        )
+        for layer_id, layer_mapping in enumerate(logical_to_physical_by_layer):
+            for logical_id, physical_ids in enumerate(layer_mapping):
+                logical_to_all_physical_map_cpu[
+                    layer_id, logical_id, : len(physical_ids)
+                ] = torch.tensor(
+                    physical_ids,
+                    dtype=logical_to_all_physical_map_cpu.dtype,
+                )
+
+        return ExpertLocationMetadata._init_raw(
+            server_args=server_args,
+            ep_size=old_metadata.ep_size,
+            physical_to_logical_map=physical_to_logical_map_cpu.to(
+                old_metadata.physical_to_logical_map.device
+            ),
+            logical_to_all_physical_map=logical_to_all_physical_map_cpu.to(
+                old_metadata.physical_to_logical_map.device
+            ),
+            moe_ep_rank=moe_ep_rank,
         )
 
     @staticmethod

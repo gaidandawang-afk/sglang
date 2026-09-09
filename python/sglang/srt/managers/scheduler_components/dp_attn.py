@@ -10,6 +10,10 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.fault_tolerance.npu_communication import (
+    all_gather_into_tensor_with_timeout,
+    get_npu_ft_communication,
+)
 from sglang.srt.layers.dp_attention import world_dp_gather_enabled
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.recv_skipper import (
@@ -139,7 +143,27 @@ class MLPSyncBatchInfo:
             self.dp_size, self.tp_size * self.cp_size, info_width
         ).contiguous()
 
-        if use_all_reduce:
+        npu_ft_comm = get_npu_ft_communication()
+        if npu_ft_comm is not None:
+            local_info_cpu = local_info_tensor.detach().cpu().contiguous()
+            active_original_ranks = npu_ft_comm.active_original_ranks
+            gathered = torch.empty(
+                len(active_original_ranks),
+                info_width,
+                dtype=local_info_cpu.dtype,
+            )
+            all_gather_into_tensor_with_timeout(
+                gathered.flatten(),
+                local_info_cpu,
+                group=npu_ft_comm.mlp_sync_group,
+                timeout_sec=5,
+            )
+            # The metadata layout is (DP, attention-CP, attention-TP), with TP
+            # as the fastest-changing dimension. Flattening the first two axes
+            # therefore maps each physical TP rank to its original global slot.
+            flat_info = global_info_tensor.view(-1, info_width)
+            flat_info[list(active_original_ranks)] = gathered.to(device=device)
+        elif use_all_reduce:
             # Admission can expose different WORLD sizes; use fixed global slots.
             global_info_tensor.zero_()
             flat_info = global_info_tensor.view(-1, info_width)

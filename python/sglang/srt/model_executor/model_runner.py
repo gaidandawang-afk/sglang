@@ -336,6 +336,16 @@ class ModelRunner:
             )
             raise
 
+        if (
+            _is_npu
+            and server_args.enable_fault_tolerance
+            and server_args.elastic_ep_backend == "mc2"
+            and server_args.fault_tolerance_communication_abort_timeout > 0
+        ):
+            torch.npu.set_op_timeout_ms(
+                server_args.fault_tolerance_communication_abort_timeout * 1000
+            )
+
         # Initialize MooncakeTransferEngine BEFORE init_torch_distributed so
         # that the shared TE can be passed to the Mooncake PG backend (avoids
         # creating duplicate TransferEngines).
@@ -660,7 +670,11 @@ class ModelRunner:
 
     def maybe_init_elastic_ep(self):
         if self.server_args.elastic_ep_backend:
-            ElasticEPStateManager.init(self.server_args)
+            state = ElasticEPStateManager.init(self.server_args)
+            if _is_npu and self.server_args.elastic_ep_backend == "mc2":
+                state.init_npu_mc2_elastic_info(
+                    num_physical_experts=get_global_expert_location_metadata().num_physical_experts
+                )
 
     def init_token_oracle(self):
         self._token_oracle_manager = install_token_oracle_from_env(
@@ -1908,8 +1922,35 @@ class ModelRunner:
             )
         return output
 
+    def recover_npu_device_for_fault_tolerance_scale_down(self) -> None:
+        import torch_npu
+
+        device_id = self.gpu_id
+        torch.npu.set_device(torch.device("npu", device_id))
+        torch_npu.npu.stop_device(device_id)
+        torch_npu.npu.restart_device(device_id)
+        torch_npu.distributed.reinit_process_group(None, False)
+        torch.npu.synchronize()
+
+    def run_npu_fault_tolerance_dummy_batch(self, active_mask: list[bool]) -> None:
+        self.eager_runner.run_dummy_via_model_runner(
+            batch_size=1,
+            active_mask=active_mask,
+        )
+
+    def synchronize_npu_fault_tolerance_health_gate(self) -> None:
+        torch.get_device_module(self.device).synchronize()
+
     def apply_fault_tolerance_scale_down(self, active_mask: list[bool]) -> None:
         state = ElasticEPStateManager.instance()
+        is_npu_ft_mc2 = _is_npu and self.server_args.elastic_ep_backend == "mc2"
+        if is_npu_ft_mc2:
+            from sglang.srt.fault_tolerance.npu_communication import (
+                get_npu_ft_communication,
+            )
+
+            get_npu_ft_communication().rebuild_survivor_groups(active_mask)
+
         mask = torch.as_tensor(
             active_mask,
             dtype=state.active_ranks.dtype,
@@ -1917,8 +1958,11 @@ class ModelRunner:
         )
         state.active_ranks.copy_(mask)
         state.active_ranks_cpu.copy_(mask.detach().cpu())
+
         for _ in self.eplb_manager.rebalance(force=True):
             pass
+        if is_npu_ft_mc2:
+            state.update_npu_mc2_elastic_info()
         state.snapshot_active_to_last()
 
     def update_model_fields(

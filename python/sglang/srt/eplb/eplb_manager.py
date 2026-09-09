@@ -101,29 +101,50 @@ class EPLBManager:
 
         logger.info("[EPLBManager] rebalance start")
 
-        enable_timing = self._rebalance_layers_per_chunk is None
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        elastic_ep_state = ElasticEPStateManager.instance()
+        recovering_from_npu_fault = (
+            self._server_args.device == "npu"
+            and self._server_args.enable_fault_tolerance
+            and self._server_args.elastic_ep_backend == "mc2"
+            and elastic_ep_state is not None
+            and elastic_ep_state.active_ranks_cpu is not None
+            and not bool(elastic_ep_state.active_ranks_cpu.all().item())
+        )
+        enable_timing = (
+            self._rebalance_layers_per_chunk is None and not recovering_from_npu_fault
+        )
 
         if enable_timing:
             torch.get_device_module().synchronize()
             time_start = time.time()
 
-        dump_record_output = get_global_expert_distribution_recorder().dump_record(
-            output_mode="object"
-        )
-        logical_count = dump_record_output["logical_count"]
-        average_utilization_rate_over_window = dump_record_output[
-            "average_utilization_rate_over_window"
-        ]
+        if recovering_from_npu_fault:
+            expert_location_metadata = ExpertLocationMetadata.init_for_fault_recovery(
+                self._server_args,
+                get_global_expert_location_metadata(),
+                elastic_ep_state.active_ranks_cpu,
+                moe_ep_rank=self._ps.tp_rank,
+            )
+        else:
+            dump_record_output = get_global_expert_distribution_recorder().dump_record(
+                output_mode="object"
+            )
+            logical_count = dump_record_output["logical_count"]
+            average_utilization_rate_over_window = dump_record_output[
+                "average_utilization_rate_over_window"
+            ]
 
-        # Check whether rebalancing is needed
-        if not force and not self._check_rebalance_needed(
-            average_utilization_rate_over_window
-        ):
-            return
+            # Check whether rebalancing is needed
+            if not force and not self._check_rebalance_needed(
+                average_utilization_rate_over_window
+            ):
+                return
 
-        expert_location_metadata = ExpertLocationMetadata.init_by_eplb(
-            self._server_args, self._model_config, logical_count
-        )
+            expert_location_metadata = ExpertLocationMetadata.init_by_eplb(
+                self._server_args, self._model_config, logical_count
+            )
 
         from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
             init_lplb_solvers,
@@ -275,15 +296,54 @@ def update_expert_location_with_recovery(
             expert_backup_client.update_weights(weight_name_filter)
         else:
             # Load the missing weights from disk
-            update_weights_from_disk_callable(
+            update_result = update_weights_from_disk_callable(
                 get_server_args().model_path,
                 get_server_args().load_format,
                 weight_name_filter=weight_name_filter,
+            )
+            _validate_missing_expert_disk_reload(
+                update_result=update_result,
+                weight_name_filter=weight_name_filter,
+                tp_rank=tp_rank,
             )
 
     # Re-init LPLB solvers after expert location update
     if ep_dispatch_algorithm == "lp":
         init_lplb_solvers_callable()
+
+
+def _validate_missing_expert_disk_reload(
+    *,
+    update_result,
+    weight_name_filter,
+    tp_rank: int,
+) -> None:
+    if isinstance(update_result, tuple) and not update_result[0]:
+        raise RuntimeError(
+            f"EPLB failed to reload missing experts from disk: {update_result[1]}"
+        )
+
+    reload_stats = getattr(weight_name_filter, "_sglang_eplb_reload_stats", None)
+    if reload_stats is None:
+        return
+
+    expected_pairs = reload_stats["expected_pairs"]
+    selected_pairs = reload_stats["selected_pairs"]
+    unmatched_pairs = sorted(expected_pairs - selected_pairs)
+    logger.info(
+        "[EPLB] missing-expert checkpoint coverage: rank=%d "
+        "expected_pairs=%d selected_pairs=%d selected_tensors=%d",
+        tp_rank,
+        len(expected_pairs),
+        len(selected_pairs),
+        reload_stats["selected_weight_names"],
+    )
+    if unmatched_pairs:
+        raise RuntimeError(
+            "EPLB checkpoint filter did not find every requested expert: "
+            f"rank={tp_rank} unmatched_pairs={unmatched_pairs[:32]} "
+            f"unmatched_count={len(unmatched_pairs)}"
+        )
 
 
 def _chunk_list(items: List, chunk_size):

@@ -358,6 +358,9 @@ class Scheduler(
         # Parse args
         self.server_args = server_args
         self.nccl_port = port_args.nccl_port
+        self.fault_tolerance_metadata_ipc_name = (
+            port_args.fault_tolerance_metadata_ipc_name
+        )
         self.schedule_policy = server_args.schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
@@ -944,6 +947,22 @@ class Scheduler(
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
+        if (
+            self.server_args.device == "npu"
+            and self.server_args.enable_fault_tolerance
+            and self.server_args.elastic_ep_backend == "mc2"
+        ):
+            from sglang.srt.fault_tolerance.npu_communication import (
+                init_npu_ft_communication,
+            )
+
+            init_npu_ft_communication(
+                self.fault_tolerance_metadata_ipc_name,
+                original_rank=self.ps.tp_rank,
+                original_world_size=self.ps.tp_size,
+                timeout_sec=self.server_args.fault_tolerance_timeout,
+                mlp_sync_group=self.tp_cpu_group,
+            )
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use
@@ -1546,6 +1565,34 @@ class Scheduler(
                 dispatch_event_loop(self)
                 return
             except Exception as exc:
+                defer_npu_kv_release = (
+                    _is_npu
+                    and self.server_args.elastic_ep_backend == "mc2"
+                    and self.server_args.fault_tolerance_on_error_strategy == "pause"
+                )
+
+                # Releasing KV can enqueue NPU work, so report the fault and wait
+                # for device recovery before touching device-backed KV state.
+                if defer_npu_kv_release:
+                    self._engine_paused = True
+                    self._ft_pause_deadline = (
+                        time.monotonic()
+                        + self.server_args.fault_tolerance_pause_timeout
+                    )
+
+                    self.ipc_channels.send_to_tokenizer.send_output(
+                        FaultToleranceRankFaultOutput(
+                            rank=self.ps.dp_rank,
+                            message=str(exc),
+                        )
+                    )
+
+                    self._ft_discard_inflight_window(
+                        exc,
+                        defer_kv_release=True,
+                    )
+                    continue
+
                 recovered = self._ft_discard_inflight_window(exc)
                 should_continue = (
                     self.server_args.fault_tolerance_on_error_strategy == "continue"
@@ -1566,7 +1613,9 @@ class Scheduler(
                 if should_continue:
                     continue
 
-    def _ft_discard_inflight_window(self, exc: Exception) -> bool:
+    def _ft_discard_inflight_window(
+        self, reason, *, defer_kv_release: bool = False
+    ) -> bool:
         window_batches = [
             self.cur_batch_for_debug,
             self.last_batch,
@@ -1581,10 +1630,20 @@ class Scheduler(
             if batch is None:
                 continue
             for req in batch.reqs:
-                if not req.finished():
+                if (
+                    not req.finished()
+                    or getattr(req, "req_pool_idx", None) is not None
+                    or getattr(req, "kv", None) is not None
+                ):
                     discarded_by_rid.setdefault(req.rid, req)
-        if self.chunked_req is not None and not self.chunked_req.finished():
-            discarded_by_rid.setdefault(self.chunked_req.rid, self.chunked_req)
+        if self.chunked_req is not None:
+            req = self.chunked_req
+            if (
+                not req.finished()
+                or getattr(req, "req_pool_idx", None) is not None
+                or getattr(req, "kv", None) is not None
+            ):
+                discarded_by_rid.setdefault(req.rid, req)
 
         success = True
         for req in discarded_by_rid.values():
@@ -1593,14 +1652,25 @@ class Scheduler(
                     req.kv_committed_len,
                     len(req.origin_input_ids) + len(req.output_ids),
                 )
-                release_kv_cache(
-                    req,
-                    self.tree_cache,
-                    is_insert=False,
-                    allow_non_spec_overallocated=True,
-                )
+                if defer_kv_release:
+                    deferred_reqs = getattr(
+                        self,
+                        "_ft_deferred_kv_release_reqs",
+                        None,
+                    )
+                    if deferred_reqs is None:
+                        deferred_reqs = {}
+                        self._ft_deferred_kv_release_reqs = deferred_reqs
+                    deferred_reqs.setdefault(req.rid, req)
+                else:
+                    release_kv_cache(
+                        req,
+                        self.tree_cache,
+                        is_insert=False,
+                        allow_non_spec_overallocated=True,
+                    )
                 abort_reason = FINISH_ABORT(
-                    message=f"Request discarded after scheduler exception: {exc}",
+                    message=f"Request discarded during fault-tolerance recovery: {reason}",
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                     err_type="SchedulerFault",
                 )
@@ -1616,6 +1686,9 @@ class Scheduler(
                 logger.exception("FT failed to discard request state")
                 success = False
 
+        if not success:
+            return False
+
         self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
         if self.chunked_req is not None and self.chunked_req.rid in discarded_by_rid:
             self.chunked_req = None
@@ -1623,12 +1696,36 @@ class Scheduler(
             result_queue.clear()
         self.cur_batch_for_debug = None
         self.last_batch = None
+
         logger.warning(
-            "FT discarded %d in-flight request(s) after scheduler exception: %s",
+            "FT discarded %d in-flight request(s)%s: %s",
             len(discarded_by_rid),
-            exc,
+            (
+                "; KV release deferred until device recovery"
+                if defer_kv_release
+                else " during recovery"
+            ),
+            reason,
         )
-        return success
+        return True
+
+    def _ft_release_deferred_kv_cache(self) -> None:
+        deferred_reqs = getattr(
+            self,
+            "_ft_deferred_kv_release_reqs",
+            None,
+        )
+        if not deferred_reqs:
+            return
+
+        for rid, req in list(deferred_reqs.items()):
+            release_kv_cache(
+                req,
+                self.tree_cache,
+                is_insert=False,
+                allow_non_spec_overallocated=True,
+            )
+            deferred_reqs.pop(rid, None)
 
     def _process_next_overlap_result(self) -> None:
         batch, result = self.result_queue[0]
@@ -4476,6 +4573,25 @@ class Scheduler(
             self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
         self._engine_paused = False
 
+    def _recover_npu_fault_tolerance_scale_down(self, active_mask: list[bool]) -> None:
+        model_runner = self.tp_worker.model_runner
+        model_runner.recover_npu_device_for_fault_tolerance_scale_down()
+
+        with self.device_module.StreamContext(self.schedule_stream):
+            model_runner.apply_fault_tolerance_scale_down(active_mask)
+            self._ft_release_deferred_kv_cache()
+
+        self.schedule_stream.synchronize()
+
+        # Use the ordinary ModelRunner dispatch under the existing forward
+        # stream. With graphs enabled this must replay the captured decode graph;
+        # with graphs disabled the same call naturally dispatches to eager.
+        self.forward_stream.wait_stream(self.schedule_stream)
+        with self.forward_stream_ctx:
+            model_runner.run_npu_fault_tolerance_dummy_batch(active_mask)
+
+        model_runner.synchronize_npu_fault_tolerance_health_gate()
+
     def handle_fault_tolerance_command(
         self, recv_req: FaultToleranceCommandReqInput
     ) -> Optional[FaultToleranceCommandReqOutput]:
@@ -4491,9 +4607,24 @@ class Scheduler(
             state.active_ranks_cpu.copy_(state.last_active_ranks.detach().cpu())
             message = "retried"
         elif recv_req.command == "scale_down":
-            self.tp_worker.model_runner.apply_fault_tolerance_scale_down(
-                recv_req.active_mask
-            )
+            model_runner = self.tp_worker.model_runner
+            if _is_npu and self.server_args.elastic_ep_backend == "mc2":
+                try:
+                    self._recover_npu_fault_tolerance_scale_down(recv_req.active_mask)
+                except Exception as exc:
+                    message = f"NPU FT scale-down recovery failed: {exc}"
+                    logger.exception("NPU FT scale-down recovery failed")
+                    self._engine_paused = True
+                    if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:
+                        return None
+                    return FaultToleranceCommandReqOutput(
+                        request_id=recv_req.request_id,
+                        rank=rank,
+                        success=False,
+                        message=message,
+                    )
+            else:
+                model_runner.apply_fault_tolerance_scale_down(recv_req.active_mask)
             message = "scaled down"
         else:
             logger.warning(
