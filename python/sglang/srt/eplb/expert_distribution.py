@@ -952,10 +952,12 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device="cuda",
+                device=self._server_args.device,
             )
         else:
-            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
+            avg_rate_tensor = torch.empty(
+                1, dtype=torch.float32, device=self._server_args.device
+            )
         torch.distributed.broadcast(avg_rate_tensor, src=0)
         return avg_rate_tensor.item()
 

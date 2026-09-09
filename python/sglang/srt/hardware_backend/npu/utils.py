@@ -200,6 +200,56 @@ def npu_format_cast(
     return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
 
 
+def copy_npu_formatted_tensor_(
+    destination: torch.Tensor, source: torch.Tensor
+) -> torch.Tensor:
+    """Copy raw storage between matching NPU-formatted tensor views.
+
+    For padded NPU formats, ``copy_memory_`` requires tensors with zero
+    storage offset. Create temporary offset-zero descriptors and redirect
+    them to the exact source and destination view addresses before copying.
+    This preserves the NPU format and performs no format conversion.
+    """
+    if destination.device.type != "npu" or source.device.type != "npu":
+        raise ValueError("formatted NPU copy requires two NPU tensors")
+    if destination.shape != source.shape:
+        raise ValueError(
+            f"formatted NPU copy requires matching shapes: "
+            f"destination={destination.shape}, source={source.shape}"
+        )
+
+    import torch_npu
+
+    destination_format = torch_npu.get_npu_format(destination)
+    source_format = torch_npu.get_npu_format(source)
+    if destination_format != source_format:
+        raise ValueError(
+            "formatted NPU copy requires matching formats: "
+            f"destination={destination_format} source={source_format}"
+        )
+
+    def make_offset_zero_alias(tensor: torch.Tensor) -> torch.Tensor:
+        tensor_format = torch_npu.get_npu_format(tensor)
+        alias = torch_npu.empty_with_format(
+            tuple(tensor.shape),
+            dtype=tensor.dtype,
+            device=tensor.device,
+            acl_format=tensor_format,
+        )
+        torch_npu.npu_change_data_ptr(alias, tensor, int(tensor.storage_offset()))
+        return alias
+
+    return torch.ops.npu.copy_memory_(
+        make_offset_zero_alias(destination), make_offset_zero_alias(source), False
+    )
+
+
+def is_npu_internal_format_tensor(tensor: torch.Tensor) -> bool:
+    import torch_npu
+
+    return torch_npu.get_npu_format(tensor) != int(NPUACLFormat.ACL_FORMAT_ND)
+
+
 def get_indexer_weight_stream():
     global indexer_weight_stream
     if indexer_weight_stream is None:

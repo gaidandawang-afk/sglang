@@ -11,7 +11,7 @@ from sglang.srt.distributed import get_world_group, parallel_state
 from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.eplb.expert_location import broadcast_global_expert_location_metadata
 from sglang.srt.managers.schedule_batch import ServerArgs
-from sglang.srt.utils import is_cpu, is_cuda
+from sglang.srt.utils import is_cpu, is_cuda, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -138,10 +138,12 @@ class ElasticEPStateManager:
     def _select_device() -> torch.device:
         if is_cuda():
             return torch.device("cuda")
+        elif is_npu():
+            return torch.device("npu")
         elif is_cpu():
             return torch.device("cpu")
         else:
-            raise NotImplementedError("Only CUDA and CPU support elastic ep now.")
+            raise NotImplementedError("Only CUDA, NPU and CPU support elastic ep now.")
 
     @classmethod
     def _build_state(
