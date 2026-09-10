@@ -2210,6 +2210,16 @@ class ModelRunner:
         reinit_attn_backend: bool,
         split_forward_count: int,
     ) -> ModelRunnerOutput:
+        state = ElasticEPStateManager.instance()
+        if (
+            get_parallel().enable_fault_tolerance
+            and get_parallel().fault_tolerance_on_error_strategy == "pause"
+            and state is not None
+            and bool(
+                (state.last_active_ranks.bool() & ~state.active_ranks.bool()).any()
+            )
+        ):
+            raise RuntimeError("Elastic EP membership loss detected before EPLB")
         if maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager):
             output = self._forward_raw(
                 forward_batch,
@@ -2218,6 +2228,26 @@ class ModelRunner:
                 split_forward_count,
             )
         return output
+
+    def update_fault_tolerance_active_ranks(
+        self, active_mask: Optional[list[bool]] = None
+    ) -> None:
+        """Restore the last rank mask, or apply a new one and rebalance."""
+        state = ElasticEPStateManager.instance()
+        active_ranks = state.last_active_ranks
+        if active_mask is not None:
+            active_ranks = torch.as_tensor(
+                active_mask,
+                dtype=state.active_ranks.dtype,
+                device=state.active_ranks.device,
+            )
+        state.active_ranks.copy_(active_ranks)
+        state.active_ranks_cpu.copy_(active_ranks.detach().cpu())
+        if active_mask is not None:
+            maybe_rebalance_after_rank_fault(
+                eplb_manager=self.eplb_manager,
+                force=True,
+            )
 
     def update_model_fields(
         self,
