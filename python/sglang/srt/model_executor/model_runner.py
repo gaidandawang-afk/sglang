@@ -63,6 +63,7 @@ from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     append_trivial_expert_slots,
     broadcast_global_expert_location_metadata,
+    broadcast_global_expert_location_metadata_in_place,
     compute_initial_expert_location_metadata,
     format_expert_location_layout,
     get_global_expert_location_metadata,
@@ -92,6 +93,7 @@ from sglang.srt.mem_cache.kv_cache_configurator import (
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -107,6 +109,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
     replace_graph_memory_usage,
     replace_graph_time_usage,
 )
+from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.model_runner_components import misc_utils
 from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
     build_attention_backends,
@@ -480,9 +483,10 @@ class ModelRunner:
         )
 
         if self.ps.pp_size > 1:
-            assert self.support_pp, (
-                "Pipeline Parallel is not compatible with this model."
-            )
+            if not (envs.SGLANG_ENABLE_PP_SPEC.get() and self.is_draft_worker):
+                assert self.support_pp, (
+                    "Pipeline Parallel is not compatible with this model."
+                )
 
         # For weight updates
         self.init_weight_updater()
@@ -935,6 +939,11 @@ class ModelRunner:
         self.init_indexer_capturer()
 
         self.graph_shared_output = None
+        # Set once real decode CUDA graphs are captured (makes on-flip role-switch
+        # capture idempotent).
+        self.decode_cuda_graph_captured = False
+        # Captured decode bs; exposed via /get_server_info for role-switch queries.
+        self.decode_cuda_graph_capture_bs: list[int] = []
 
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
@@ -993,19 +1002,13 @@ class ModelRunner:
     def post_capture_elastic_ep_recover(self):
         join_process_groups()
 
-        global_ep_rank = self.ps.tp_rank + get_parallel().ep_join_rank_offset
-        broadcast_global_expert_location_metadata(
-            model_config=self.model_config,
-            moe_ep_rank=global_ep_rank,
+        # Recovery updates the existing fixed-topology metadata in place.
+        # Keep the recorder too: captured graphs still write its GPU counters.
+        # Replacing it would free buffers whose addresses are held by the graph.
+        broadcast_global_expert_location_metadata_in_place(
             src_rank=get_healthy_expert_location_src_rank(
                 invoked_in_elastic_ep_rejoin_path=True
             ),
-        )
-        set_global_expert_distribution_recorder(
-            ExpertDistributionRecorder.init_new(
-                get_global_expert_location_metadata(),
-                rank=global_ep_rank,
-            )
         )
 
         ElasticEPStateManager.instance().reset()
@@ -1117,7 +1120,9 @@ class ModelRunner:
             RoutedExpertsCapturer.create(
                 model=self.model,
                 model_config=self.model_config,
-                num_tokens=self.max_token_pool_size + self.page_size,
+                num_tokens=self.kv_index_translator.capture_token_capacity(
+                    self.max_token_pool_size
+                ),
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -1127,7 +1132,9 @@ class ModelRunner:
         set_global_indexer_capturer(
             create_indexer_capturer(
                 model_config=self.model_config,
-                num_tokens=self.max_token_pool_size + self.page_size,
+                num_tokens=self.kv_index_translator.capture_token_capacity(
+                    self.max_token_pool_size
+                ),
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -1373,7 +1380,11 @@ class ModelRunner:
     def effective_max_total_num_tokens(self):
         """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
-            capacity = self.full_max_total_num_tokens or self.swa_max_total_num_tokens
+            capacity = self.kv_cache_configurator.hybrid_swa_token_capacity(
+                allocator=self.token_to_kv_pool_allocator,
+                full_capacity=self.full_max_total_num_tokens,
+                swa_capacity=self.swa_max_total_num_tokens,
+            )
         else:
             capacity = self.max_total_num_tokens
         if (req_to_token_pool := getattr(self, "req_to_token_pool", None)) is not None:
@@ -1483,6 +1494,51 @@ class ModelRunner:
             capture.time_usage,
             phases=("decode", "target_verify", "draft_decode"),
         )
+        # Bookkeeping for the PD role switch: mark the graphs as captured (makes
+        # the on-flip capture idempotent) and record the captured bs so it can be
+        # queried via /get_server_info.
+        self.decode_cuda_graph_captured = self.decode_cuda_graph_runner is not None
+        self.decode_cuda_graph_capture_bs = list(
+            getattr(self.decode_cuda_graph_runner, "capture_bs", []) or []
+        )
+
+    def ensure_decode_cuda_graphs(self, capture_bs: Optional[list[int]] = None):
+        """Idempotently capture decode CUDA graphs after startup.
+
+        Used by the PD role switch: an instance launched as prefill runs fully
+        eager (decode CUDA graph disabled). On the first flip to decode we
+        enable the decode CUDA graph and capture it here, so the flipped
+        instance replays decode graphs instead of running eager.
+        """
+        if self.decode_cuda_graph_captured:
+            logger.info("Decode CUDA graphs already captured; skipping re-capture.")
+            return
+
+        cfg = get_exec().graph.cuda_graph_config
+        was_disabled = cfg is not None and cfg.decode.backend == Backend.DISABLED
+        if was_disabled:
+            # Prefill was launched with the decode CUDA graph disabled; enable it
+            # for the decode role.
+            logger.info(
+                "Enabling decode CUDA graph on role switch (was disabled at startup)."
+            )
+            cfg.decode.backend = Backend.FULL
+            get_context().override(
+                "model_runner.ensure_decode_cuda_graphs", disable_cuda_graph=False
+            )
+
+        if capture_bs:
+            # Capture-to-fit: only the requested (router-sized) batch sizes.
+            filtered_bs = sorted({int(b) for b in capture_bs if int(b) > 0})
+            if filtered_bs:
+                cfg.decode.bs = filtered_bs
+
+        if was_disabled:
+            # graph_shared_output is skipped at startup when decode is disabled,
+            # so build it now (before the decode runner reads its logits buffer).
+            self.graph_shared_output = GraphSharedOutput.create_for_model_runner(self)
+
+        self.init_decode_cuda_graph()
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         self.prefill_cuda_graph_runner = None
@@ -1648,7 +1704,9 @@ class ModelRunner:
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = profile_range(build_step_span_name(forward_batch))
+        step_span_ctx = profile_range(
+            build_step_span_name(forward_batch, is_draft_worker=self.is_draft_worker)
+        )
 
         canary_ctx = (
             context_tuple(
@@ -2167,8 +2225,6 @@ class ModelRunner:
             recovered = maybe_recover_ep_ranks(
                 tp_group=self.tp_group,
                 eplb_manager=self.eplb_manager,
-                model_config=self.model_config,
-                moe_ep_rank=self._elastic_global_rank(),
             )
             if recovered:
                 self.forward_pass_id = 0
@@ -2229,6 +2285,16 @@ class ModelRunner:
         reinit_attn_backend: bool,
         split_forward_count: int,
     ) -> ModelRunnerOutput:
+        state = ElasticEPStateManager.instance()
+        if (
+            get_parallel().enable_fault_tolerance
+            and get_parallel().fault_tolerance_on_error_strategy == "pause"
+            and state is not None
+            and bool(
+                (state.last_active_ranks.bool() & ~state.active_ranks.bool()).any()
+            )
+        ):
+            raise RuntimeError("Elastic EP membership loss detected before EPLB")
         if maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager):
             output = self._forward_raw(
                 forward_batch,
@@ -2237,6 +2303,23 @@ class ModelRunner:
                 split_forward_count,
             )
         return output
+
+    def update_fault_tolerance_active_ranks(
+        self, active_mask: Optional[list[bool]] = None
+    ) -> None:
+        """Restore the last rank mask, or apply a new one and rebalance."""
+        state = ElasticEPStateManager.instance()
+        active_ranks = state.last_active_ranks
+        if active_mask is not None:
+            active_ranks = torch.as_tensor(
+                active_mask,
+                dtype=state.active_ranks.dtype,
+                device=state.active_ranks.device,
+            )
+        state.active_ranks.copy_(active_ranks)
+        state.active_ranks_cpu.copy_(active_ranks.detach().cpu())
+        if active_mask is not None:
+            maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager)
 
     def update_model_fields(
         self,

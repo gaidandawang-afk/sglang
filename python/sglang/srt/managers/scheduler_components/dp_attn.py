@@ -211,6 +211,23 @@ class MLPSyncBatchInfo:
         tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
+        if (
+            get_parallel().enable_fault_tolerance
+            and get_parallel().fault_tolerance_on_error_strategy == "pause"
+        ):
+            from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+            state = ElasticEPStateManager.instance()
+            # PG can observe an idle failure without any EP forward running.
+            # Compare with the last installed topology so removed ranks do not
+            # trigger another pause after a successful scale-down.
+            if state is not None and bool(
+                (
+                    state.last_active_ranks.to(tp_active_ranks.device).bool()
+                    & ~tp_active_ranks.bool()
+                ).any()
+            ):
+                raise RuntimeError("PG membership loss detected after MLP sync")
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
@@ -289,9 +306,9 @@ def _local_prefill_cuda_graph_vote(
     model_config,
 ) -> bool:
     """This rank's vote for the prefill graph (min-reduced across dp
-    ranks). Extend/mixed batches vote their own replayability; a decode
-    batch eligible for the decode->extend conversion votes as its 1-token-
-    extend view, so the vote and the post-sync conversion always agree."""
+    ranks). Extend and mixed batches share the runner's rank-local replay
+    policy. A decode batch eligible for the decode->extend conversion votes as
+    its 1-token-extend view, so the vote and post-sync conversion agree."""
     if local_batch is None or local_batch.forward_mode.is_idle():
         return True
     if not coordinated_prefill:
@@ -350,6 +367,14 @@ def _local_prefill_cuda_graph_vote(
         capture_hidden_mode=None,
         return_logprob=return_logprob,
         lora_ineligible=prefill_graph_runner.enable_lora,
+        is_mixed=mode == ForwardMode.MIXED,
+        batch_max_context_len=(
+            int(local_batch.seq_lens_cpu.max().item())
+            if prefill_graph_runner.max_context_size is not None
+            and local_batch.seq_lens_cpu is not None
+            and local_batch.seq_lens_cpu.numel() > 0
+            else None
+        ),
     )
 
 

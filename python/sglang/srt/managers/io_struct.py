@@ -1771,6 +1771,23 @@ class ContinueGenerationReqInput(BaseReq, kw_only=True):
     torch_empty_cache: bool = True
 
 
+class FaultToleranceCommandReqInput(BaseReq, kw_only=True):
+    request_id: str
+    command: Literal["retry", "scale_down"]
+    target_ranks: List[int]
+    active_mask: Optional[List[bool]] = None
+
+
+class FaultToleranceCommandReqOutput(BaseReq, kw_only=True):
+    request_id: str
+    rank: int
+
+
+class FaultToleranceRankFaultOutput(BaseReq, kw_only=True):
+    rank: int
+    message: str = ""
+
+
 class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
     """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
 
@@ -2049,6 +2066,24 @@ class SlowDownReqOutput(BaseReq, kw_only=True):
     pass
 
 
+class PdRoleSwitchReqInput(BaseReq, kw_only=True):
+    # Target role; "" is an invalid sentinel rejected by the handler.
+    new_role: Literal["prefill", "decode", ""] = ""
+    # Optional decode bs to capture on a flip to decode (capture-to-fit);
+    # None uses the server's configured decode bs list.
+    decode_cuda_graph_bs: Optional[List[int]] = None
+    # Measured graph footprint from a matching decode peer.
+    decode_cuda_graph_memory_gb: Optional[float] = None
+
+
+class PdRoleSwitchReqOutput(BaseReq, kw_only=True):
+    success: bool = False
+    message: str = ""
+    old_role: str = ""
+    new_role: str = ""
+    safe_to_restore: bool = False
+
+
 class AbortReq(BaseReq, kw_only=True):
     # Whether to abort all requests
     abort_all: bool = False
@@ -2072,6 +2107,26 @@ class EncoderDispatchErrorReq(BaseReq, kw_only=True):
 
 class ActiveRanksOutput(BaseReq, kw_only=True):
     status: List[bool]
+    request_id: Optional[str] = None
+
+
+class ProcessActiveRanksOutput(BaseReq, kw_only=True):
+    ranks: List[int]
+    active: bool
+
+
+class WatchdogHeartbeatOutput(BaseReq, kw_only=True):
+    node_rank: int
+    ranks: List[int]
+    control_endpoint: Optional[str] = None
+
+
+class FaultToleranceDPCShutdownReqInput(BaseReq, kw_only=True):
+    target_dp_ranks: List[int]
+
+
+class RouteUpdateAckOutput(BaseReq, kw_only=True):
+    request_id: str
 
 
 class ElasticScaleUpdateReq(BaseReq, kw_only=True):

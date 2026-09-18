@@ -113,6 +113,7 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
+from sglang.srt.fault_tolerance.protocol import parse_apply_request
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -133,6 +134,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
+    PdRoleSwitchReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -293,7 +295,7 @@ async def lifespan(fast_api_app: FastAPI):
     if get_observability().enable_trace:
         process_tracing_init(
             get_observability().otlp_traces_endpoint,
-            "sglang",
+            get_observability().otlp_service_name,
             trace_modules=get_observability().trace_modules,
         )
         if get_disagg().disaggregation_mode == "prefill":
@@ -301,6 +303,11 @@ async def lifespan(fast_api_app: FastAPI):
         elif get_disagg().disaggregation_mode == "decode":
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
+
+    if get_parallel().enable_fault_tolerance and hasattr(
+        _global_state.tokenizer_manager, "auto_create_handle_loop"
+    ):
+        _global_state.tokenizer_manager.auto_create_handle_loop()
 
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
@@ -659,6 +666,13 @@ async def validate_json_request(raw_request: Request):
 ##### Native API endpoints #####
 
 
+@app.get("/ready")
+async def ready() -> Response:
+    """Report whether the server is ready to receive new requests."""
+    status_code = 200 if _global_state.tokenizer_manager.is_ready() else 503
+    return Response(status_code=status_code)
+
+
 @app.get("/health")
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
@@ -771,6 +785,9 @@ async def model_info():
         ),
         "tool_call_parser": _global_state.tokenizer_manager.config_value(
             "tool_call_parser"
+        ),
+        "disaggregation_mode": _global_state.tokenizer_manager.config_value(
+            "disaggregation_mode"
         ),
         "has_image_understanding": model_config.is_image_understandable_model,
         "has_audio_understanding": model_config.is_audio_understandable_model,
@@ -1554,6 +1571,23 @@ async def slow_down(obj: Annotated[SlowDownReqInput, Body()], request: Request):
         return _create_error_response(e)
 
 
+@app.api_route("/pd_role_switch", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pd_role_switch(
+    obj: Annotated[PdRoleSwitchReqInput, Body()], request: Request
+):
+    """Switch this instance's PD disaggregation role (prefill<->decode) at runtime.
+    Requires --enable-pd-role-switch; the instance must be idle."""
+    try:
+        result = await _global_state.tokenizer_manager.pd_role_switch(obj, request)
+    except Exception as e:
+        return _create_error_response(e)
+    return ORJSONResponse(
+        msgspec_to_builtins(result),
+        status_code=HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
 @app.api_route("/load_lora_adapter", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_lora_adapter(
@@ -1724,6 +1758,49 @@ async def continue_generation(
         content={"message": "Generation continued successfully.", "status": "ok"},
         status_code=200,
     )
+
+
+@app.get("/v1/fault_tolerance/status")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def fault_tolerance_status(request: Request):
+    status_code, body = _global_state.tokenizer_manager.fault_tolerance_status()
+    if status_code != HTTPStatus.OK:
+        return _fault_tolerance_error_response(status_code, body["message"])
+    return ORJSONResponse(content=body, status_code=status_code)
+
+
+def _fault_tolerance_error_response(status_code: int, message: str):
+    return ORJSONResponse(
+        content={
+            "error": {
+                "message": message,
+                "type": HTTPStatus(status_code).phrase,
+                "param": None,
+                "code": status_code,
+            }
+        },
+        status_code=status_code,
+    )
+
+
+@app.post("/v1/fault_tolerance/apply")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def fault_tolerance_apply(request: Request):
+    content_type = request.headers.get("content-type", "").lower()
+    if content_type.split(";", maxsplit=1)[0] != "application/json":
+        return _fault_tolerance_error_response(
+            HTTPStatus.BAD_REQUEST,
+            "Unsupported Media Type: Only 'application/json' is allowed",
+        )
+    try:
+        obj = parse_apply_request(await request.body())
+    except ValueError as exc:
+        return _fault_tolerance_error_response(HTTPStatus.BAD_REQUEST, str(exc))
+
+    status_code, body = _global_state.tokenizer_manager.fault_tolerance_apply(obj)
+    if status_code != HTTPStatus.ACCEPTED:
+        return _fault_tolerance_error_response(status_code, body["message"])
+    return ORJSONResponse(content=body, status_code=status_code)
 
 
 ##### OpenAI-compatible API endpoints #####
@@ -2457,6 +2534,7 @@ def _run_granian_server(
     log_level,
     http2_max_concurrent_streams,
     http2_initial_connection_window_size,
+    tokenizer_manager=None,
     tokenizer_worker_num=1,
     ssl_certfile=None,
     ssl_keyfile=None,
@@ -2514,6 +2592,10 @@ def _run_granian_server(
     server = Server(**granian_kwargs)
 
     if tokenizer_worker_num == 1:
+        if tokenizer_manager is not None:
+            # auto_create_handle_loop replaces the signal handler wired below,
+            # so shutdown can only reach this server through the hook.
+            tokenizer_manager.set_server_stop_hook(server.stop)
 
         async def serve():
             # The embedded server does not install its own signal handlers, so wire
@@ -2638,6 +2720,7 @@ def _setup_and_run_http_server(
                     ssl_ca_certs=get_serving().ssl_ca_certs,
                     ssl_keyfile_password=get_serving().ssl_keyfile_password,
                     ssl_verify=False,  # No MTLS supported for now.
+                    tokenizer_manager=tokenizer_manager,
                 )
             elif get_serving().enable_ssl_refresh:
                 # Use Config/Server API for access to the SSLContext.
@@ -2660,6 +2743,9 @@ def _setup_and_run_http_server(
                 from sglang.srt.entrypoints.ssl_utils import SSLCertRefresher
 
                 server = uvicorn.Server(config)
+                tokenizer_manager.set_server_stop_hook(
+                    lambda: setattr(server, "should_exit", True)
+                )
 
                 async def _run_with_ssl_refresh():
                     refresher = SSLCertRefresher(
@@ -2678,23 +2764,31 @@ def _setup_and_run_http_server(
 
                 asyncio.run(_run_with_ssl_refresh())
             else:
-                # Default case, one tokenizer process
-                uvicorn.run(
-                    app,
-                    host=get_serving().host,
-                    port=get_serving().port,
-                    root_path=get_serving().fastapi_root_path,
-                    log_level=get_observability().log_level_http
-                    or get_observability().log_level,
-                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
-                    loop="uvloop",
-                    ssl_keyfile=get_serving().ssl_keyfile,
-                    ssl_certfile=get_serving().ssl_certfile,
-                    ssl_ca_certs=get_serving().ssl_ca_certs,
-                    ssl_keyfile_password=get_serving().ssl_keyfile_password,
+                # Default case, one tokenizer process.
+                # A Server rather than uvicorn.run(), so shutdown can ask it to stop.
+                server = uvicorn.Server(
+                    uvicorn.Config(
+                        app,
+                        host=get_serving().host,
+                        port=get_serving().port,
+                        root_path=get_serving().fastapi_root_path,
+                        log_level=get_observability().log_level_http
+                        or get_observability().log_level,
+                        timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                        loop="uvloop",
+                        ssl_keyfile=get_serving().ssl_keyfile,
+                        ssl_certfile=get_serving().ssl_certfile,
+                        ssl_ca_certs=get_serving().ssl_ca_certs,
+                        ssl_keyfile_password=get_serving().ssl_keyfile_password,
+                    )
                 )
+                tokenizer_manager.set_server_stop_hook(
+                    lambda: setattr(server, "should_exit", True)
+                )
+                server.run()
         else:
-            # Multiple tokenizer and http processes
+            # Multiple tokenizer and http processes.
+            # Child processes re-import the app, so no stop hook here.
             from uvicorn.config import LOGGING_CONFIG
 
             LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {

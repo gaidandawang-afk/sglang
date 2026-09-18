@@ -190,6 +190,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         apply_inkling_prefill_cuda_graph_default,
         apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
+        finalize_cuda_graph_prefill_max_context,
         handle_cuda_graph_config,
     )
 
@@ -369,8 +370,15 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # time; last declarations of the resolution, mirroring that order.
     run_hook(handle_model_capability_adjustments, server_args)
 
+    finalize_cuda_graph_prefill_max_context(server_args)
+
     # Validate after all batch-size declarations are visible.
     run_hook(validate_deepep_v2_speculative_draft, server_args)
     run_hook(validate_deepep_v2_dispatch_token_budget, server_args)
+
+    # Validate FT after topology, MoE, and Elastic EP resolution.
+    from sglang.srt.arg_groups.parallel_hook import handle_fault_tolerance
+
+    run_hook(handle_fault_tolerance, server_args)
 
     server_args._resolution_finished = True
