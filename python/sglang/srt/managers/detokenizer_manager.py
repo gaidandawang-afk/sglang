@@ -57,6 +57,7 @@ from sglang.srt.parser.response_template import tool_close_token_ids
 from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
     get_device,
+    get_exec,
     get_model,
     get_observability,
     get_serving,
@@ -78,6 +79,7 @@ logger = logging.getLogger(__name__)
 
 
 class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+    enable_ascend_ft = False
     """DetokenizerManager is a process that detokenizes the token ids."""
 
     def __init__(
@@ -128,6 +130,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 self.vocab_size = getattr(self.tokenizer, "vocab_size", None)
 
     def init_running_status(self, server_args: ServerArgs):
+        self.enable_ascend_ft = get_exec().features.enable_ascend_ft
         self.detokenize_state_table = DetokenizeStateTable(
             capacity=DETOKENIZER_MAX_STATES
         )
@@ -425,6 +428,14 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         )
         routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
+        replay_offsets = None
+        if self.enable_ascend_ft:
+            replay_offsets = [
+                (s.surr_offset, s.read_offset, s.decoded_text_len, s.sent_offset)
+                if s is not None
+                else None
+                for s in states
+            ]
         return BatchStrOutput(
             rids=recv_obj.rids,
             http_worker_ipcs=self._route_rows(recv_obj, headers),
@@ -470,6 +481,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             token_steps=recv_obj.token_steps,
             beam_search_output=recv_obj.beam_search_output,
             dp_ranks=recv_obj.dp_ranks,
+            ascend_ft_detokenize_offsets=replay_offsets,
         )
 
     def handle_detokenize_release_req(self, recv_req: DetokenizeReleaseReq):

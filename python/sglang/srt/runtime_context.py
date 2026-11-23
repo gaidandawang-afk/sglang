@@ -527,6 +527,7 @@ def is_control_broadcast_local() -> bool:
     parallel = get_parallel()
     return parallel.attn_dp_enabled and (
         parallel.enable_dp_attention_local_control_broadcast
+        or get_exec().features.enable_ascend_ft
         or get_exec().moe.is_ep_scale_joiner
     )
 

@@ -48,6 +48,7 @@ from typing import (
     Type,
     Union,
 )
+from uuid import uuid4
 
 import fastapi
 import numpy as np
@@ -85,6 +86,7 @@ from sglang.srt.layers.joint_schema_head import (
     parse_decision_layout,
 )
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+from sglang.srt.managers.ascend_ft import AscendFTManager
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import (
@@ -94,6 +96,7 @@ from sglang.srt.managers.embed_types import (
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    AscendFTAckOutput,
     BaseBatchReq,
     BaseReq,
     BatchEmbeddingOutput,
@@ -296,6 +299,10 @@ class ReqState:
     abort_sent: bool = False
     # obj.input_ids was dropped after dispatch, so the request cannot be dumped.
     prompt_released: bool = False
+    ascend_ft_request: Optional[TokenizedGenerateReqInput] = None
+    ascend_ft_wire_rid: Optional[str] = None
+    # Surrogate and read token offsets, committed text length, and sent text length.
+    ascend_ft_detokenize_offsets: Optional[tuple[int, int, int, int]] = None
     # Held at generate_request's pause gate; an abort_all leaves it to run
     # after the pause.
     waiting_at_pause_gate: bool = False
@@ -605,6 +612,7 @@ def _requested_token_ids(obj: GenerateReqInput) -> Optional[list]:
 
 
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+    ascend_ft: Optional[AscendFTManager] = None
     """TokenizerManager is a process that tokenizes the text."""
 
     tokenized_generate_req_type = TokenizedGenerateReqInput
@@ -728,6 +736,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.init_canary_info_hook()
 
         # Init request dispatcher
+        if get_exec().features.enable_ascend_ft:
+            self.ascend_ft = AscendFTManager(self)
+            self._ascend_ft_wire_to_rid: dict[str, str] = {}
         self.init_request_dispatcher()
 
         # Init the CUDA IPC transport for GPU-resident embedding overrides
@@ -1042,6 +1053,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (AbortReq, self._handle_abort_req),
+                (AscendFTAckOutput, self._handle_ascend_ft_ack),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
@@ -1072,6 +1084,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
+        if self.ascend_ft is not None and (
+            not isinstance(obj, GenerateReqInput)
+            or obj.parallel_sample_num != 1
+            or obj.contains_mm_input()
+            or obj.input_embeds is not None
+            or obj.max_thinking_tokens is not None
+        ):
+            raise ValueError(
+                "Ascend fault tolerance supports plain text generation with n=1."
+            )
         if (
             isinstance(obj, GenerateReqInput)
             and obj.max_thinking_tokens is not None
@@ -2070,6 +2092,100 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         )
 
+    def _handle_ascend_ft_ack(self, output: AscendFTAckOutput) -> None:
+        if self.ascend_ft is not None:
+            self.ascend_ft.handle_ack(output)
+
+    async def _ascend_ft_wait_to_dispatch(self) -> None:
+        # Tokenization can yield after the first admission check.
+        async with self.is_pause_cond:
+            await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+
+    def _ascend_ft_save_request(self, request: TokenizedGenerateReqInput) -> None:
+        if is_health_check_generate_req(request):
+            return
+        if (
+            request.routed_dp_rank is not None
+            and request.routed_dp_rank not in self.ascend_ft.active_ranks
+        ):
+            raise ValueError(f"routed_dp_rank={request.routed_dp_rank} is inactive.")
+        params = request.sampling_params
+        if (
+            request.input_ids is None
+            or request.token_type_ids is not None
+            or request.session_id is not None
+            or request.session_params is not None
+            or request.positional_embed_overrides is not None
+            or request.return_logprob
+            or request.return_sampling_mask
+            or request.return_hidden_states
+            or request.return_routed_experts
+            or request.return_indexer_topk
+            or request.return_bytes
+            or request.return_entropy
+            or request.custom_logit_processor is not None
+            or (params.beam_width or 1) > 1
+            or params.watermark is not None
+            or params.json_schema
+            or params.regex
+            or params.ebnf
+            or params.structural_tag
+        ):
+            raise ValueError(
+                "Ascend fault tolerance supports text generation without sessions, "
+                "beam search, structured output, custom processors or auxiliary outputs."
+            )
+        state = self.rid_to_state[request.rid]
+        state.ascend_ft_request = copy.copy(request)
+        state.ascend_ft_wire_rid = request.rid
+
+    def _ascend_ft_response_rid(self, wire_rid: str) -> Optional[str]:
+        rid = self._ascend_ft_wire_to_rid.get(wire_rid, wire_rid)
+        state = self.rid_to_state.get(rid)
+        if state is not None and state.ascend_ft_wire_rid in (None, wire_rid):
+            return rid
+        return None
+
+    def _ascend_ft_forget_wire_rid(self, state: ReqState) -> None:
+        if state.ascend_ft_wire_rid is not None:
+            self._ascend_ft_wire_to_rid.pop(state.ascend_ft_wire_rid, None)
+
+    async def ascend_ft_replay(self, removed_dp_ranks: Iterable[int]) -> None:
+        removed = set(removed_dp_ranks)
+        # Snapshot and replace each wire ID without yielding to the output loop.
+        for rid, state in list(self.rid_to_state.items()):
+            if (
+                state.finished
+                or not state.dispatched
+                or state.ascend_ft_request is None
+            ):
+                continue
+            if state.abort_sent:
+                self._handle_abort_req(AbortReq(rid=state.ascend_ft_wire_rid))
+                continue
+            self._ascend_ft_forget_wire_rid(state)
+            wire_rid = f"ascend-ft-{uuid4().hex}"
+            state.ascend_ft_wire_rid = wire_rid
+            self._ascend_ft_wire_to_rid[wire_rid] = rid
+            request = copy.copy(state.ascend_ft_request)
+            request.rid = wire_rid
+            if request.routed_dp_rank in removed:
+                request.routed_dp_rank = None
+                # Future reductions must not target the already retired DP.
+                state.ascend_ft_request.routed_dp_rank = None
+            request.ascend_ft_output_ids = state.output_ids.copy()
+            offsets = state.ascend_ft_detokenize_offsets
+            if offsets is not None:
+                surr, read, text_len, sent = offsets
+                request.ascend_ft_detokenize_state = (
+                    surr,
+                    read,
+                    state.get_text()[:text_len],
+                    sent,
+                )
+            request.wrap_pickle_fields()
+            self._dispatch_to_scheduler(request)
+
     def _reads_input_ids_late(self) -> bool:
         return (
             self.request_logger.logs_field_on_finish("input_ids")
@@ -2091,6 +2207,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     (tokenized_obj.mm_inputs,)
                 )
             )
+            if self.ascend_ft is not None:
+                await self._ascend_ft_wait_to_dispatch()
             if self._skip_dispatch_if_aborted(tokenized_obj.rid):
                 self._cancel_cuda_ipc_features((tokenized_obj,))
                 return
@@ -2102,6 +2220,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 hook.on_request_dispatched(
                     rid_to_state=self.rid_to_state, tokenized_obj=tokenized_obj
                 )
+            if self.ascend_ft is not None:
+                self._ascend_ft_save_request(tokenized_obj)
             tokenized_obj = wrap_shm_features(tokenized_obj)
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
@@ -2208,6 +2328,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
                 )
             )
+            if self.ascend_ft is not None:
+                await self._ascend_ft_wait_to_dispatch()
             tokenized_objs = self._drop_aborted_before_dispatch(tokenized_objs)
             if not tokenized_objs:
                 return
@@ -2223,6 +2345,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
             time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
             for tokenized_obj in tokenized_objs:
+                if self.ascend_ft is not None:
+                    self._ascend_ft_save_request(tokenized_obj)
                 tokenized_obj.wrap_pickle_fields()
 
             if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
@@ -2656,6 +2780,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.abort_sent = True
             elif get_serving().tokenizer_worker_num == 1:
                 return
+        if state is not None and state.ascend_ft_wire_rid is not None:
+            rid = state.ascend_ft_wire_rid
         req = AbortReq(rid=rid, abort_all=abort_all)
         try:
             self._dispatch_to_scheduler(req)
@@ -2951,6 +3077,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         pending_notify: dict[str, ReqState] = {}
         batch_notify_size = get_serving().batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
+            if self.ascend_ft is not None:
+                rid = self._ascend_ft_response_rid(rid)
+                if rid is None:
+                    continue
             state = self.rid_to_state.get(rid, None)
             if state is None:
                 # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
@@ -3090,6 +3220,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 delta_output_ids = list(row_output_ids(recv_obj, i))
                 output_offset = state.last_output_offset
                 state.append_text(delta_text)
+                if (offsets := recv_obj.ascend_ft_detokenize_offsets) is not None:
+                    state.ascend_ft_detokenize_offsets = offsets[i]
                 state.output_ids.extend(delta_output_ids)
 
                 if is_stream:
@@ -3234,6 +3366,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
 
                 del self.rid_to_state[rid]
+                if self.ascend_ft is not None:
+                    self._ascend_ft_forget_wire_rid(state)
 
                 self._release_lora_once(state)
 
@@ -3989,7 +4123,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # and this abort echo. If the finish wins, the rid is already gone and
         # there is nothing left to abort. Common under mass client
         # disconnects, amplified by prefix / abort_all fan-out.
-        state = self.rid_to_state.get(recv_obj.rid)
+        rid = recv_obj.rid
+        if self.ascend_ft is not None:
+            rid = self._ascend_ft_response_rid(rid)
+            if rid is None:
+                return
+        state = self.rid_to_state.get(rid)
         if state is None:
             logger.info(
                 "Abort request for rid=%s not found in rid_to_state; "
@@ -4008,7 +4147,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if recv_obj.finished_reason:
             finish_reason = recv_obj.finished_reason
         meta_info = {
-            "id": recv_obj.rid,
+            "id": rid,
             "finish_reason": finish_reason,
             "weight_version": self.config_value("weight_version"),
             "e2e_latency": state.time_stats.get_e2e_latency(),
@@ -4082,7 +4221,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         }
         if state.prompt_token_ids is not None:
             out["prompt_token_ids"] = state.prompt_token_ids
-        del self.rid_to_state[recv_obj.rid]
+        del self.rid_to_state[rid]
+        if self.ascend_ft is not None:
+            self._ascend_ft_forget_wire_rid(state)
 
         self._release_lora_once(state)
 

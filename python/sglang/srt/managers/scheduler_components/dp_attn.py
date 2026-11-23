@@ -53,6 +53,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.ascend_ft_communication import AscendFTCommunication
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -248,6 +249,7 @@ class MLPSyncBatchInfo:
         device,
         group: torch.distributed.ProcessGroup,
         use_all_reduce: bool = False,
+        ascend_ft_communication: Optional[AscendFTCommunication] = None,
     ):
         sync_start = time.perf_counter()
         local_info_tensor = self._get_local_tensor(device=device)
@@ -262,7 +264,11 @@ class MLPSyncBatchInfo:
             self.num_dp_ranks, self.tp_size * self.cp_size, 1
         )
 
-        if use_all_reduce:
+        if ascend_ft_communication is not None:
+            ascend_ft_communication.gather(
+                local_info_tensor, global_info_tensor.view(-1, info_width)
+            )
+        elif use_all_reduce:
             # Admission can expose different WORLD sizes; use fixed global slots.
             global_info_tensor.zero_()
             flat_info = global_info_tensor.view(-1, info_width)
@@ -283,21 +289,22 @@ class MLPSyncBatchInfo:
                 group=group,
             )
 
-        tp_info = global_info_tensor.view(
-            self.num_dp_ranks * self.tp_size * self.cp_size, info_width
-        )
-        num_ranks_in_tp_info = tp_info.shape[0]
-        if device == "cpu":
-            tp_active_ranks = get_parallel().tp_group.active_ranks_cpu
-        else:
-            tp_active_ranks = get_parallel().tp_group.active_ranks
-        if tp_active_ranks.shape[0] < num_ranks_in_tp_info:
-            tp_active_ranks = torch.ones(
-                num_ranks_in_tp_info,
-                dtype=tp_active_ranks.dtype,
-                device=tp_active_ranks.device,
+        if ascend_ft_communication is None:
+            tp_info = global_info_tensor.view(
+                self.num_dp_ranks * self.tp_size * self.cp_size, info_width
             )
-        tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
+            num_ranks_in_tp_info = tp_info.shape[0]
+            if device == "cpu":
+                tp_active_ranks = get_parallel().tp_group.active_ranks_cpu
+            else:
+                tp_active_ranks = get_parallel().tp_group.active_ranks
+            if tp_active_ranks.shape[0] < num_ranks_in_tp_info:
+                tp_active_ranks = torch.ones(
+                    num_ranks_in_tp_info,
+                    dtype=tp_active_ranks.dtype,
+                    device=tp_active_ranks.device,
+                )
+            tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
 
         # One D2H for every field: each `.item()` / `.tolist()` on a device
         # tensor is its own stream sync. Copy the whole tensor, not the
@@ -596,6 +603,7 @@ def prepare_mlp_sync_batch_raw(
     sync_wait_carry: Optional[DPSyncWaitCarry] = None,
     shutdown_vote: Optional[DPShutdownVote] = None,
     drain_column: Optional[DPDrainColumn] = None,
+    ascend_ft_communication: Optional[AscendFTCommunication] = None,
 ):
     parallel = get_parallel()
     num_dp_ranks = parallel.num_dp_ranks
@@ -669,8 +677,11 @@ def prepare_mlp_sync_batch_raw(
         local_batch.is_extend_in_batch = is_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
-    use_world_group = world_dp_gather_enabled()
-    if use_world_group:
+    use_world_group = ascend_ft_communication is None and world_dp_gather_enabled()
+    if ascend_ft_communication is not None:
+        group = ascend_ft_communication.group
+        device = "cpu"
+    elif use_world_group:
         world = parallel.world_group
         group = torch.distributed.group.WORLD
         device = world.device
@@ -692,7 +703,10 @@ def prepare_mlp_sync_batch_raw(
             local_num_tokens=num_tokens,
             local_forward_mode=local_forward_mode,
         )
-    skip_all_gather = should_skip_scheduler_all_gather(num_dp_ranks)
+    skip_all_gather = (
+        ascend_ft_communication is None
+        and should_skip_scheduler_all_gather(num_dp_ranks)
+    )
 
     mlp_sync_info = MLPSyncBatchInfo(
         num_dp_ranks=num_dp_ranks,
@@ -722,6 +736,7 @@ def prepare_mlp_sync_batch_raw(
             device=device,
             group=group,
             use_all_reduce=use_world_group,
+            ascend_ft_communication=ascend_ft_communication,
         )
 
     metadata_ready = mlp_sync_info.tp0_info_cpu is not None
@@ -804,6 +819,7 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
+    ascend_ft_communication: Optional[AscendFTCommunication] = None
     sync_wait_carry: DPSyncWaitCarry = field(default_factory=DPSyncWaitCarry)
     # Whether this rank honored a ShutdownReq, and what to do when a peer DP
     # rank did (see DPShutdownVote).
@@ -863,6 +879,7 @@ class SchedulerDPAttnAdapter:
             sync_wait_carry=self.sync_wait_carry,
             shutdown_vote=shutdown_vote,
             drain_column=drain_column,
+            ascend_ft_communication=self.ascend_ft_communication,
         )
         if drain_column.rows is not None and self.on_drain_rows is not None:
             self.on_drain_rows(drain_column.rows)

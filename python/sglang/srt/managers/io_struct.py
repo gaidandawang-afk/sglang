@@ -1326,6 +1326,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     token_ids_logprob_rows: Optional[List[List[int]]] = None
     # Internal: the scheduler overwrites it on receipt; see Req.filler_seed.
     filler_seed: Optional[int] = None
+    ascend_ft_output_ids: Optional[List[int]] = None
+    ascend_ft_detokenize_state: Optional[tuple[int, int, str, int]] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
@@ -2019,6 +2021,10 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
     input_top_logprobs_weights: Optional[List[Optional[np.ndarray]]] = None
 
+    ascend_ft_detokenize_offsets: Optional[
+        List[Optional[tuple[int, int, int, int]]]
+    ] = None
+
 
 def row_output_ids(output: Union[BatchTokenIDOutput, BatchStrOutput], i: int) -> array:
     """Row i's new output ids, sliced from the batch's flat column."""
@@ -2562,6 +2568,18 @@ class EncoderDispatchErrorReq(BaseReq, kw_only=True):
 
     error_msg: str
     error_code: int
+
+
+class AscendFTCommandReq(BaseReq, kw_only=True):
+    op: Literal["pause", "recover", "resume"]
+    target_ranks: list[int]
+    membership_changed: bool = False
+
+
+class AscendFTAckOutput(BaseReq, kw_only=True):
+    op: Literal["pause", "recover", "resume", "fault"]
+    rank: int
+    error: str | None = None
 
 
 class ActiveRanksOutput(BaseReq, kw_only=True):

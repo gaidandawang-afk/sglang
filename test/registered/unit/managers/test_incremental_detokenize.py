@@ -12,6 +12,7 @@ from sglang.srt.managers import multi_tokenizer_mixin
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.incremental_detokenize import (
     DetokenizeHeader,
+    DetokenizeState,
     DetokenizeStateTable,
 )
 from sglang.srt.managers.io_struct import (
@@ -111,6 +112,57 @@ def _detokenizer(capacity=16):
     detok.is_tool_call_parser_gpt_oss = False
     detok.tool_close_token_ids = frozenset()
     return detok
+
+
+def test_ascend_ft_resume_keeps_partial_utf8_cursor():
+    def trim(value, *_unused):
+        return value
+
+    header = _header([0])
+    before = DetokenizeState.from_header(header=header, vocab_size=None)
+    before.append_row(
+        rid="old",
+        output_ids=[1, 2],
+        completion_tokens=2,
+        is_beam=False,
+        vocab_size=None,
+    )
+    assert (
+        before.step(
+            read_text="promptword �",
+            surr_text="prompt",
+            finished_reason=None,
+            trim_matched_stop=trim,
+        )
+        == "word "
+    )
+    resumed_header = DetokenizeHeader(
+        prompt_tail_ids=array("q", before.decode_ids),
+        skip_special_tokens=header.skip_special_tokens,
+        spaces_between_special_tokens=header.spaces_between_special_tokens,
+        no_stop_trim=header.no_stop_trim,
+        http_worker_ipc=header.http_worker_ipc,
+        ascend_ft_state=(
+            before.surr_offset,
+            before.read_offset,
+            before.get_decoded_text(),
+            before.sent_offset,
+            before.num_received_ids,
+        ),
+    )
+    after = DetokenizeState.from_header(header=resumed_header, vocab_size=None)
+    after.append_row(
+        rid="new", output_ids=[3], completion_tokens=3, is_beam=False, vocab_size=None
+    )
+    assert (
+        after.step(
+            read_text="promptword é",
+            surr_text="prompt",
+            finished_reason=None,
+            trim_matched_stop=trim,
+        )
+        == "é"
+    )
 
 
 class _Drained(Exception):

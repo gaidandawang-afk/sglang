@@ -10,6 +10,7 @@ from torch import nn
 
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
+from sglang.srt.eplb.eplb_algorithms import elasticity_aware
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
@@ -183,6 +184,52 @@ class EPLBManager:
             time_end = time.time()
             msg += f" time={time_end - time_start:.3f}s"
         logger.info(msg)
+
+    def rebalance_for_ascend_ft(self, active_ranks: tuple[int, ...], control_group):
+        current = get_global_expert_location_metadata()
+        if (
+            len(active_ranks) * current.num_local_physical_experts
+            < current.num_logical_experts
+        ):
+            raise ValueError("Surviving Ascend ranks do not have enough expert slots")
+        count = get_global_expert_distribution_recorder().dump_for_ascend_ft(
+            control_group
+        )
+        live = frozenset(active_ranks)
+        active_mask = torch.tensor([rank in live for rank in range(current.ep_size)])
+        placement, routes, _ = elasticity_aware.rebalance_experts(
+            weight=count,
+            num_replicas=current.num_physical_experts,
+            num_groups=1,
+            num_nodes=1,
+            num_gpus=current.ep_size,
+            enable_hierarchical=False,
+            active_ranks=active_mask,
+        )
+        device = current.physical_to_logical_map.device
+        new = ExpertLocationMetadata._init_raw(
+            ep_size=current.ep_size,
+            physical_to_logical_map=placement.to(device),
+            logical_to_all_physical_map=routes.to(device),
+        )
+        model = self._get_model()
+        weights = model.routed_experts_weights_of_layer
+        missing = self._get_expert_location_updater().update(
+            weights,
+            new,
+            update_layer_ids=list(weights.keys()),
+            nnodes=get_parallel().nnodes,
+            rank=get_parallel().moe_ep_rank,
+            active_ranks=live,
+        )
+        if missing:
+            ok, message = self._get_weight_updater().update_weights_from_disk(
+                get_model().model_path,
+                get_model().load_format,
+                weight_name_filter=model.missing_expert_weight_filter(missing),
+            )
+            if not ok:
+                raise RuntimeError(message)
 
     def _compute_expert_location_metadata(
         self, logical_count, *, broadcast_over_world: bool

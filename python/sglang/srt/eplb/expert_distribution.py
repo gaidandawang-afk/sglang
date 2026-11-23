@@ -391,6 +391,12 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._reset()
         return output
 
+    def dump_for_ascend_ft(self, group) -> torch.Tensor:
+        count = self._accumulator.get_local_logical_count().sum(dim=0).cpu()
+        torch.distributed.all_reduce(count, group=group)
+        self._reset()
+        return count
+
     @property
     def recording(self):
         return self._recording
@@ -1008,14 +1014,16 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         super().reset()
         self._global_physical_count_of_buffered_step.reset()
 
-    def dump(self, output_mode: _OutputMode):
-        logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
+    def get_local_logical_count(self) -> torch.Tensor:
+        return _convert_global_physical_count_to_logical_count(
             self._global_physical_count_of_buffered_step.get_all(),
             num_layers=self._expert_location_metadata.num_layers,
             num_logical_experts=self._expert_location_metadata.num_logical_experts,
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
 
+    def dump(self, output_mode: _OutputMode):
+        logical_count_of_buffered_step = self.get_local_logical_count()
         if self._first_dump:
             self._first_dump = False
             torch.get_device_module().empty_cache()

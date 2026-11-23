@@ -1138,6 +1138,16 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
+    @staticmethod
+    def missing_expert_weight_filter(missing: Dict[int, List[int]]):
+        # Use the same checkpoint names as load_weights for fused gate/up/down.
+        prefixes = tuple(
+            f"model.layers.{layer}.mlp.experts.{expert}."
+            for layer, experts in missing.items()
+            for expert in experts
+        )
+        return lambda name: name.startswith(prefixes)
+
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):

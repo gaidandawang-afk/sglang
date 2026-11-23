@@ -300,6 +300,10 @@ class ServerArgs:
 
             # Validate resolved arguments and checkpoint-derived constraints.
             cfg = resolving_view(self)
+            if cfg.enable_ascend_ft:
+                from sglang.srt.managers.ascend_ft_config import validate_ascend_ft
+
+                validate_ascend_ft(cfg)
             if (
                 cfg.device == "mps"
                 and not use_mlx()
@@ -844,6 +848,7 @@ class PortArgs:
     # Stable token shared by all processes in one server instance, used to
     # derive the /dev/shm path for load snapshots.
     instance_id: str = ""
+    ascend_ft_endpoint: str | None = None
 
     @staticmethod
     def init_new(
@@ -916,6 +921,7 @@ class PortArgs:
             # overflow.
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
             NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + num_dp_ranks_of(cfg)
+            NUM_DERIVED_PORTS += int(cfg.enable_ascend_ft)
             if ep_scale_joiner_of(resolving_view(server_args)):
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
@@ -957,6 +963,8 @@ class PortArgs:
                     if not dist_init_overridden:
                         wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(metrics_port, "metrics_port")
+                    if cfg.enable_ascend_ft:
+                        wait_port_available(port_base + 6, "ascend_ft_port")
                     if server_args.nnodes > 1:
                         wait_port_available(load_collector_port, "load_collector_port")
                 # Check scheduler_input_port only for dp.
@@ -985,4 +993,9 @@ class PortArgs:
                     dist_init_host, load_collector_port
                 ).to_tcp(),
                 instance_id=instance_id,
+                ascend_ft_endpoint=(
+                    NetworkAddress(dist_init_host, port_base + 6).to_tcp()
+                    if cfg.enable_ascend_ft
+                    else None
+                ),
             )

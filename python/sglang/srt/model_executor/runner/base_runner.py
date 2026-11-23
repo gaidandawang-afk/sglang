@@ -517,6 +517,8 @@ class BaseRunner(ABC):
         *,
         buffers,
         extend_num_tokens_per_req: Optional[int] = None,
+        barrier_group: Optional[torch.distributed.ProcessGroup] = None,
+        active_dp_ranks: Optional[tuple[int, ...]] = None,
     ):
         """Run a dummy forward pass for warmup/profiling.
 
@@ -686,6 +688,12 @@ class BaseRunner(ABC):
 
         if require_mlp_tp_gather_:
             global_num_tokens_cpu = [num_tokens] * get_parallel().num_dp_ranks
+            if active_dp_ranks is not None:
+                live = frozenset(active_dp_ranks)
+                global_num_tokens_cpu = [
+                    count if rank in live else 0
+                    for rank, count in enumerate(global_num_tokens_cpu)
+                ]
         elif require_attn_tp_gather_:
             global_num_tokens_cpu = [num_tokens]
         else:
@@ -827,7 +835,10 @@ class BaseRunner(ABC):
             return logits_output_or_pp_proxy_tensors
 
         torch.get_device_module(mr.device).synchronize()
-        get_parallel().tp_group.barrier()
+        if barrier_group is None:
+            get_parallel().tp_group.barrier()
+        else:
+            torch.distributed.barrier(group=barrier_group)
         with forward_context(
             ForwardContext(attn_backend=mr.attn_backend), forward_batch=forward_batch
         ):

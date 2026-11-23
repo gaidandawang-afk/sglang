@@ -52,6 +52,7 @@ class ExpertLocationUpdater:
         nnodes: int,
         rank: int,
         use_flat_topology: bool = False,
+        active_ranks: Optional[frozenset[int]] = None,
     ):
         """
         Update experts' physical location after EPLB.
@@ -74,6 +75,7 @@ class ExpertLocationUpdater:
             update_layer_ids=update_layer_ids,
             nnodes=topology_num_nodes,
             rank=rank,
+            active_ranks=active_ranks,
         )
         old_expert_location_metadata.update(
             new_expert_location_metadata,
@@ -98,6 +100,7 @@ def _update_expert_weights_with_canary(
     update_layer_ids: List[int],
     nnodes: int,
     rank: int,
+    active_ranks: Optional[frozenset[int]] = None,
 ):
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
 
@@ -125,6 +128,7 @@ def _update_expert_weights_with_canary(
         update_layer_ids=update_layer_ids,
         nnodes=nnodes,
         rank=rank,
+        active_ranks=active_ranks,
     )
 
     for layer_id in update_layer_ids:
@@ -147,6 +151,7 @@ def _update_expert_weights_raw(
     update_layer_ids: List[int],
     nnodes: int,
     rank: int,
+    active_ranks: Optional[frozenset[int]] = None,
 ):
     log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
 
@@ -160,6 +165,7 @@ def _update_expert_weights_raw(
             rank=rank,
             log_metrics=log_metrics,
             update_layer_fn=update_expert_weights_single_layer,
+            active_ranks=active_ranks,
         )
 
     temp_buffers = create_temp_buffers(
@@ -242,6 +248,7 @@ def update_expert_weights_single_layer(
     debug: bool = False,
     log_metrics: bool = False,
     group: Optional[torch.distributed.ProcessGroup] = None,
+    active_ranks: Optional[frozenset[int]] = None,
 ):
     assert all(
         tensor.shape[0] == num_local_physical_experts
@@ -347,6 +354,14 @@ def update_expert_weights_single_layer(
                         f"handle_recv_of_dst_expert_location {dst_expert_location=} case=same-gpu {src_expert_location=}"
                     )
                 return
+
+        if active_ranks is not None and not any(
+            expert_id == logical_expert_id
+            and slot // num_local_physical_experts in active_ranks
+            for slot, expert_id in enumerate(old_physical_to_logical_map)
+        ):
+            missing_logical_experts_info.append(logical_expert_id)
+            return
 
         # case 3: free-rider
         for src_expert_location in range(
@@ -481,6 +496,10 @@ def update_expert_weights_single_layer(
                 x // num_local_physical_experts
                 for x in range(num_physical_experts)
                 if old_physical_to_logical_map[x] == logical_expert_id
+                and (
+                    active_ranks is None
+                    or x // num_local_physical_experts in active_ranks
+                )
             ]
         )
         all_src_nodes = [x // num_gpu_per_node for x in all_src_ranks]
@@ -494,6 +513,10 @@ def update_expert_weights_single_layer(
                 for x in range(num_physical_experts)
                 if new_physical_to_logical_map[x] == logical_expert_id
                 and x // num_local_physical_experts not in all_src_ranks
+                and (
+                    active_ranks is None
+                    or x // num_local_physical_experts in active_ranks
+                )
             ]
         )
         need_comm_self_node_dst_ranks = (

@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.elastic_ep.npu_mc2 import NpuMC2ElasticInfo
 from sglang.srt.hardware_backend.npu.moe.routing import (
     MXFP8_QUANT_MODE,
     RoutedTokens,
@@ -54,6 +55,7 @@ class TestAscendOpsConfig(CustomTestCase):
 class TestAscendOpsDispatcherContracts(CustomTestCase):
     def _dispatcher_for_quant_mode(self, quant_config=None):
         dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
+        dispatcher._elastic = None
         dispatcher.quant_config = quant_config or {}
         return dispatcher
 
@@ -80,6 +82,52 @@ class TestAscendOpsDispatcherContracts(CustomTestCase):
         )
         with self.assertRaisesRegex(NotImplementedError, "mc2.*fp8"):
             dispatcher._quant_mode("mc2")
+
+    def test_mc2_passes_elastic_info_without_renumbering_hccl_peers(self):
+        module = "sglang.srt.layers.moe.token_dispatcher.ascend_ops"
+        dispatcher = self._dispatcher_for_quant_mode()
+        dispatcher.num_experts = 8
+        dispatcher.ep_rank = 3
+        dispatcher.ep_size = 4
+        dispatcher._ep_comm_name = "original"
+        dispatcher.moe_ascend_ops_config = AscendOpsConfig()
+        dispatcher._elastic = NpuMC2ElasticInfo(4, 2, "cpu")
+        hidden = torch.ones((1, 8), dtype=torch.bfloat16)
+        ids = torch.tensor([[6, 4]], dtype=torch.int32)
+        weights = torch.ones((1, 2))
+        aux = torch.empty(0)
+        calls = []
+
+        def dispatch(*args, **kwargs):
+            calls.append((args[1], args[2:6], kwargs))
+            return hidden, None, aux, aux, aux, aux, None
+
+        def combine(*args, **kwargs):
+            calls.append((args[1], args[5:9], kwargs))
+            return hidden
+
+        with patch(
+            f"{module}.torch_npu",
+            SimpleNamespace(
+                npu_moe_distribute_dispatch_v2=dispatch,
+                npu_moe_distribute_combine_v2=combine,
+            ),
+            create=True,
+        ):
+            healthy = dispatcher._dispatch_mc2(hidden, ids, weights, 1, "low_latency")
+            dispatcher._combine_mc2(hidden, healthy.forward_state)
+            dispatcher._elastic.install((0, 2, 3))
+            shrunk = dispatcher._dispatch_mc2(hidden, ids, weights, 1, "low_latency")
+            dispatcher._combine_mc2(hidden, shrunk.forward_state)
+
+        for index, (routed, group_args, kwargs) in enumerate(calls):
+            self.assertEqual(group_args, ("original", 4, 3, 8))
+            if index < 2:
+                self.assertNotIn("elastic_info", kwargs)
+                self.assertEqual(routed.tolist(), [[6, 4]])
+            else:
+                self.assertIs(kwargs["elastic_info"], dispatcher._elastic.tensor)
+                self.assertEqual(routed.tolist(), [[4, 2]])
 
     def test_alltoallv_communicates_mode_specific_payload_and_scale(self):
         """Ascend Ops routing honors the low-latency wire dtype before fallback."""
@@ -372,6 +420,7 @@ class TestAscendOpsPrefillGraph(CustomTestCase):
     # falling into the decode MC2 path.
     def test_prefill_capture_selects_allgather(self):
         dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
+        dispatcher._elastic = None
         dispatcher.tp_group = None
         dispatcher.moe_ascend_ops_config = AscendOpsConfig(prefill="allgather")
         hidden_states = torch.zeros((8, 4))
@@ -401,6 +450,7 @@ class TestAscendOpsPrefillGraph(CustomTestCase):
     # selects allgather rather than the decode MC2 path.
     def test_eager_extend_selects_allgather(self):
         dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
+        dispatcher._elastic = None
         dispatcher.tp_group = None
         dispatcher.moe_ascend_ops_config = AscendOpsConfig(prefill="allgather")
         hidden_states = torch.zeros((8, 4))
@@ -428,6 +478,7 @@ class TestAscendOpsPrefillGraph(CustomTestCase):
     # captured, so the prefill scope is what keeps that on the MC2 path.
     def test_decode_capture_keeps_low_latency(self):
         dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
+        dispatcher._elastic = None
         dispatcher.tp_group = None
         hidden_states = torch.zeros((8, 4))
         topk_weights, topk_ids, _ = self._topk_output(8)

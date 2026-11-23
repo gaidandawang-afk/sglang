@@ -149,6 +149,7 @@ from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
+    AscendFTCommandReq,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -255,6 +256,7 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
     mamba_prefill_chunk_grid,
 )
+from sglang.srt.managers.scheduler_ascend_ft_mixin import SchedulerAscendFTMixin
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -513,6 +515,7 @@ class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
     SchedulerPPMixin,
+    SchedulerAscendFTMixin,
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
 ):
@@ -790,7 +793,8 @@ class Scheduler(
 
         self.maybe_init_mm_feature_receive_budget()
 
-        self.init_dp_attn_adapter()
+        self.init_ascend_ft(port_args.ascend_ft_endpoint)
+        self.init_dp_attn_adapter(self.ascend_ft_communication)
 
         self.init_pool_stats_observer()
 
@@ -2095,6 +2099,7 @@ class Scheduler(
                     self.load_lora_adapter_from_tensors,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                (AscendFTCommandReq, self.handle_ascend_ft_command),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (ConfigureLoggingReq, self.configure_logging),
@@ -2124,6 +2129,17 @@ class Scheduler(
             "max_req_input_len": self.max_req_input_len,
             "startup_time": self.startup_time,
         }
+
+        if self.ascend_ft_communication is not None:
+            from sglang.srt.eplb.expert_location import (
+                get_global_expert_location_metadata,
+            )
+
+            metadata = get_global_expert_location_metadata()
+            local = metadata.num_local_physical_experts
+            result_dict["ascend_ft_min_survivors"] = (
+                metadata.num_logical_experts + local - 1
+            ) // local
 
         if self.rust_server is not None:
             # The main process waits for this process's crash dump.
@@ -2228,6 +2244,8 @@ class Scheduler(
             self.ingest_requests()
             if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
+                if self.ascend_ft_communication is not None:
+                    time.sleep(0.001)
                 continue
 
             # Get the next batch to run
@@ -2773,7 +2791,7 @@ class Scheduler(
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
-    def init_dp_attn_adapter(self) -> None:
+    def init_dp_attn_adapter(self, ascend_ft_communication=None) -> None:
         self.dp_attn_adapter = SchedulerDPAttnAdapter(
             model_runner=self.tp_worker.model_runner,
             req_to_token_pool=self.req_to_token_pool,
@@ -2786,6 +2804,7 @@ class Scheduler(
             get_require_mlp_sync=lambda: self.require_mlp_sync,
             get_shutting_down=lambda: self.gracefully_exit,
             on_peer_shutdown=self.handle_peer_shutdown,
+            ascend_ft_communication=ascend_ft_communication,
             **self._dp_drain_column_callbacks(),
         )
 
@@ -3452,6 +3471,11 @@ class Scheduler(
                 filler_seed=recv_req.filler_seed,
             )
             req.tokenizer = self.tokenizer
+            if recv_req.ascend_ft_output_ids:
+                req.restore_ascend_ft(recv_req)
+                self.batch_result_processor._maybe_update_reasoning_tokens(
+                    req, recv_req.ascend_ft_output_ids
+                )
 
             if radix_native_session:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -7095,6 +7119,8 @@ class Scheduler(
 
 
 def dispatch_event_loop(scheduler: Scheduler):
+    if scheduler.ascend_ft_communication is not None:
+        return scheduler.run_ascend_ft_loop(_dispatch_event_loop_once)
     if scheduler.server_args.enable_pd_role_switch:
         return role_switch.run_event_loop_supervisor(
             scheduler,

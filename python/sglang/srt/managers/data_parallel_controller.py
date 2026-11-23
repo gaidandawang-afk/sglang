@@ -40,6 +40,7 @@ from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    AscendFTCommandReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
@@ -242,6 +243,14 @@ class DataParallelController:
         self._active_workers: list[int] = list(range(self.launch_dp_size))
         self._active_count_cache: int = self.launch_dp_size
 
+        self.ascend_ft_store = None
+        if port_args.ascend_ft_endpoint and get_parallel().node_rank == 0:
+            from sglang.srt.managers.ascend_ft_communication import (
+                create_ascend_ft_store,
+            )
+
+            self.ascend_ft_store = create_ascend_ft_store(port_args.ascend_ft_endpoint)
+
         if get_parallel().attn_dp_enabled:
             self.launch_dp_attention_schedulers(server_args, port_args)
             # When local control broadcast is enabled, send control messages to
@@ -278,6 +287,10 @@ class DataParallelController:
             worker = self.workers[i]
             if worker is not None:
                 sock_send(worker, obj)
+
+    def send_ascend_ft_command(self, req: AscendFTCommandReq):
+        for rank in req.target_ranks:
+            sock_send(self.workers[rank], req)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         if len(ranks.status) != self.max_dp_size:
@@ -401,6 +414,7 @@ class DataParallelController:
                 # so every DP rank gets the abort on the socket its requests use.
                 (AbortReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (AscendFTCommandReq, self.send_ascend_ft_command),
                 (
                     ElasticScaleUpdateReq,
                     lambda msg: self.add_elastic_workers(
@@ -835,6 +849,10 @@ class DataParallelController:
             for info in self._scheduler_init_infos:
                 if info.get("router_l3_layout"):
                     init_info["router_l3_layout"] = info["router_l3_layout"]
+                if "ascend_ft_min_survivors" in info:
+                    init_info["ascend_ft_min_survivors"] = info[
+                        "ascend_ft_min_survivors"
+                    ]
         if layout is not None:
             init_info["hicache_object_layout"] = layout
         return init_info

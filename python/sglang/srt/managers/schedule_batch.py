@@ -162,6 +162,7 @@ if TYPE_CHECKING:
     from sglang.srt.dllm.config import DllmConfig
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.managers.scheduler_components.request_list import ReqList
     from sglang.srt.managers.scheduler_components.request_retirer import (
@@ -703,6 +704,7 @@ class Req(ReqDllmMixin):
         self.send_token_offset: int = 0
         # Whether the DetokenizeHeader went out, so the detokenizer holds its state.
         self.detokenize_header_sent = False
+        self.ascend_ft_detokenize_state: Optional[tuple[int, int, str, int]] = None
         # TODO (Byron): send_output_token_logprobs_offset and send_token_offset can be different in disaggregation mode
         # because the decode server does not have the first output token logprobs
         self.send_output_token_logprobs_offset: int = 0
@@ -1267,6 +1269,12 @@ class Req(ReqDllmMixin):
             max_prefix_len = min(max_prefix_len, committed_len)
             max_prefix_len = max_prefix_len // block_size * block_size
         return max(max_prefix_len, 0)
+
+    def restore_ascend_ft(self, request: TokenizedGenerateReqInput) -> None:
+        # Normal prefill rebuilds KV from the original prompt and output_ids.
+        self.output_ids.extend(request.ascend_ft_output_ids)
+        self.send_token_offset = len(self.output_ids)
+        self.ascend_ft_detokenize_state = request.ascend_ft_detokenize_state
 
     def take_detokenize_header_due(self) -> bool:
         """Whether this output carries the DetokenizeHeader: only the first does."""

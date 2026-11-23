@@ -12,6 +12,7 @@ from typing import Any, NamedTuple, Optional
 import torch
 import torch.distributed as dist
 
+from sglang.srt.elastic_ep.npu_mc2 import get_mc2_elastic_info
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.moe.routing import (
     INT8_QUANT_MODE,
@@ -155,6 +156,7 @@ class AscendOpsDispatcher(BaseDispatcher):
         self.hidden_size = moe_runner_config.hidden_size
         self.quant_config: Optional[dict] = None
         self._ep_comm_name: Optional[str] = None
+        self._elastic = get_mc2_elastic_info()
         self._pad_buffers: dict[tuple, tuple] = {}
         if self.moe_ascend_ops_config.prefill == "allgather":
             if not (
@@ -178,7 +180,11 @@ class AscendOpsDispatcher(BaseDispatcher):
         topk_weights, topk_ids, _ = topk_output
         # Capture forces is_extend_in_batch False; the scope term keeps a
         # prefill graph on the prefill path instead of the decode MC2 path.
-        if get_is_extend_in_batch() or is_in_prefill_graph_scope():
+        # FT keeps both phases on MC2; TP AllGather/AllToAllV require every
+        # rank of the original world to participate.
+        if self._elastic is None and (
+            get_is_extend_in_batch() or is_in_prefill_graph_scope()
+        ):
             if self.moe_ascend_ops_config.prefill == "allgather":
                 return self._dispatch_allgather(
                     hidden_states, topk_weights, topk_ids, self.tp_group
@@ -236,6 +242,10 @@ class AscendOpsDispatcher(BaseDispatcher):
         num_tokens = hidden_states.shape[0]
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.float()
+        elastic_kwargs = {}
+        if self._elastic is not None and self._elastic.shrunk:
+            topk_ids = self._elastic.compact_expert_ids(topk_ids)
+            elastic_kwargs["elastic_info"] = self._elastic.tensor
         quant_mode = self._quant_mode("mc2", dtype_mode)
 
         x_active_mask = None
@@ -270,6 +280,7 @@ class AscendOpsDispatcher(BaseDispatcher):
             global_bs=0,
             expert_token_nums_type=1,
             comm_alg=self.moe_ascend_ops_config.ll_dispatch_alg,
+            **elastic_kwargs,
             **mxfp8_args,
         )
 
@@ -355,6 +366,9 @@ class AscendOpsDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, state: _MC2State
     ) -> torch.Tensor:
         """Run ``npu_moe_distribute_combine_v2`` for the batch dispatched last."""
+        elastic_kwargs = {}
+        if self._elastic is not None and self._elastic.shrunk:
+            elastic_kwargs["elastic_info"] = self._elastic.tensor
         combined = torch_npu.npu_moe_distribute_combine_v2(
             hidden_states,
             state.topk_ids,
@@ -370,6 +384,7 @@ class AscendOpsDispatcher(BaseDispatcher):
             global_bs=0,
             comm_quant_mode=0,
             comm_alg=self.moe_ascend_ops_config.ll_combine_alg,
+            **elastic_kwargs,
         )
 
         return combined[: state.num_tokens]

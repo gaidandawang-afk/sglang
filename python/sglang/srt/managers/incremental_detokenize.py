@@ -82,6 +82,9 @@ class DetokenizeHeader(
     spaces_between_special_tokens: bool
     no_stop_trim: bool
     http_worker_ipc: Optional[str]
+    # Restores a replay's cursor, including printable text before an incomplete
+    # UTF-8 sequence and the already-received token count.
+    ascend_ft_state: Optional[tuple[int, int, str, int, int]] = None
 
 
 def build_detokenize_header(
@@ -96,12 +99,16 @@ def build_detokenize_header(
         prompt_tail_ids = array("q", prompt_tail_ids)
         prompt_tail_ids.extend(req.output_ids[:output_prefix_len])
     sampling_params = req.sampling_params
+    replay_state = req.ascend_ft_detokenize_state
     return DetokenizeHeader(
         prompt_tail_ids=prompt_tail_ids,
         skip_special_tokens=sampling_params.skip_special_tokens,
         spaces_between_special_tokens=sampling_params.spaces_between_special_tokens,
         no_stop_trim=sampling_params.no_stop_trim,
         http_worker_ipc=req.http_worker_ipc,
+        ascend_ft_state=(
+            (*replay_state, output_prefix_len) if replay_state is not None else None
+        ),
     )
 
 
@@ -147,6 +154,18 @@ class DetokenizeState(msgspec.Struct):
     def from_header(
         cls, *, header: DetokenizeHeader, vocab_size: Optional[int]
     ) -> DetokenizeState:
+        if header.ascend_ft_state is not None:
+            surr, read, text, sent, received = header.ascend_ft_state
+            return cls(
+                decode_ids=_clamp_decode_ids(header.prompt_tail_ids, vocab_size),
+                surr_offset=surr,
+                read_offset=read,
+                header=header,
+                num_received_ids=received,
+                sent_offset=sent,
+                decoded_text=text,
+                decoded_text_len=len(text),
+            )
         return cls(
             decode_ids=_clamp_decode_ids(header.prompt_tail_ids, vocab_size),
             surr_offset=0,

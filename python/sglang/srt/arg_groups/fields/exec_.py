@@ -72,6 +72,11 @@ class ExecFeatures(msgspec.Struct):
     # -------------------------------------------------------------------------
     # Misc runtime features
     # -------------------------------------------------------------------------
+    enable_ascend_ft: A[bool, "Enable fixed-world Ascend MC2 fault tolerance."] = False
+    ascend_ft_collective_timeout: A[
+        float, "Ascend fault-tolerant collective timeout in seconds."
+    ] = 10.0
+
     enable_memory_saver: A[
         bool,
         "Allow saving memory using release_memory_occupation and resume_memory_occupation",

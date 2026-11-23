@@ -476,6 +476,8 @@ POSITIONAL_FIELD_ORDER = (
     "debug_tensor_dump_layers",
     "debug_tensor_dump_input_file",
     "enable_memory_saver",
+    "enable_ascend_ft",
+    "ascend_ft_collective_timeout",
     "enable_weights_cpu_backup",
     "enable_draft_weights_cpu_backup",
     "enable_custom_logit_processor",

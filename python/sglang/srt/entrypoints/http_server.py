@@ -801,6 +801,12 @@ async def health_generate(request: Request) -> Response:
     ):
         return Response(status_code=200)
 
+    if (
+        get_exec().features.enable_ascend_ft
+        and _global_state.tokenizer_manager.is_pause
+    ):
+        return Response(status_code=503)
+
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     # uuid keeps rids unique across tokenizer workers (a bare time.time() can
     # collide, and colliding rids overwrite each other's detokenize state).
@@ -1866,6 +1872,12 @@ async def pause_generation(
     obj: Annotated[PauseGenerationReqInput, Body()], request: Request
 ):
     """Pause generation."""
+    if get_exec().features.enable_ascend_ft:
+        if obj.mode == "abort":
+            raise HTTPException(
+                status_code=400, detail="Use in_place or the FT pause instruction."
+            )
+        return _apply_ascend_ft("pause", [])
     await _global_state.tokenizer_manager.pause_generation(obj)
     return ORJSONResponse(
         content={"message": "Generation paused successfully.", "status": "ok"},
@@ -1878,11 +1890,52 @@ async def continue_generation(
     obj: Annotated[ContinueGenerationReqInput, Body()], request: Request
 ):
     """Continue generation."""
+    if get_exec().features.enable_ascend_ft:
+        return _apply_ascend_ft("retry", [])
     await _global_state.tokenizer_manager.continue_generation(obj)
     return ORJSONResponse(
         content={"message": "Generation continued successfully.", "status": "ok"},
         status_code=200,
     )
+
+
+def _apply_ascend_ft(instruction: str, removed_dp_ranks: list[int]):
+    manager = _global_state.tokenizer_manager.ascend_ft
+    try:
+        return ORJSONResponse(
+            manager.apply(instruction, removed_dp_ranks), status_code=202
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/v1/fault_tolerance/status")
+async def ascend_ft_status():
+    if not get_exec().features.enable_ascend_ft:
+        raise HTTPException(status_code=404, detail="Ascend FT is disabled.")
+    return _global_state.tokenizer_manager.ascend_ft.status()
+
+
+@app.post("/v1/fault_tolerance/apply", dependencies=[Depends(validate_json_request)])
+async def ascend_ft_apply(request: Request):
+    if not get_exec().features.enable_ascend_ft:
+        raise HTTPException(status_code=404, detail="Ascend FT is disabled.")
+    try:
+        payload = await request.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON.") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("params", {}), dict):
+        raise HTTPException(
+            status_code=400, detail="Expected an FT instruction and params."
+        )
+    removed = payload.get("params", {}).get("removed_dp_ranks", [])
+    if not isinstance(removed, list) or any(type(rank) is not int for rank in removed):
+        raise HTTPException(
+            status_code=400, detail="removed_dp_ranks must be an integer list."
+        )
+    return _apply_ascend_ft(payload.get("instruction"), removed)
 
 
 ##### OpenAI-compatible API endpoints #####

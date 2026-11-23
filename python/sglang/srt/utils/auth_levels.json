@@ -84,6 +84,8 @@
   "/v1/decisions": "normal",
   "/v1/detokenize": "normal",
   "/v1/embeddings": "normal",
+  "/v1/fault_tolerance/apply": "admin_optional",
+  "/v1/fault_tolerance/status": "admin_optional",
   "/v1/loads": "normal",
   "/v1/messages": "normal",
   "/v1/messages/count_tokens": "normal",

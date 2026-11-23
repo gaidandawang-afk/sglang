@@ -63,6 +63,7 @@ def migrate_expert_weights(
     rank: int,
     log_metrics: bool,
     update_layer_fn: Callable[..., None],
+    active_ranks: frozenset[int] | None = None,
 ) -> dict[int, list[int]]:
     """Migrate expert storage in place without changing model tensor metadata."""
     changed_layer_ids, local_update_plan = _select_expert_weight_updates(
@@ -97,6 +98,7 @@ def migrate_expert_weights(
             missing_logical_experts_info=missing_experts,
             log_metrics=log_metrics,
             group=group,
+            **({"active_ranks": active_ranks} if active_ranks is not None else {}),
         )
         # Release this layer's migration views before preparing the next layer.
         del migration_weights

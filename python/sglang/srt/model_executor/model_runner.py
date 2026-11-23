@@ -56,6 +56,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
     validate_scale_cohort_topology,
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
+from sglang.srt.elastic_ep.npu_mc2 import get_mc2_elastic_info, init_mc2_elastic_info
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_size_to_dp_size,
@@ -134,6 +135,7 @@ from sglang.srt.model_executor.forward_context import (
     get_forward_context,
     has_forward_context,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.forward_observer import ForwardObserver
 from sglang.srt.model_executor.graph_memory_usage import (
     replace_graph_memory_usage,
@@ -740,6 +742,26 @@ class ModelRunner:
         self.init_memory_saver_adapter()
         self.maybe_init_remote_instance_transfer_engine()
         self.maybe_init_expert_location_metadata()
+        if get_exec().features.enable_ascend_ft:
+            import torch_npu
+
+            if (
+                self.model_config.hf_config.architectures != ["Qwen3MoeForCausalLM"]
+                or self.model_config.quantization is not None
+                or self.model_config.dtype != torch.bfloat16
+            ):
+                raise ValueError(
+                    "Ascend FT requires an unquantized BF16 Qwen3-MoE model."
+                )
+            torch_npu.npu.set_op_timeout_ms(
+                int(get_exec().features.ascend_ft_collective_timeout * 1000)
+            )
+            metadata = get_global_expert_location_metadata()
+            if metadata is None:
+                raise ValueError("Ascend FT requires MoE expert-location metadata")
+            init_mc2_elastic_info(
+                metadata.ep_size, metadata.num_local_physical_experts, self.device
+            )
         self.maybe_init_lplb_solvers()
         self.maybe_init_eplb_manager()
         self.expert_location_updater = ExpertLocationUpdater()
@@ -841,6 +863,10 @@ class ModelRunner:
             if get_exec().moe.enable_eplb and (not self.is_draft_worker)
             else None
         )
+        if get_exec().features.enable_ascend_ft:
+            self.eplb_manager.disable_rebalance(
+                "Ascend FT rebalances during recovery only"
+            )
 
     def maybe_init_elastic_ep(self):
         if get_exec().moe.elastic_ep_backend:
@@ -2609,6 +2635,40 @@ class ModelRunner:
         if maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager):
             output = self._forward_raw(forward_batch, pp_proxy_tensors)
         return output
+
+    @torch.inference_mode()
+    def recover_ascend_ft(
+        self,
+        active_ranks: tuple[int, ...],
+        control_group: dist.ProcessGroup,
+        *,
+        membership_changed: bool,
+    ) -> None:
+        import torch_npu
+
+        torch_npu.npu.set_device(self.gpu_id)
+        torch_npu.npu.stop_device(self.gpu_id)
+        torch_npu.npu.restart_device(self.gpu_id)
+        torch_npu.distributed.reinit_process_group(None, False)
+
+        if membership_changed:
+            self.eplb_manager.rebalance_for_ascend_ft(active_ranks, control_group)
+            get_mc2_elastic_info().install(active_ranks)
+
+        # The dummy uses the reserved KV row. One real token on every survivor
+        # exercises the restored MC2 dispatch and combine before reopening routing.
+        runner = self.eager_runner
+        buffers = runner._alloc_dummy_decode_buffers(1)
+        buffers.seq_lens.fill_(1)
+        buffers.seq_lens_cpu.fill_(1)
+        runner._dummy_run(
+            batch_size=1,
+            forward_mode_override=ForwardMode.DECODE,
+            buffers=buffers,
+            barrier_group=control_group,
+            active_dp_ranks=active_ranks,
+        )
+        torch_npu.npu.synchronize()
 
     def update_model_fields(
         self,
