@@ -18,6 +18,7 @@ import threading
 import time
 import unittest
 from contextlib import nullcontext
+from http import HTTPStatus
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -28,6 +29,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.fault_tolerance.dpc_watchdog import DPCFaultToleranceWatchdog
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
@@ -38,6 +40,9 @@ from sglang.srt.managers.data_parallel_controller import (
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    FaultToleranceDPCShutdownReqInput,
+    ProcessActiveRanksOutput,
+    RouteUpdateAckOutput,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
@@ -682,6 +687,76 @@ class TestUpdateActiveRanks(CustomTestCase):
         ctl.update_active_ranks(ActiveRanksOutput(status=[True, False]))
         self.assertEqual(ctl.status, before_status)
         self.assertEqual(ctl._active_workers, before_active)
+
+
+class TestAscendFTRouting(CustomTestCase):
+    def test_route_ack_after_installation_and_no_dispatch_to_retired_slots(self):
+        ctl = _make_controller(num_dp_ranks=4)
+        ctl.send_to_tokenizer = MagicMock()
+        ctl.dp_budget.total_requests = [8, 3, 0, 4]
+        ctl.dp_budget.total_tokens = [9, 6, 0, 7]
+
+        def check_ack(ack, **kwargs):
+            self.assertEqual(ctl._active_workers, [0, 1, 3])
+            self.assertEqual(ack, RouteUpdateAckOutput(request_id="operation"))
+
+        ctl.send_to_tokenizer.send_pyobj.side_effect = check_ack
+        ctl.update_active_ranks(
+            ActiveRanksOutput(status=[True, True, False, True], request_id="operation")
+        )
+        ctl.send_to_tokenizer.send_pyobj.assert_called_once()
+        ctl.send_to_tokenizer.send_pyobj.side_effect = None
+
+        ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=6))
+        ctl.total_requests_scheduler(_req())
+        ctl.total_tokens_scheduler(_req())
+        ctl.workers[2].send_pyobj.assert_not_called()
+        self.assertEqual(sum(worker.send_pyobj.call_count for worker in ctl.workers), 3)
+
+        ctl.round_robin_scheduler(_req(routed_dp_rank=2))
+        abort = ctl.send_to_tokenizer.send_pyobj.call_args.args[0]
+        self.assertEqual(
+            abort.finished_reason["status_code"], HTTPStatus.SERVICE_UNAVAILABLE
+        )
+        self.assertEqual(abort.abort_message, "routed_dp_rank=2 is not active")
+
+
+class TestDPCFaultToleranceWatchdog(CustomTestCase):
+    def test_shutdown_targets_whole_dp_and_reports_physical_exit_once(self):
+        procs = [MagicMock(pid=10 + i, exitcode=None) for i in range(3)]
+        for proc in procs:
+            proc.is_alive.return_value = True
+        watchdog = DPCFaultToleranceWatchdog(
+            context=MagicMock(),
+            tokenizer_endpoint="tcp://127.0.0.1:1234",
+            node_rank=1,
+            processes=procs,
+            process_dp_ranks=[2, 2, 3],
+            process_global_ranks=[4, 5, 6],
+        )
+        watchdog.control_endpoint = "tcp://127.0.0.1:5678"
+        self.assertEqual(watchdog.heartbeat().ranks, [4, 5, 6])
+
+        watchdog._shutdown_dp(FaultToleranceDPCShutdownReqInput(target_dp_ranks=[2]))
+        for proc in procs[:2]:
+            proc.kill.assert_called_once()
+            proc.is_alive.return_value = False
+            proc.exitcode = -9
+        procs[2].kill.assert_not_called()
+
+        watchdog._heartbeat_sender = MagicMock()
+        watchdog._check_processes()
+        watchdog._check_processes()
+        self.assertEqual(
+            [
+                sent.args[0]
+                for sent in watchdog._heartbeat_sender.send_pyobj.call_args_list
+            ],
+            [
+                ProcessActiveRanksOutput(ranks=[4], active=False),
+                ProcessActiveRanksOutput(ranks=[5], active=False),
+            ],
+        )
 
 
 class TestRefreshLoadBudgetThrottle(CustomTestCase):

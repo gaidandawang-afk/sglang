@@ -488,6 +488,15 @@ class ModelRunner:
             )
             raise
 
+        if get_exec().features.enable_fault_tolerance:
+            abort_timeout = (
+                get_exec().features.fault_tolerance_communication_abort_timeout
+            )
+            if abort_timeout:
+                import torch_npu
+
+                torch_npu.npu.set_op_timeout_ms(abort_timeout * 1000)
+
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
@@ -742,9 +751,7 @@ class ModelRunner:
         self.init_memory_saver_adapter()
         self.maybe_init_remote_instance_transfer_engine()
         self.maybe_init_expert_location_metadata()
-        if get_exec().features.enable_ascend_ft:
-            import torch_npu
-
+        if get_exec().features.enable_fault_tolerance:
             if (
                 self.model_config.hf_config.architectures != ["Qwen3MoeForCausalLM"]
                 or self.model_config.quantization is not None
@@ -753,9 +760,6 @@ class ModelRunner:
                 raise ValueError(
                     "Ascend FT requires an unquantized BF16 Qwen3-MoE model."
                 )
-            torch_npu.npu.set_op_timeout_ms(
-                int(get_exec().features.ascend_ft_collective_timeout * 1000)
-            )
             metadata = get_global_expert_location_metadata()
             if metadata is None:
                 raise ValueError("Ascend FT requires MoE expert-location metadata")
@@ -863,7 +867,7 @@ class ModelRunner:
             if get_exec().moe.enable_eplb and (not self.is_draft_worker)
             else None
         )
-        if get_exec().features.enable_ascend_ft:
+        if get_exec().features.enable_fault_tolerance:
             self.eplb_manager.disable_rebalance(
                 "Ascend FT rebalances during recovery only"
             )
@@ -2637,13 +2641,7 @@ class ModelRunner:
         return output
 
     @torch.inference_mode()
-    def recover_ascend_ft(
-        self,
-        active_ranks: tuple[int, ...],
-        control_group: dist.ProcessGroup,
-        *,
-        membership_changed: bool,
-    ) -> None:
+    def recover_ascend_ft_device(self) -> None:
         import torch_npu
 
         torch_npu.npu.set_device(self.gpu_id)
@@ -2651,10 +2649,15 @@ class ModelRunner:
         torch_npu.npu.restart_device(self.gpu_id)
         torch_npu.distributed.reinit_process_group(None, False)
 
-        if membership_changed:
-            self.eplb_manager.rebalance_for_ascend_ft(active_ranks, control_group)
-            get_mc2_elastic_info().install(active_ranks)
+    def install_ascend_ft_topology(self, active_ranks: tuple[int, ...]) -> None:
+        topology = get_mc2_elastic_info()
+        topology.install(active_ranks)
+        topology.validate_scale_down_routing(get_global_expert_location_metadata())
 
+    @torch.inference_mode()
+    def run_ascend_ft_health_gate(
+        self, active_ranks: tuple[int, ...], control_group: dist.ProcessGroup
+    ) -> None:
         # The dummy uses the reserved KV row. One real token on every survivor
         # exercises the restored MC2 dispatch and combine before reopening routing.
         runner = self.eager_runner
@@ -2667,8 +2670,9 @@ class ModelRunner:
             buffers=buffers,
             barrier_group=control_group,
             active_dp_ranks=active_ranks,
+            via_model_runner=True,
         )
-        torch_npu.npu.synchronize()
+        torch.get_device_module(self.device).synchronize()
 
     def update_model_fields(
         self,

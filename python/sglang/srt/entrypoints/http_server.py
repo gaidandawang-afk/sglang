@@ -139,6 +139,12 @@ from sglang.srt.entrypoints.uvicorn_worker_spawn import (
 )
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
+from sglang.srt.fault_tolerance.protocol import (
+    FaultToleranceApplyRequest,
+    PauseRequest,
+    RetryRequest,
+    parse_apply_request,
+)
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
@@ -344,6 +350,9 @@ async def lifespan(fast_api_app: FastAPI):
         elif get_disagg().disaggregation_mode == "decode":
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
+
+    if get_exec().features.enable_fault_tolerance:
+        _global_state.tokenizer_manager.auto_create_handle_loop()
 
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
@@ -801,10 +810,9 @@ async def health_generate(request: Request) -> Response:
     ):
         return Response(status_code=200)
 
-    if (
-        get_exec().features.enable_ascend_ft
-        and _global_state.tokenizer_manager.is_pause
-    ):
+    tokenizer = _global_state.tokenizer_manager
+    ascend_ft = getattr(tokenizer, "ascend_ft", None)
+    if ascend_ft is not None and ascend_ft.admission_error(None):
         return Response(status_code=503)
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
@@ -828,8 +836,12 @@ async def health_generate(request: Request) -> Response:
         )
 
     async def gen():
-        async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
-            break
+        try:
+            async for _ in tokenizer.generate_request(gri, request):
+                break
+        except HTTPException as exc:
+            if ascend_ft is None or exc.status_code != HTTPStatus.SERVICE_UNAVAILABLE:
+                raise
 
     task = asyncio.create_task(gen())
 
@@ -837,6 +849,10 @@ async def health_generate(request: Request) -> Response:
     tic = time.time()
     while time.time() < tic + HEALTH_CHECK_TIMEOUT:
         await asyncio.sleep(1)
+        if ascend_ft is not None and ascend_ft.admission_error(None):
+            task.cancel()
+            tokenizer.rid_to_state.pop(rid, None)
+            return Response(status_code=503)
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
             _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
@@ -998,6 +1014,8 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
     this directly, so the body is not decoded and checked a second time."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
+    tokenizer = _global_state.tokenizer_manager
+    ascend_ft = getattr(tokenizer, "ascend_ft", None)
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -1010,9 +1028,7 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
             # normalizes a copy leaves it unset, which reads as a batch.
             done_sent = False
             try:
-                async for out in _global_state.tokenizer_manager.generate_request(
-                    obj, request
-                ):
+                async for out in tokenizer.generate_request(obj, request):
                     event = b"data: " + dumps_json(out) + b"\n\n"
                     if (
                         getattr(obj, "is_single", False)
@@ -1043,17 +1059,40 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
             if not done_sent:
                 yield b"data: [DONE]\n\n"
 
+        stream = stream_results()
+        if ascend_ft is not None:
+            # Admission can change during tokenization. Let the tokenizer
+            # reject with HTTP 503 before the stream sends its HTTP status.
+            try:
+                first_event = await anext(stream, None)
+            except HTTPException as exc:
+                return _fault_tolerance_error_response(exc.status_code, exc.detail)
+
+            async def stream_with_first_event() -> AsyncIterator[bytes]:
+                try:
+                    if first_event is not None:
+                        yield first_event
+                    async for event in stream:
+                        yield event
+                finally:
+                    await stream.aclose()
+
+            body = stream_with_first_event()
+        else:
+            body = stream
         return StreamingResponse(
-            stream_results(),
+            body,
             media_type="text/event-stream",
-            background=_global_state.tokenizer_manager.create_abort_task(obj),
+            background=tokenizer.create_abort_task(obj),
         )
     else:
         try:
-            ret = await _global_state.tokenizer_manager.generate_request(
-                obj, request
-            ).__anext__()
+            ret = await tokenizer.generate_request(obj, request).__anext__()
             return orjson_response(ret)
+        except HTTPException as exc:
+            if ascend_ft is None:
+                raise
+            return _fault_tolerance_error_response(exc.status_code, exc.detail)
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
@@ -1872,12 +1911,14 @@ async def pause_generation(
     obj: Annotated[PauseGenerationReqInput, Body()], request: Request
 ):
     """Pause generation."""
-    if get_exec().features.enable_ascend_ft:
+    if get_exec().features.enable_fault_tolerance:
         if obj.mode == "abort":
-            raise HTTPException(
-                status_code=400, detail="Use in_place or the FT pause instruction."
+            return _fault_tolerance_error_response(
+                HTTPStatus.BAD_REQUEST, "Use in_place or retract for Ascend FT pause."
             )
-        return _apply_ascend_ft("pause", [])
+        return _apply_ascend_ft(
+            PauseRequest(instruction="pause", request_id=obj.rid or "")
+        )
     await _global_state.tokenizer_manager.pause_generation(obj)
     return ORJSONResponse(
         content={"message": "Generation paused successfully.", "status": "ok"},
@@ -1890,8 +1931,10 @@ async def continue_generation(
     obj: Annotated[ContinueGenerationReqInput, Body()], request: Request
 ):
     """Continue generation."""
-    if get_exec().features.enable_ascend_ft:
-        return _apply_ascend_ft("retry", [])
+    if get_exec().features.enable_fault_tolerance:
+        return _apply_ascend_ft(
+            RetryRequest(instruction="retry", request_id=obj.rid or "")
+        )
     await _global_state.tokenizer_manager.continue_generation(obj)
     return ORJSONResponse(
         content={"message": "Generation continued successfully.", "status": "ok"},
@@ -1899,43 +1942,56 @@ async def continue_generation(
     )
 
 
-def _apply_ascend_ft(instruction: str, removed_dp_ranks: list[int]):
-    manager = _global_state.tokenizer_manager.ascend_ft
-    try:
-        return ORJSONResponse(
-            manager.apply(instruction, removed_dp_ranks), status_code=202
+def _fault_tolerance_error_response(status_code: int, message: str) -> ORJSONResponse:
+    return ORJSONResponse(
+        content={
+            "error": {
+                "message": message,
+                "type": HTTPStatus(status_code).phrase,
+                "param": None,
+                "code": status_code,
+            }
+        },
+        status_code=status_code,
+    )
+
+
+def _apply_ascend_ft(obj: FaultToleranceApplyRequest | PauseRequest):
+    tokenizer = _global_state.tokenizer_manager
+    manager = getattr(tokenizer, "ascend_ft", None)
+    if manager is None:
+        return _fault_tolerance_error_response(
+            HTTPStatus.SERVICE_UNAVAILABLE, "fault_tolerance_disabled"
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    status_code, body = manager.submit(obj)
+    if status_code != HTTPStatus.ACCEPTED:
+        return _fault_tolerance_error_response(status_code, body["message"])
+    return ORJSONResponse(content=body, status_code=status_code)
 
 
 @app.get("/v1/fault_tolerance/status")
 async def ascend_ft_status():
-    if not get_exec().features.enable_ascend_ft:
-        raise HTTPException(status_code=404, detail="Ascend FT is disabled.")
-    return _global_state.tokenizer_manager.ascend_ft.status()
+    manager = getattr(_global_state.tokenizer_manager, "ascend_ft", None)
+    if manager is None:
+        return _fault_tolerance_error_response(
+            HTTPStatus.SERVICE_UNAVAILABLE, "fault_tolerance_disabled"
+        )
+    return ORJSONResponse(content=manager.status())
 
 
-@app.post("/v1/fault_tolerance/apply", dependencies=[Depends(validate_json_request)])
+@app.post("/v1/fault_tolerance/apply")
 async def ascend_ft_apply(request: Request):
-    if not get_exec().features.enable_ascend_ft:
-        raise HTTPException(status_code=404, detail="Ascend FT is disabled.")
+    content_type = request.headers.get("content-type", "").lower()
+    if content_type.split(";", maxsplit=1)[0] != "application/json":
+        return _fault_tolerance_error_response(
+            HTTPStatus.BAD_REQUEST,
+            "Unsupported Media Type: Only 'application/json' is allowed",
+        )
     try:
-        payload = await request.json()
+        obj = parse_apply_request(await request.body())
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Invalid JSON.") from exc
-    if not isinstance(payload, dict) or not isinstance(payload.get("params", {}), dict):
-        raise HTTPException(
-            status_code=400, detail="Expected an FT instruction and params."
-        )
-    removed = payload.get("params", {}).get("removed_dp_ranks", [])
-    if not isinstance(removed, list) or any(type(rank) is not int for rank in removed):
-        raise HTTPException(
-            status_code=400, detail="removed_dp_ranks must be an integer list."
-        )
-    return _apply_ascend_ft(payload.get("instruction"), removed)
+        return _fault_tolerance_error_response(HTTPStatus.BAD_REQUEST, str(exc))
+    return _apply_ascend_ft(obj)
 
 
 ##### OpenAI-compatible API endpoints #####
@@ -2153,9 +2209,17 @@ async def v1_decisions_request(request: DecisionRequest, raw_request: Request):
 async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
 
-    result = await raw_request.app.state.openai_serving_responses.create_responses(
-        request, raw_request
-    )
+    serving = raw_request.app.state.openai_serving_responses
+    ascend_ft = getattr(_global_state.tokenizer_manager, "ascend_ft", None)
+    if ascend_ft is not None:
+        rank = serving.extract_routed_dp_rank_from_header(
+            raw_request, request.routed_dp_rank
+        )
+        if error := ascend_ft.admission_error(rank):
+            return _fault_tolerance_error_response(
+                HTTPStatus.SERVICE_UNAVAILABLE, error
+            )
+    result = await serving.create_responses(request, raw_request)
 
     # Handle streaming responses
     if isinstance(result, AsyncGenerator):

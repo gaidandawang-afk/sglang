@@ -45,6 +45,7 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
     resolution_result,
 )
 from sglang.srt.arg_groups.validation_hook import (
@@ -300,9 +301,17 @@ class ServerArgs:
 
             # Validate resolved arguments and checkpoint-derived constraints.
             cfg = resolving_view(self)
-            if cfg.enable_ascend_ft:
+            if cfg.enable_fault_tolerance:
                 from sglang.srt.managers.ascend_ft_config import validate_ascend_ft
 
+                if cfg.fault_tolerance_on_error_strategy == "continue":
+                    logger.warning("Ascend fault tolerance uses the pause strategy.")
+                    declare_resolution(
+                        self,
+                        "validate_ascend_ft",
+                        fault_tolerance_on_error_strategy="pause",
+                    )
+                    cfg = resolving_view(self)
                 validate_ascend_ft(cfg)
             if (
                 cfg.device == "mps"
@@ -921,7 +930,7 @@ class PortArgs:
             # overflow.
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
             NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + num_dp_ranks_of(cfg)
-            NUM_DERIVED_PORTS += int(cfg.enable_ascend_ft)
+            NUM_DERIVED_PORTS += int(cfg.enable_fault_tolerance)
             if ep_scale_joiner_of(resolving_view(server_args)):
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
@@ -963,7 +972,7 @@ class PortArgs:
                     if not dist_init_overridden:
                         wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(metrics_port, "metrics_port")
-                    if cfg.enable_ascend_ft:
+                    if cfg.enable_fault_tolerance:
                         wait_port_available(port_base + 6, "ascend_ft_port")
                     if server_args.nnodes > 1:
                         wait_port_available(load_collector_port, "load_collector_port")
@@ -995,7 +1004,7 @@ class PortArgs:
                 instance_id=instance_id,
                 ascend_ft_endpoint=(
                     NetworkAddress(dist_init_host, port_base + 6).to_tcp()
-                    if cfg.enable_ascend_ft
+                    if cfg.enable_fault_tolerance
                     else None
                 ),
             )

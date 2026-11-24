@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
+
+if TYPE_CHECKING:
+    from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 
 
 class NpuMC2ElasticInfo:
@@ -23,6 +28,32 @@ class NpuMC2ElasticInfo:
             values[4 + self.ep_size + compact_rank] = rank
         self.tensor.copy_(torch.tensor(values, dtype=torch.int32))
         self.active_ranks = active_ranks
+
+    def validate_scale_down_routing(self, metadata: ExpertLocationMetadata) -> None:
+        if (
+            metadata.ep_size != self.ep_size
+            or metadata.num_local_physical_experts != self.local_experts
+        ):
+            raise RuntimeError("MC2 topology differs from expert location metadata")
+
+        candidates = metadata.logical_to_all_physical_map_cpu
+        capacity = self.ep_size * self.local_experts
+        live = torch.zeros(self.ep_size, dtype=torch.bool)
+        live[list(self.active_ranks)] = True
+        if ((candidates < -1) | (candidates >= capacity)).any():
+            raise RuntimeError("MC2 expert candidates contain an out-of-range slot")
+        candidate_live = (candidates >= 0) & live[
+            candidates.clamp_min(0).long() // self.local_experts
+        ]
+        if not candidate_live.any(dim=-1).all():
+            raise RuntimeError("MC2 logical expert has no surviving physical replica")
+
+        selected = metadata.logical_to_rank_dispatch_physical_map
+        if selected is None or selected.shape != candidates.shape[:-1]:
+            raise RuntimeError("MC2 static routing map is missing or malformed")
+        selected = selected.cpu().unsqueeze(-1)
+        if not ((candidates == selected) & candidate_live).any(dim=-1).all():
+            raise RuntimeError("MC2 static route does not select a surviving replica")
 
     @property
     def shrunk(self) -> bool:

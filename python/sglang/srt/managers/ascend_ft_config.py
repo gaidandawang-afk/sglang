@@ -69,12 +69,35 @@ def validate_ascend_ft(cfg) -> None:
         and not cfg.use_ray
         and cfg.grpc_port is None
         and not envs.SGLANG_RUST_SERVER.get()
-        and 0 < cfg.ascend_ft_collective_timeout < cfg.watchdog_timeout
+    ):
+        raise ValueError("Ascend FT requires one Python tokenizer and detokenizer.")
+
+    if not (
+        0
+        < cfg.fault_tolerance_gloo_timeout
+        < min(cfg.fault_tolerance_timeout, cfg.watchdog_timeout)
+        and cfg.fault_tolerance_pause_timeout > 0
     ):
         raise ValueError(
-            "Ascend FT requires one Python tokenizer and detokenizer and a "
-            "positive collective timeout shorter than --watchdog-timeout."
+            "The Gloo timeout must be positive and below both the FT and scheduler "
+            "watchdog timeouts; the FT pause timeout must be positive."
         )
-
     if os.environ.setdefault("TASK_QUEUE_ENABLE", "0") != "0":
         raise ValueError("Ascend FT requires TASK_QUEUE_ENABLE=0.")
+
+    abort = cfg.fault_tolerance_communication_abort_timeout
+    if abort != 0 and abort < 2:
+        raise ValueError(
+            "The NPU FT communication abort timeout must be 0 or at least 2 seconds."
+        )
+    if abort:
+        os.environ.setdefault("HCCL_EVENT_TIMEOUT", str(abort))
+        os.environ.setdefault("HCCL_EXEC_TIMEOUT", str(abort - 1))
+        os.environ.setdefault("ACL_DEVICE_SYNC_TIMEOUT", str(abort))
+        os.environ.setdefault("ACL_STREAM_TIMEOUT", str(abort * 1000))
+        if int(os.environ["HCCL_EVENT_TIMEOUT"]) <= int(
+            os.environ["HCCL_EXEC_TIMEOUT"]
+        ):
+            raise ValueError(
+                "HCCL_EVENT_TIMEOUT must be greater than HCCL_EXEC_TIMEOUT."
+            )

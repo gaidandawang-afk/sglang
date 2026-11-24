@@ -96,7 +96,6 @@ from sglang.srt.managers.embed_types import (
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
-    AscendFTAckOutput,
     BaseBatchReq,
     BaseReq,
     BatchEmbeddingOutput,
@@ -736,7 +735,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.init_canary_info_hook()
 
         # Init request dispatcher
-        if get_exec().features.enable_ascend_ft:
+        if get_exec().features.enable_fault_tolerance:
             self.ascend_ft = AscendFTManager(self)
             self._ascend_ft_wire_to_rid: dict[str, str] = {}
         self.init_request_dispatcher()
@@ -843,6 +842,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
+        self._zmq_context = context
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
@@ -1053,7 +1053,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (AbortReq, self._handle_abort_req),
-                (AscendFTAckOutput, self._handle_ascend_ft_ack),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
@@ -1069,6 +1068,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (PauseContinueBroadcastReq, self._handle_pause_continue_broadcast),
             ]
         )
+        if self.ascend_ft is not None:
+            self._result_dispatcher += TypeBasedDispatcher(self.ascend_ft.dispatchers())
         self.init_communicators()
 
         self.sampling_params_class = SamplingParams
@@ -1115,6 +1116,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {num_dp_ranks})"
                 )
 
+        routed_dp_rank = (
+            obj.routed_dp_rank if isinstance(obj, GenerateReqInput) else None
+        )
+        self.check_ascend_ft_admission(routed_dp_rank)
+
         self._init_req_state(obj, request)
         request_states = {
             rid: self.rid_to_state[rid]
@@ -1130,7 +1136,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.request_logger.log_received_request(obj, self.tokenizer, request)
 
             async with self.is_pause_cond:
-                await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+                if self.ascend_ft is None:
+                    await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+                else:
+                    self.check_ascend_ft_admission(routed_dp_rank)
                 for state in request_states.values():
                     state.waiting_at_pause_gate = False
 
@@ -2092,23 +2101,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         )
 
-    def _handle_ascend_ft_ack(self, output: AscendFTAckOutput) -> None:
-        if self.ascend_ft is not None:
-            self.ascend_ft.handle_ack(output)
-
-    async def _ascend_ft_wait_to_dispatch(self) -> None:
-        # Tokenization can yield after the first admission check.
-        async with self.is_pause_cond:
-            await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+    def check_ascend_ft_admission(self, routed_dp_rank: Optional[int]) -> None:
+        if self.ascend_ft is None:
+            return
+        if error := self.ascend_ft.admission_error(routed_dp_rank):
+            raise fastapi.HTTPException(status_code=503, detail=error)
+        if self.is_pause:
+            raise fastapi.HTTPException(
+                status_code=503, detail="fault_tolerance_paused"
+            )
 
     def _ascend_ft_save_request(self, request: TokenizedGenerateReqInput) -> None:
+        # Tokenization can yield after the first admission check. This check
+        # and sending the request to the DPC run without another await.
+        self.check_ascend_ft_admission(request.routed_dp_rank)
         if is_health_check_generate_req(request):
             return
-        if (
-            request.routed_dp_rank is not None
-            and request.routed_dp_rank not in self.ascend_ft.active_ranks
-        ):
-            raise ValueError(f"routed_dp_rank={request.routed_dp_rank} is inactive.")
         params = request.sampling_params
         if (
             request.input_ids is None
@@ -2207,8 +2215,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     (tokenized_obj.mm_inputs,)
                 )
             )
-            if self.ascend_ft is not None:
-                await self._ascend_ft_wait_to_dispatch()
             if self._skip_dispatch_if_aborted(tokenized_obj.rid):
                 self._cancel_cuda_ipc_features((tokenized_obj,))
                 return
@@ -2328,8 +2334,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
                 )
             )
-            if self.ascend_ft is not None:
-                await self._ascend_ft_wait_to_dispatch()
             tokenized_objs = self._drop_aborted_before_dispatch(tokenized_objs)
             if not tokenized_objs:
                 return
@@ -2608,8 +2612,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         generators = []
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
-            if self._should_use_batch_tokenization(batch_size, obj):
-                tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
+            batch_tokenize = self._should_use_batch_tokenization(batch_size, obj)
+            if batch_tokenize or self.ascend_ft is not None:
+                # FT admits a request batch in one DPC send. A pause during
+                # tokenization must not strand a partially dispatched batch.
+                tokenized_objs = (
+                    await self._batch_tokenize_and_process(batch_size, obj)
+                    if batch_tokenize
+                    else [
+                        await self._tokenize_one_request(obj[i])
+                        for i in range(batch_size)
+                    ]
+                )
                 await self._send_batch_request(tokenized_objs)
 
                 # Set up generators for each request in the batch

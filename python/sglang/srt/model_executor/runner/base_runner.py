@@ -519,6 +519,7 @@ class BaseRunner(ABC):
         extend_num_tokens_per_req: Optional[int] = None,
         barrier_group: Optional[torch.distributed.ProcessGroup] = None,
         active_dp_ranks: Optional[tuple[int, ...]] = None,
+        via_model_runner: bool = False,
     ):
         """Run a dummy forward pass for warmup/profiling.
 
@@ -772,6 +773,9 @@ class BaseRunner(ABC):
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_cpu=global_num_tokens_cpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
+            global_num_tokens_for_logprob_cpu=(
+                global_num_tokens_cpu if via_model_runner else None
+            ),
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
             mrope_positions=mrope_positions,
@@ -798,6 +802,11 @@ class BaseRunner(ABC):
             mr.lora_manager.prepare_lora_batch(forward_batch)
 
         forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
+        if via_model_runner:
+            torch.distributed.barrier(group=barrier_group)
+            mr.forward(forward_batch)
+            return
+
         mr.attn_backend.init_forward_metadata(forward_batch)
         if get_exec().features.enable_encoder_swa_bounded_replay:
             mr.token_to_kv_pool.request_window.initialize_dummy_history()
@@ -835,10 +844,7 @@ class BaseRunner(ABC):
             return logits_output_or_pp_proxy_tensors
 
         torch.get_device_module(mr.device).synchronize()
-        if barrier_group is None:
-            get_parallel().tp_group.barrier()
-        else:
-            torch.distributed.barrier(group=barrier_group)
+        get_parallel().tp_group.barrier()
         with forward_context(
             ForwardContext(attn_backend=mr.attn_backend), forward_batch=forward_batch
         ):

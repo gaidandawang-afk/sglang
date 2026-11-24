@@ -23,6 +23,7 @@ import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
+from http import HTTPStatus
 from multiprocessing.connection import Connection, wait
 
 import psutil
@@ -36,6 +37,7 @@ from sglang.srt.elastic_ep.topology import (
     validate_matching_attention_topology,
 )
 from sglang.srt.environ import envs
+from sglang.srt.fault_tolerance.dpc_watchdog import DPCFaultToleranceWatchdog
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -46,6 +48,7 @@ from sglang.srt.managers.io_struct import (
     BlockReqInput,
     ElasticScaleUpdateReq,
     ProfileReq,
+    RouteUpdateAckOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
@@ -139,13 +142,20 @@ class DPBudget:
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
 
-    def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
+    def dispatch(
+        self,
+        method: LoadBalanceMethod,
+        estimated_tokens: int = 0,
+        *,
+        active_ranks: list[int] | None = None,
+    ):
+        candidates = range(self.num_dp_ranks) if active_ranks is None else active_ranks
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
-            target_rank = self.total_requests.index(min(self.total_requests))
+            target_rank = min(candidates, key=self.total_requests.__getitem__)
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
             # Use total_requests as a tie-breaker when total_tokens are equal
             target_rank = min(
-                range(self.num_dp_ranks),
+                candidates,
                 key=lambda i: (self.total_tokens[i], self.total_requests[i]),
             )
         else:
@@ -159,6 +169,8 @@ class DPBudget:
 
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
+
+    send_to_tokenizer = None
 
     def __init__(
         self,
@@ -183,6 +195,10 @@ class DataParallelController:
         if get_parallel().node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+            )
+        if get_exec().features.enable_fault_tolerance:
+            self.send_to_tokenizer = get_zmq_socket(
+                self.context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
 
         # Dispatch method
@@ -237,6 +253,8 @@ class DataParallelController:
 
         # Launch data parallel workers
         self.scheduler_procs = []
+        self.scheduler_process_dp_ranks: list[int] = []
+        self.scheduler_process_global_ranks: list[int] = []
         self.local_kv_event_sources = []
         self.workers: list[zmq.Socket | None] = [None] * self.max_dp_size
         self.status: list[bool] = list(self.dp_active)
@@ -265,6 +283,25 @@ class DataParallelController:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
 
+        self._scheduler_watchdog = None
+        if self.send_to_tokenizer is not None:
+            control_host = (
+                NetworkAddress.parse(port_args.tokenizer_ipc_name).host
+                if get_parallel().node_rank == 0
+                else None
+            )
+            self._scheduler_watchdog = DPCFaultToleranceWatchdog(
+                context=self.context,
+                tokenizer_endpoint=port_args.tokenizer_ipc_name,
+                node_rank=get_parallel().node_rank,
+                processes=self.scheduler_procs,
+                process_dp_ranks=self.scheduler_process_dp_ranks,
+                process_global_ranks=self.scheduler_process_global_ranks,
+                control_host=control_host,
+            )
+            self._scheduler_watchdog.start()
+            sock_send(self.send_to_tokenizer, self._scheduler_watchdog.heartbeat())
+
         self.init_dispatcher()
 
         self.soft_watchdog = Watchdog.create(
@@ -290,7 +327,10 @@ class DataParallelController:
 
     def send_ascend_ft_command(self, req: AscendFTCommandReq):
         for rank in req.target_ranks:
-            sock_send(self.workers[rank], req)
+            worker = self.workers[rank]
+            if worker is None:
+                raise RuntimeError(f"DP rank {rank} has no scheduler socket")
+            sock_send(worker, req)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         if len(ranks.status) != self.max_dp_size:
@@ -306,6 +346,13 @@ class DataParallelController:
             self.dp_active[i] and bool(ranks.status[i]) for i in range(self.max_dp_size)
         ]
         self._refresh_active_workers()
+        if self.send_to_tokenizer is not None and ranks.request_id is not None:
+            if self.status != ranks.status:
+                raise RuntimeError("Cannot install FT routes for unprovisioned workers")
+            sock_send(
+                self.send_to_tokenizer,
+                RouteUpdateAckOutput(request_id=ranks.request_id),
+            )
 
     def add_elastic_workers(self, slot_offset: int, slot_count: int):
         """Activate a range of pre-bound worker slots."""
@@ -379,7 +426,9 @@ class DataParallelController:
 
         time_stats.set_dp_dispatch_time()
         req.time_stats = wrap_as_pickle(time_stats)
-        if is_health_check:
+        if self.send_to_tokenizer is not None and not self._active_workers:
+            self._reject_req(req, "no active DP rank")
+        elif is_health_check:
             self.dispatch_health_check(req)
         else:
             self.dispatching(req)
@@ -805,6 +854,11 @@ class DataParallelController:
                         ):
                             proc.start()
                         self.scheduler_procs.append(proc)
+                        if self.send_to_tokenizer is not None:
+                            self.scheduler_process_dp_ranks.append(dp_rank)
+                            self.scheduler_process_global_ranks.append(
+                                get_parallel().tp_size * pp_rank + tp_rank
+                            )
                 scheduler_pipe_readers.append(reader)
 
         # Wait for model to finish loading
@@ -886,11 +940,28 @@ class DataParallelController:
                 or rank not in self._active_workers
                 or self.workers[rank] is None
             ):
+                if self.send_to_tokenizer is not None:
+                    self._reject_req(req, f"routed_dp_rank={rank} is not active")
+                    return True
                 raise ValueError(f"DP rank {rank} is not active.")
             logger.debug(f"Direct routing to DP rank {rank}")
             sock_send(self.workers[rank], req)
             return True
         return False
+
+    def _reject_req(self, req: Req, message: str) -> None:
+        sock_send(
+            self.send_to_tokenizer,
+            AbortReq(
+                rid=req.rid,
+                abort_message=message,
+                finished_reason={
+                    "type": "abort",
+                    "message": message,
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                },
+            ),
+        )
 
     def round_robin_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
@@ -909,17 +980,29 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
+        if self.send_to_tokenizer is not None and req.bootstrap_room is None:
+            return self.round_robin_scheduler(req)
         assert req.bootstrap_room is not None, (
             "req.bootstrap_room should not be None. Do not send requests directly to "
             "prefill or decode instances; send to the router instead."
         )
         target_rank = req.bootstrap_room % len(self.workers)
+        if (
+            self.send_to_tokenizer is not None
+            and target_rank not in self._active_workers
+        ):
+            return self.round_robin_scheduler(req)
         sock_send(self.workers[target_rank], req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
+        target_worker = self.dp_budget.dispatch(
+            LoadBalanceMethod.TOTAL_REQUESTS,
+            active_ranks=self._active_workers
+            if self.send_to_tokenizer is not None
+            else None,
+        )
         sock_send(self.workers[target_worker], req)
 
     def total_tokens_scheduler(self, req: Req):
@@ -930,7 +1013,11 @@ class DataParallelController:
             len(req.input_ids) if req.input_ids is not None else len(req.input_embeds)
         )
         target_worker = self.dp_budget.dispatch(
-            LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
+            LoadBalanceMethod.TOTAL_TOKENS,
+            estimated_tokens=estimated_tokens,
+            active_ranks=self._active_workers
+            if self.send_to_tokenizer is not None
+            else None,
         )
         sock_send(self.workers[target_worker], req)
 
@@ -1006,6 +1093,8 @@ def run_data_parallel_controller_process(
         # The primary owns routing for the expanded scheduler set.
         if get_parallel().node_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
             controller.event_loop()
+        if controller._scheduler_watchdog is not None:
+            controller._scheduler_watchdog.wait_for_follower_exit()
         if prelaunched_schedulers is not None:
             # The launcher owns these processes. Their pipes close when they exit.
             wait([pipe for _, pipe in prelaunched_schedulers.values()])

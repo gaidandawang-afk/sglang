@@ -2243,9 +2243,10 @@ class Scheduler(
             # Receive requests
             self.ingest_requests()
             if self.pause_state.paused:
-                self._record_scheduler_state_for_paused_engine()
                 if self.ascend_ft_communication is not None:
+                    self.check_ascend_ft_pause_deadline()
                     time.sleep(0.001)
+                self._record_scheduler_state_for_paused_engine()
                 continue
 
             # Get the next batch to run

@@ -79,7 +79,7 @@ logger = logging.getLogger(__name__)
 
 
 class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
-    enable_ascend_ft = False
+    enable_fault_tolerance = False
     """DetokenizerManager is a process that detokenizes the token ids."""
 
     def __init__(
@@ -130,7 +130,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 self.vocab_size = getattr(self.tokenizer, "vocab_size", None)
 
     def init_running_status(self, server_args: ServerArgs):
-        self.enable_ascend_ft = get_exec().features.enable_ascend_ft
+        self.enable_fault_tolerance = get_exec().features.enable_fault_tolerance
         self.detokenize_state_table = DetokenizeStateTable(
             capacity=DETOKENIZER_MAX_STATES
         )
@@ -429,7 +429,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         replay_offsets = None
-        if self.enable_ascend_ft:
+        if self.enable_fault_tolerance:
             replay_offsets = [
                 (s.surr_offset, s.read_offset, s.decoded_text_len, s.sent_offset)
                 if s is not None

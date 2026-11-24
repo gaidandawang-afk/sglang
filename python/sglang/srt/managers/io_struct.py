@@ -2574,6 +2574,7 @@ class AscendFTCommandReq(BaseReq, kw_only=True):
     op: Literal["pause", "recover", "resume"]
     target_ranks: list[int]
     membership_changed: bool = False
+    reset_collective: bool = False
 
 
 class AscendFTAckOutput(BaseReq, kw_only=True):
@@ -2584,6 +2585,26 @@ class AscendFTAckOutput(BaseReq, kw_only=True):
 
 class ActiveRanksOutput(BaseReq, kw_only=True):
     status: List[bool]
+    request_id: Optional[str] = None
+
+
+class ProcessActiveRanksOutput(BaseReq, kw_only=True):
+    ranks: List[int]
+    active: bool
+
+
+class WatchdogHeartbeatOutput(BaseReq, kw_only=True):
+    node_rank: int
+    ranks: List[int]
+    control_endpoint: Optional[str] = None
+
+
+class FaultToleranceDPCShutdownReqInput(BaseReq, kw_only=True):
+    target_dp_ranks: List[int]
+
+
+class RouteUpdateAckOutput(BaseReq, kw_only=True):
+    request_id: str
 
 
 class ElasticScaleUpdateReq(BaseReq, kw_only=True):

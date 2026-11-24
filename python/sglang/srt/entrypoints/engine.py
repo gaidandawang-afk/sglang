@@ -919,7 +919,7 @@ class Engine(EngineScoreMixin, EngineBase):
             use_dp_controller
             and get_parallel().attn_dp_enabled
             and get_exec().moe.elastic_ep_backend is None
-            and not get_exec().features.enable_ascend_ft
+            and not get_exec().features.enable_fault_tolerance
             and not get_exec().moe.is_ep_joiner
         )
         prelaunched_schedulers = {}
@@ -1429,7 +1429,7 @@ class Engine(EngineScoreMixin, EngineBase):
             # Get back some info from scheduler to tokenizer_manager
             scheduler_info = scheduler_init_result.scheduler_infos[0]
             tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
-            if get_exec().features.enable_ascend_ft:
+            if get_exec().features.enable_fault_tolerance:
                 tokenizer_manager.ascend_ft.min_survivors = scheduler_info[
                     "ascend_ft_min_survivors"
                 ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from sglang.srt.managers.ascend_ft_communication import (
@@ -10,6 +11,7 @@ from sglang.srt.managers.ascend_ft_communication import (
 from sglang.srt.managers.io_struct import AscendFTAckOutput, AscendFTCommandReq
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.utils.process import notify_node_main_process_failure
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -20,13 +22,14 @@ logger = logging.getLogger(__name__)
 class SchedulerAscendFTMixin:
     def init_ascend_ft(self: Scheduler, endpoint: str | None) -> None:
         self.ascend_ft_pending_pause: AscendFTCommandReq | None = None
+        self.ascend_ft_pause_deadline: float | None = None
         self.ascend_ft_communication = None
         if endpoint is not None:
             self.ascend_ft_communication = AscendFTCommunication(
                 endpoint,
                 rank=get_parallel().dp_rank,
                 world_size=get_parallel().num_dp_ranks,
-                timeout=get_exec().features.ascend_ft_collective_timeout,
+                timeout=get_exec().features.fault_tolerance_gloo_timeout,
             )
 
     def run_ascend_ft_loop(self: Scheduler, dispatch) -> None:
@@ -36,19 +39,31 @@ class SchedulerAscendFTMixin:
                 return
             except AscendFTPause:
                 self._enter_ascend_ft_pause()
-            except RuntimeError as exc:
+            except Exception as exc:
+                if self.pause_state.paused:
+                    # A fault in the paused loop itself cannot re-enter FT.
+                    notify_node_main_process_failure()
+                    raise
                 logger.exception("Ascend FT paused after a scheduler error")
-                self._enter_ascend_ft_pause(error=str(exc))
+                self._enter_ascend_ft_pause(error=str(exc) or type(exc).__name__)
+
+    def check_ascend_ft_pause_deadline(self: Scheduler) -> None:
+        deadline = self.ascend_ft_pause_deadline
+        if deadline is None or time.monotonic() < deadline:
+            return
+        self.ascend_ft_pause_deadline = None
+        logger.error("Ascend FT pause unattended on DP rank %d", get_parallel().dp_rank)
+        notify_node_main_process_failure()
 
     def _enter_ascend_ft_pause(self: Scheduler, error: str | None = None) -> None:
-        if self.pause_state.paused:
-            # A paused loop runs only control RPCs. Preserve unexpected failures.
-            raise RuntimeError(error or "Ascend FT is already paused.")
         self.pause_state.pause()
         self.pause_state.start_window()
         # A paused worker is no longer executing the interrupted forward.
         self.cur_batch_for_debug = None
         if error is not None:
+            self.ascend_ft_pause_deadline = (
+                time.monotonic() + get_exec().features.fault_tolerance_pause_timeout
+            )
             self.send_control_output(
                 AscendFTAckOutput(op="fault", rank=get_parallel().dp_rank, error=error),
                 None,
@@ -81,12 +96,24 @@ class SchedulerAscendFTMixin:
             return ack
         try:
             if req.op == "recover":
+                self.ascend_ft_pause_deadline = None
                 active = tuple(req.target_ranks)
-                group = comm.rebuild(active, req.rid)
-                self.tp_worker.model_runner.recover_ascend_ft(
-                    active, group, membership_changed=req.membership_changed
+                runner = self.tp_worker.model_runner
+                runner.recover_ascend_ft_device()
+                group = (
+                    comm.rebuild(active, req.rid)
+                    if req.membership_changed or req.reset_collective
+                    else comm.group
                 )
+                if req.membership_changed:
+                    runner.eplb_manager.rebalance_for_ascend_ft(active, group)
                 self._discard_ascend_ft_attempts()
+                if req.membership_changed:
+                    runner.install_ascend_ft_topology(active)
+                    self.schedule_stream.synchronize()
+                    self.forward_stream.wait_stream(self.schedule_stream)
+                    with self.forward_stream_ctx:
+                        runner.run_ascend_ft_health_gate(active, group)
             else:
                 comm.pause_requested = False
                 self.pause_state.resume()

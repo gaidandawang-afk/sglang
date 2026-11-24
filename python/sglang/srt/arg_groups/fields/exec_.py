@@ -72,10 +72,33 @@ class ExecFeatures(msgspec.Struct):
     # -------------------------------------------------------------------------
     # Misc runtime features
     # -------------------------------------------------------------------------
-    enable_ascend_ft: A[bool, "Enable fixed-world Ascend MC2 fault tolerance."] = False
-    ascend_ft_collective_timeout: A[
-        float, "Ascend fault-tolerant collective timeout in seconds."
-    ] = 10.0
+    enable_fault_tolerance: A[
+        bool,
+        Arg(
+            help="Enable the DP-only Ascend fault-tolerance control plane.",
+            aliases=["--enable-ascend-ft"],
+        ),
+    ] = False
+    fault_tolerance_on_error_strategy: A[
+        Literal["pause", "continue"],
+        "Fault-tolerance strategy for scheduler exceptions.",
+    ] = "pause"
+    fault_tolerance_timeout: A[
+        int, "Timeout in seconds for each fault-tolerance control phase."
+    ] = 60
+    fault_tolerance_pause_timeout: A[
+        int, "Fail-stop timeout in seconds for an unattended fault-tolerance pause."
+    ] = 300
+    fault_tolerance_gloo_timeout: A[
+        int,
+        Arg(
+            help="Timeout in seconds for survivor Gloo operations.",
+            aliases=["--ascend-ft-collective-timeout"],
+        ),
+    ] = 30
+    fault_tolerance_communication_abort_timeout: A[
+        int, "NPU communication abort timeout in seconds; 0 disables timeout setup."
+    ] = 10
 
     enable_memory_saver: A[
         bool,
