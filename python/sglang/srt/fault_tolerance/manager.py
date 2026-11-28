@@ -5,15 +5,14 @@ import dataclasses
 import logging
 import os
 import time
+import traceback
 import uuid
-from typing import Dict, List, Optional, Tuple
-
-import zmq
-import zmq.asyncio
+from typing import Dict, List, Optional
 
 from sglang.srt.fault_tolerance.constants import (
     FT_OPERATION_RETRY,
     FT_OPERATION_SCALE_DOWN,
+    FT_OPERATION_SCALE_DOWN_PREPARE,
 )
 from sglang.srt.fault_tolerance.ft_state import FaultToleranceState
 from sglang.srt.fault_tolerance.protocol import FaultToleranceApplyRequest
@@ -21,22 +20,19 @@ from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     FaultToleranceCommandReqInput,
     FaultToleranceCommandReqOutput,
-    FaultToleranceDPCShutdownReqInput,
+    FaultToleranceDPExitOutput,
     FaultToleranceRankFaultOutput,
-    ProcessActiveRanksOutput,
+    FaultToleranceWatchdogHeartbeatOutput,
     RouteUpdateAckOutput,
-    WatchdogHeartbeatOutput,
-    async_sock_send,
 )
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.network import get_zmq_socket
-from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sglang.srt.utils.common import TypeBasedDispatcher
 
 logger = logging.getLogger(__name__)
 
-WATCHDOG_LEASE_SWEEP_INTERVAL_SEC = 1
-WATCHDOG_LEASE_TIMEOUT_SEC = 60
+WATCHDOG_HEARTBEAT_TIMEOUT = 60.0
+
 FT_REQUEST_ACCEPTED_MESSAGE = (
     "Request accepted; poll /v1/fault_tolerance/status for updates."
 )
@@ -44,34 +40,32 @@ FT_REQUEST_ACCEPTED_MESSAGE = (
 
 @dataclasses.dataclass
 class PendingFTCommand:
+    command: str
     remaining_ranks: set[int]
     future: asyncio.Future
 
     def acknowledge(self, rank: int) -> None:
         self.remaining_ranks.discard(rank)
-        if not self.remaining_ranks:
+        if not self.remaining_ranks and not self.future.done():
             self.future.set_result(None)
 
 
 class FaultToleranceManager:
-    def __init__(self, *, server_args, zmq_context, send_to_scheduler):
-        self._zmq_context = zmq_context
+    def __init__(self, *, server_args, send_to_scheduler):
         self.send_to_scheduler = send_to_scheduler
-        self.send_to_watchdog: Dict[int, zmq.asyncio.Socket] = {}
-        self._watchdog_endpoints: Dict[int, str] = {}
         self.state = FaultToleranceState(
             dp_size=server_args.num_dp_ranks,
             strategy=get_exec().features.fault_tolerance_on_error_strategy,
-            global_rank_count=server_args.tp_size,
+            max_world_size=server_args.max_world_size,
+            attn_replica_size=server_args.attn_tp_size * server_args.attn_cp_size,
         )
         self.event_loop = None
         self.asyncio_tasks = None
         self._pending_commands: Dict[str, PendingFTCommand] = {}
         self._pending_active_rank_updates: Dict[str, asyncio.Future] = {}
-        self._shutdown_waiter: Optional[Tuple[set[int], asyncio.Future]] = None
-        self._watchdog_leases: Dict[int, Tuple[float, Tuple[int, ...]]] = {}
-        self._watchdog_lease_task: Optional[asyncio.Task] = None
-        self._route_dp_mask = [True] * self.state.dp_size
+        self._recovered_dp_ranks: set[int] = set()
+        self._watchdog_heartbeats: dict[int, tuple[float, list[int]]] = {}
+        self._route_dp_mask = self.state.expected_dp_mask.copy()
         self._last_ft_request_id: Optional[str] = None
         self._ft_error: Optional[str] = None
 
@@ -91,39 +85,67 @@ class FaultToleranceManager:
                 (RouteUpdateAckOutput, self.handle_route_update_ack),
                 (FaultToleranceCommandReqOutput, self.handle_command_output),
                 (FaultToleranceRankFaultOutput, self.handle_rank_fault),
-                (WatchdogHeartbeatOutput, self.observe_watchdog_heartbeat),
+                (
+                    FaultToleranceWatchdogHeartbeatOutput,
+                    self.observe_watchdog_heartbeat,
+                ),
             ]
         )
 
     def status(self) -> tuple[int, dict]:
+        now = time.monotonic()
+        mask = self.state.unreachable_dp_mask
+        mask[:] = [False] * len(mask)
+        for last_seen, dp_ranks in self._watchdog_heartbeats.values():
+            if now - last_seen >= WATCHDOG_HEARTBEAT_TIMEOUT:
+                for rank in dp_ranks:
+                    mask[rank] = True
         body = self.state.status_response()
-        if self._last_ft_request_id is not None:
+        if self.state.in_flight_request_id is not None:
+            body["last_ft_request_id"] = self.state.in_flight_request_id
+            body["ft_state"] = "recovering"
+        elif self._last_ft_request_id is not None:
             body["last_ft_request_id"] = self._last_ft_request_id
             if self._ft_error is not None:
+                body["ft_state"] = "failed"
                 body["ft_error"] = self._ft_error
         return 200, body
 
-    def submit(self, request: FaultToleranceApplyRequest) -> tuple[int, dict]:
-        if request.instruction == FT_OPERATION_SCALE_DOWN and any(
-            rank >= self.state.dp_size for rank in request.params.removed_dp_ranks
-        ):
-            return 400, {"message": "'removed_dp_ranks' contains a rank out of range."}
-        # One centralized SGLang request controls all DP engines atomically.
-        if self.state.ft_operation_in_progress:
-            return 409, {"message": "ft_operation_in_progress"}
+    def add_elastic_workers(self, slot_offset: int, slot_count: int) -> None:
+        st = self.state
+        end = slot_offset + slot_count
+        for rank in range(max(slot_offset, st.dp_size), end):
+            st.expected_dp_mask[rank] = True
+            st.runtime_active_dp_mask[rank] = True
+            self._route_dp_mask[rank] = True
+        st.dp_size = max(st.dp_size, end)
 
-        self.state.ft_operation_in_progress = True
-        try:
-            self._create_task(self._run_submitted_apply(request))
-        except Exception:
-            self.state.ft_operation_in_progress = False
-            raise
+    def submit(self, request: FaultToleranceApplyRequest) -> tuple[int, dict]:
+        if request.instruction == FT_OPERATION_SCALE_DOWN:
+            if self.state.strategy != "pause":
+                return 400, {"message": "scale_down requires the FT pause strategy."}
+            if any(
+                rank >= self.state.dp_size for rank in request.params.removed_dp_ranks
+            ):
+                return 400, {
+                    "message": "'removed_dp_ranks' contains a rank out of range."
+                }
+        self._create_task(self._run_submitted_apply(request))
         return 202, {
             "message": FT_REQUEST_ACCEPTED_MESSAGE,
             "request_id": request.request_id,
         }
 
     async def _run_submitted_apply(self, request: FaultToleranceApplyRequest) -> None:
+        request_id = request.request_id
+        if self.state.in_flight_request_id is not None:
+            logger.warning(
+                "FT recovery request %s rejected: another recovery %s is in progress",
+                request_id,
+                self.state.in_flight_request_id,
+            )
+            return
+        self.state.in_flight_request_id = request_id
         timeout = get_exec().features.fault_tolerance_timeout
 
         if not self.state.has_unresolved_expected_dp_fault():
@@ -140,23 +162,19 @@ class FaultToleranceManager:
                 request.params.removed_dp_ranks, timeout
             )
 
-        if error is None:
-            self.state.unhealthy_dp_ranks.clear()
-            self.state.cluster_paused = False
         self._finish_submitted_apply(request.request_id, error)
+        update = self._update_route_after_observation()
+        if update is not None:
+            await self.send_to_scheduler(update)
 
     def _finish_submitted_apply(self, request_id: str, error: Optional[str]) -> None:
         self._last_ft_request_id = request_id
         self._ft_error = error
-        self.state.ft_operation_in_progress = False
+        self.state.in_flight_request_id = None
 
     async def _apply_retry(self, timeout: int) -> Optional[str]:
         st = self.state
-        process_alive_dp_mask = st.process_alive_dp_mask()
-        if any(
-            expected and not process_alive_dp_mask[rank]
-            for rank, expected in enumerate(st.expected_dp_mask)
-        ):
+        if st.exited_dp_ranks.intersection(st.expected_dp_ranks()):
             return "retry_requires_all_expected_processes_alive"
 
         await self._send_command_collect(
@@ -180,23 +198,41 @@ class FaultToleranceManager:
             expected and rank not in requested
             for rank, expected in enumerate(st.expected_dp_mask)
         ]
-        if not any(candidate_dp_mask):
+        target_ranks = [rank for rank, active in enumerate(candidate_dp_mask) if active]
+        if not target_ranks:
             return "cannot_scale_down_all_expected_ranks"
+        if st.exited_dp_ranks.intersection(target_ranks):
+            return "scale_down_requires_remaining_processes_alive"
+        if not st.unhealthy_dp_ranks.issuperset(target_ranks):
+            return "scale_down_requires_remaining_dp_paused"
 
-        await self._shutdown_dp_processes(requested, timeout)
+        # The caller stops the removed DP's old processes before applying.
+        request_id = uuid.uuid4().hex
+        try:
+            await self._send_command_collect(
+                command=FT_OPERATION_SCALE_DOWN_PREPARE,
+                target_ranks=target_ranks,
+                timeout_sec=timeout,
+                active_global_rank_mask=st.expand_dp_mask_to_global_rank_mask(
+                    candidate_dp_mask
+                ),
+                request_id=request_id,
+            )
+        except TimeoutError:
+            return "scale_down_prepare_timeout"
+        if st.exited_dp_ranks.intersection(target_ranks):
+            return "scale_down_requires_remaining_processes_alive"
+
         await self._send_command_collect(
             command=FT_OPERATION_SCALE_DOWN,
-            target_ranks=[
-                rank for rank, active in enumerate(candidate_dp_mask) if active
-            ],
+            target_ranks=target_ranks,
             timeout_sec=timeout,
-            active_global_rank_mask=st.expand_dp_mask_to_global_rank_mask(
-                candidate_dp_mask
-            ),
+            request_id=request_id,
         )
         await self._publish_route_dp_mask(candidate_dp_mask, timeout)
         for rank in requested:
             st.expected_dp_mask[rank] = False
+        st.unhealthy_dp_ranks.difference_update(requested)
         return None
 
     def admission_error(self, routed_dp_rank: Optional[int]) -> Optional[str]:
@@ -215,132 +251,53 @@ class FaultToleranceManager:
         self._route_dp_mask = list(route_dp_mask)
         return ActiveRanksOutput(status=route_dp_mask)
 
-    def _auto_recover_ready_dps(self) -> List[int]:
-        # Re-add removed DPs only after process and runtime recovery complete.
+    def _update_route_after_observation(self) -> Optional[ActiveRanksOutput]:
         st = self.state
-        if st.ft_operation_in_progress:
-            return []
+        if st.in_flight_request_id is None:
+            for dp_rank in self._recovered_dp_ranks:
+                if st.runtime_active_dp_mask[dp_rank]:
+                    st.exited_dp_ranks.discard(dp_rank)
+                    st.expected_dp_mask[dp_rank] = True
+            self._recovered_dp_ranks.clear()
 
-        process_alive_dp_mask = st.process_alive_dp_mask()
-        recovered_dp_ranks = []
-        for dp_rank in range(st.dp_size):
-            if st.expected_dp_mask[dp_rank]:
-                continue
-            if (
-                process_alive_dp_mask[dp_rank]
-                and st.runtime_active_dp_mask[dp_rank]
-                and not any(
-                    member in st.pending_recovery_global_ranks
-                    for member in st.global_ranks_for_dp(dp_rank)
-                )
-            ):
-                st.expected_dp_mask[dp_rank] = True
-                recovered_dp_ranks.append(dp_rank)
-        return recovered_dp_ranks
-
-    def _update_route_after_observation(
-        self, recovered_dp_ranks: List[int]
-    ) -> Optional[ActiveRanksOutput]:
-        # Apply observed process/runtime availability to the admission route.
-        st = self.state
-        if st.strategy == "continue":
-            process_alive_dp_mask = st.process_alive_dp_mask()
-            return self._route_dp_update(
-                [
-                    expected
-                    and process_alive_dp_mask[dp_rank]
-                    and st.runtime_active_dp_mask[dp_rank]
-                    for dp_rank, expected in enumerate(st.expected_dp_mask)
-                ]
-            )
-
-        if not recovered_dp_ranks:
-            return None
-        route_dp_mask = list(self._route_dp_mask)
-        for dp_rank in recovered_dp_ranks:
-            route_dp_mask[dp_rank] = True
-        return self._route_dp_update(route_dp_mask)
+        return self._route_dp_update(
+            [
+                expected
+                and dp_rank not in st.exited_dp_ranks
+                and (st.strategy != "continue" or st.runtime_active_dp_mask[dp_rank])
+                for dp_rank, expected in enumerate(st.expected_dp_mask)
+            ]
+        )
 
     def observe_active_ranks(
         self, ranks: ActiveRanksOutput
     ) -> Optional[ActiveRanksOutput]:
-        # This Scheduler report is runtime/backend readiness, not the route mask.
-        self.state.observe_runtime_active_dp_mask(list(ranks.status))
-        return self._update_route_after_observation(self._auto_recover_ready_dps())
+        st = self.state
+        st.runtime_active_dp_mask = list(ranks.status)
+        for rank in ranks.recovered_ep_ranks or ():
+            dp_rank = rank // st.global_ranks_per_dp
+            if dp_rank < st.dp_size and ranks.status[dp_rank]:
+                self._recovered_dp_ranks.add(dp_rank)
+        return self._update_route_after_observation()
 
-    def observe_process_active_ranks(
-        self, ranks: ProcessActiveRanksOutput
+    def observe_dp_exit(
+        self, event: FaultToleranceDPExitOutput
     ) -> Optional[ActiveRanksOutput]:
-        self.state.observe_process_active_ranks(ranks.ranks, active=ranks.active)
-        self._finish_shutdown_if_ready()
-        return self._update_route_after_observation(self._auto_recover_ready_dps())
-
-    def observe_watchdog_heartbeat(self, heartbeat: WatchdogHeartbeatOutput) -> None:
-        existing = self._watchdog_leases.get(heartbeat.node_rank)
-        ranks = tuple(sorted(set(heartbeat.ranks))) if existing is None else existing[1]
-        self._watchdog_leases[heartbeat.node_rank] = (time.monotonic(), ranks)
-        if self._watchdog_lease_task is None or self._watchdog_lease_task.done():
-            self._watchdog_lease_task = self._create_task(
-                self._watchdog_lease_sweep_loop()
-            )
-
-        endpoint = heartbeat.control_endpoint
-        if (
-            not endpoint
-            or self._watchdog_endpoints.get(heartbeat.node_rank) == endpoint
-        ):
-            return
-
-        new = get_zmq_socket(self._zmq_context, zmq.PUSH, endpoint, False)
-        old = self.send_to_watchdog.get(heartbeat.node_rank)
-        self.send_to_watchdog[heartbeat.node_rank] = new
-        self._watchdog_endpoints[heartbeat.node_rank] = endpoint
-        if old is not None:
-            old.close(linger=0)
-
-    async def _send_watchdog_command(
-        self, nodes: List[int], request: FaultToleranceDPCShutdownReqInput
-    ) -> None:
-        for node in nodes:
-            await async_sock_send(self.send_to_watchdog[node], request)
-
-    async def _watchdog_lease_sweep_loop(self) -> None:
-        try:
-            while self._watchdog_leases:
-                await asyncio.sleep(WATCHDOG_LEASE_SWEEP_INTERVAL_SEC)
-                await self._sweep_expired_watchdog_leases()
-        finally:
-            self._watchdog_lease_task = None
-
-    async def _sweep_expired_watchdog_leases(self, now: Optional[float] = None) -> None:
-        now = time.monotonic() if now is None else now
-        expired = [
-            node
-            for node, (last_seen, _) in self._watchdog_leases.items()
-            if now - last_seen >= WATCHDOG_LEASE_TIMEOUT_SEC
-        ]
-        inactive = set()
-        for node in expired:
-            _, ranks = self._watchdog_leases.pop(node)
-            inactive.update(ranks)
-        if not inactive:
-            return
-        logger.warning(
-            "FT watchdog lease expired: nodes=%s global_ranks=%s",
-            sorted(expired),
-            sorted(inactive),
-        )
-        update = self.observe_process_active_ranks(
-            ProcessActiveRanksOutput(ranks=sorted(inactive), active=False)
-        )
-        if update is not None:
-            await self.send_to_scheduler(update)
+        self.state.exited_dp_ranks.add(event.dp_rank)
+        self._recovered_dp_ranks.discard(event.dp_rank)
+        return self._update_route_after_observation()
 
     def handle_command_output(self, output: FaultToleranceCommandReqOutput) -> None:
         pending = self._pending_commands.get(output.request_id)
-        if pending is None:
-            logger.warning("Unknown fault tolerance command ack: rank=%s", output.rank)
+        if (
+            pending is None
+            or pending.command != output.command
+            or output.rank not in pending.remaining_ranks
+        ):
             return
+        if output.command != FT_OPERATION_SCALE_DOWN_PREPARE:
+            # The scheduler has resumed. A later fault must keep this DP paused.
+            self.state.unhealthy_dp_ranks.discard(output.rank)
         pending.acknowledge(output.rank)
 
     def handle_route_update_ack(self, output: RouteUpdateAckOutput) -> None:
@@ -353,6 +310,14 @@ class FaultToleranceManager:
         self.state.observe_rank_fault(event.rank)
         logger.warning(
             "FT observed scheduler exception on rank %s: %s", event.rank, event.message
+        )
+
+    def observe_watchdog_heartbeat(
+        self, event: FaultToleranceWatchdogHeartbeatOutput
+    ) -> None:
+        self._watchdog_heartbeats[event.first_global_rank] = (
+            time.monotonic(),
+            event.dp_ranks,
         )
 
     def _create_task(self, coro):
@@ -369,7 +334,7 @@ class FaultToleranceManager:
             await coro
         except Exception:
             self._failstop(
-                f"FaultToleranceManager hit an exception: {get_exception_traceback()}"
+                f"FaultToleranceManager hit an exception: {traceback.format_exc()}"
             )
 
     async def _publish_route_dp_mask(
@@ -394,13 +359,16 @@ class FaultToleranceManager:
         target_ranks: List[int],
         timeout_sec: int,
         active_global_rank_mask: Optional[List[bool]] = None,
+        request_id: Optional[str] = None,
     ) -> None:
         targets = set(target_ranks)
         if not targets:
             return
-        request_id = uuid.uuid4().hex
+        request_id = request_id or uuid.uuid4().hex
         pending = PendingFTCommand(
-            remaining_ranks=targets, future=self.event_loop.create_future()
+            command=command,
+            remaining_ranks=targets,
+            future=self.event_loop.create_future(),
         )
         self._pending_commands[request_id] = pending
         req = FaultToleranceCommandReqInput(
@@ -411,47 +379,11 @@ class FaultToleranceManager:
             # its active_mask remains a physical scheduler/global-rank mask.
             active_mask=active_global_rank_mask,
         )
-        await self.send_to_scheduler(req)
         try:
+            await self.send_to_scheduler(req)
             await asyncio.wait_for(pending.future, timeout=timeout_sec)
         finally:
             self._pending_commands.pop(request_id, None)
-
-    def _finish_shutdown_if_ready(self) -> None:
-        if self._shutdown_waiter is None:
-            return
-        targets, future = self._shutdown_waiter
-        if not future.done() and not any(
-            self.state.process_alive_global_rank_mask[rank] for rank in targets
-        ):
-            future.set_result(None)
-
-    async def _shutdown_dp_processes(
-        self, target_dp_ranks: set[int], timeout_sec: int
-    ) -> None:
-        targets = set(self.state.global_ranks_for_dps(target_dp_ranks))
-        live_targets = {
-            rank for rank in targets if self.state.process_alive_global_rank_mask[rank]
-        }
-        if not live_targets:
-            return
-        nodes = [
-            node
-            for node, (_, owned) in self._watchdog_leases.items()
-            if live_targets.intersection(owned)
-        ]
-        future = self.event_loop.create_future()
-        self._shutdown_waiter = (targets, future)
-        try:
-            await self._send_watchdog_command(
-                nodes,
-                FaultToleranceDPCShutdownReqInput(
-                    target_dp_ranks=sorted(target_dp_ranks)
-                ),
-            )
-            await asyncio.wait_for(future, timeout=timeout_sec)
-        finally:
-            self._shutdown_waiter = None
 
     @staticmethod
     def _failstop(message: str) -> None:

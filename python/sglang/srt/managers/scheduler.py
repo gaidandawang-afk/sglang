@@ -70,9 +70,8 @@ import torch
 import torch.distributed
 
 if TYPE_CHECKING:
-    from torch.cuda import Stream as CudaStream
-
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from torch.cuda import Stream as CudaStream
 
 try:
     from sglang.kernels.ops.mamba.triton_ops import (
@@ -5798,6 +5797,7 @@ class Scheduler(
             collapse_physical_rank_status,
         )
 
+        model_runner = self.tp_worker.model_runner
         inst = ElasticEPStateManager.instance()
         if inst is not None and inst.active_ranks_cpu is not None:
             dp_status = collapse_physical_rank_status(
@@ -5805,13 +5805,16 @@ class Scheduler(
                 attn_replica_size(),
             )
             self.ipc_channels.send_to_tokenizer.send_output(
-                ActiveRanksOutput(status=dp_status)
+                ActiveRanksOutput(
+                    status=dp_status,
+                    recovered_ep_ranks=model_runner._recovered_ep_ranks or None,
+                )
             )
+            model_runner._recovered_ep_ranks = []
         else:
             logger.debug("[Elastic EP] active rank state is unavailable")
             return
 
-        model_runner = self.tp_worker.model_runner
         pending = model_runner._pending_elastic_scale_update
         if pending is not None:
             self.ipc_channels.send_to_tokenizer.send_output(pending)
@@ -6812,6 +6815,8 @@ class Scheduler(
         self.kv_events_publisher.publish_kv_events()
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
+        if self._ft_pause_deadline is not None:
+            return
         if recv_req.torch_empty_cache:
             before_mb = torch.cuda.memory_reserved() / (1024 * 1024)
             current_platform.empty_cache()

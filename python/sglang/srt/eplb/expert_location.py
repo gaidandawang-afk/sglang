@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
+    get_flags,
     get_parallel,
     get_resources,
 )
@@ -253,7 +254,10 @@ class ExpertLocationMetadata:
         num_physical_experts = base_num_physical_experts
         initial_ep_size = get_parallel().elastic_ep_initial_size
         if initial_ep_size is not None:
-            if get_exec().moe.ep_join_mode == "scale":
+            if (
+                get_exec().moe.ep_join_mode == "scale"
+                and not get_flags().dp.use_world_group_for_gather
+            ):
                 ep_size = max(
                     ep_size,
                     get_parallel().ep_join_rank_offset + get_parallel().tp_size,

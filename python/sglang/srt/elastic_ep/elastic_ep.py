@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
 
 import msgspec
 import torch
-
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.eplb.expert_location import (
@@ -524,14 +523,14 @@ def maybe_recover_ep_ranks(
     *,
     tp_group: parallel_state.GroupCoordinator,
     eplb_manager: EPLBManager,
-) -> bool:
+) -> List[int]:
     # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
     # synchronization, and this function is on the forward-path.
     # This check only runs when `--elastic-ep-backend` is enabled, so the
     # synchronization overhead does not propagate to other configs.
     # Leave for future optimization of the elastic EP path.
     if tp_group.active_ranks.all() and tp_group.active_ranks_cpu.all():
-        return False
+        return []
 
     tp_active_ranks = tp_group.active_ranks.detach().cpu().numpy()
     tp_active_ranks_cpu = tp_group.active_ranks_cpu.detach().numpy()
@@ -556,9 +555,9 @@ def maybe_recover_ep_ranks(
         )
         ElasticEPStateManager.instance().reset()
         logger.info(f"recover ranks {ranks_to_recover} done")
-        return True
+        return ranks_to_recover
 
-    return False
+    return []
 
 
 def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:

@@ -5,13 +5,16 @@ import time
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Callable, Deque, Dict, Optional
 
+from sglang.srt.elastic_ep.topology import physical_ep_rank_to_dp_rank
 from sglang.srt.fault_tolerance.constants import (
     FT_OPERATION_RETRY,
     FT_OPERATION_SCALE_DOWN,
+    FT_OPERATION_SCALE_DOWN_PREPARE,
 )
 from sglang.srt.fault_tolerance.utils import is_fault_tolerance_enabled
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    ElasticScaleUpdateReq,
     FaultToleranceCommandReqInput,
     FaultToleranceCommandReqOutput,
     FaultToleranceRankFaultOutput,
@@ -27,10 +30,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _ft_dp_rank() -> int:
+    parallel = get_parallel()
+    return physical_ep_rank_to_dp_rank(
+        parallel.launch_world_rank, parallel.attn_tp_size * parallel.attn_cp_size
+    )
+
+
 class SchedulerFaultToleranceMixin:
     def init_fault_tolerance(self: Scheduler) -> None:
         self._ft_pause_deadline: Optional[float] = None
         self._ft_result_queue: Optional[Deque] = None
+        self._ft_scale_down_request_id: Optional[str] = None
 
     def _run_event_loop_fault_tolerance(
         self: Scheduler, dispatch: Callable[[Scheduler], None]
@@ -53,7 +64,7 @@ class SchedulerFaultToleranceMixin:
                     )
                 self.ipc_channels.send_to_tokenizer.send_output(
                     FaultToleranceRankFaultOutput(
-                        rank=get_parallel().dp_rank,
+                        rank=_ft_dp_rank(),
                         message=str(exc),
                     )
                 )
@@ -116,29 +127,52 @@ class SchedulerFaultToleranceMixin:
     def handle_fault_tolerance_command(
         self: Scheduler, recv_req: FaultToleranceCommandReqInput
     ) -> Optional[FaultToleranceCommandReqOutput]:
-        rank = get_parallel().dp_rank
+        rank = _ft_dp_rank()
         if rank not in recv_req.target_ranks:
             return None
 
+        parallel = get_parallel()
+        is_leader = parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0
+        ack = (
+            FaultToleranceCommandReqOutput(
+                request_id=recv_req.request_id, command=recv_req.command, rank=rank
+            )
+            if is_leader
+            else None
+        )
+        model_runner = self.tp_worker.model_runner
+        if recv_req.command == FT_OPERATION_SCALE_DOWN_PREPARE:
+            if not self.pause_state.paused:
+                return None
+            assert recv_req.active_mask is not None
+            model_runner.update_fault_tolerance_active_ranks(recv_req.active_mask)
+            self._ft_scale_down_request_id = recv_req.request_id
+            return ack
+
         if recv_req.command == FT_OPERATION_RETRY:
-            active_mask = None
+            model_runner.update_fault_tolerance_active_ranks(None)
+            new_ep_size = None
         elif recv_req.command == FT_OPERATION_SCALE_DOWN:
-            active_mask = recv_req.active_mask
+            if (
+                not self.pause_state.paused
+                or self._ft_scale_down_request_id != recv_req.request_id
+            ):
+                return None
+            new_ep_size = model_runner.finish_fault_tolerance_scale_down()
         else:
             logger.warning("FT unknown command: %s", recv_req.command)
             return None
 
-        self.tp_worker.model_runner.update_fault_tolerance_active_ranks(active_mask)
+        self._ft_scale_down_request_id = None
         self._ft_discard_inflight_window()
         self.pause_state.resume()
         self._ft_pause_deadline = None
 
-        if get_parallel().attn_tp_rank != 0 or get_parallel().attn_cp_rank != 0:
-            return None
-        return FaultToleranceCommandReqOutput(
-            request_id=recv_req.request_id,
-            rank=rank,
-        )
+        if is_leader and new_ep_size is not None and rank == min(recv_req.target_ranks):
+            self.ipc_channels.send_to_tokenizer.send_output(
+                ElasticScaleUpdateReq(success=True, effective_ep_size=new_ep_size)
+            )
+        return ack
 
     def _check_ft_pause_deadline(self: Scheduler) -> None:
         if not is_fault_tolerance_enabled():

@@ -57,7 +57,6 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.beam_search.output import (
     build_beam_search_out,
     try_build_beam_search_out_dict,
@@ -109,6 +108,7 @@ from sglang.srt.managers.io_struct import (
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
     EncoderDispatchErrorReq,
+    FaultToleranceDPExitOutput,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -116,7 +116,6 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqOutput,
     PauseContinueBroadcastReq,
     PauseGenerationReqInput,
-    ProcessActiveRanksOutput,
     RequestOutputStats,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
@@ -907,7 +906,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Per-node DPC control only stops locally owned scheduler processes.
         self.fault_tolerance = FaultToleranceManager(
             server_args=get_parallel(),
-            zmq_context=self._zmq_context,
             send_to_scheduler=self._async_dispatch_to_scheduler,
         )
 
@@ -1074,7 +1072,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Same skip-detokenizer forwarding case as above.
                 (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
-                (ProcessActiveRanksOutput, self.update_process_active_ranks),
+                (FaultToleranceDPExitOutput, self.update_ft_dp_exit),
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
                 (PauseContinueBroadcastReq, self._handle_pause_continue_broadcast),
             ]
@@ -1107,7 +1105,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
-            num_dp_ranks = self.elastic_worker_count
+            num_dp_ranks = (
+                self.fault_tolerance.state.dp_size
+                if self.fault_tolerance is not None
+                else self.elastic_worker_count
+            )
             if num_dp_ranks <= 1 and obj.routed_dp_rank == 0:
                 logger.debug(
                     f"routed_dp_rank={obj.routed_dp_rank} is ignored because num_dp_ranks={num_dp_ranks}"
@@ -2733,6 +2735,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             await asyncio.sleep(1.0)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
+        if self.fault_tolerance is not None:
+            state = self.fault_tolerance.state
+            if state.cluster_paused or state.in_flight_request_id is not None:
+                raise fastapi.HTTPException(
+                    status_code=409, detail="Fault tolerance recovery is required."
+                )
         if self.tokenizer_ipc_name is not None:
             await self._pause_continue_through_router(obj)
             return
@@ -4145,7 +4153,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.elastic_last_error = msg.error
             return
 
-        self._dispatch_to_scheduler(msg)
+        if msg.slot_count:
+            if self.fault_tolerance is not None:
+                self.fault_tolerance.add_elastic_workers(msg.slot_offset, msg.slot_count)
+            self._dispatch_to_scheduler(msg)
         self.elastic_worker_count = physical_ep_size_to_dp_size(
             msg.effective_ep_size, self.attn_replica_size
         )
@@ -4194,9 +4205,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_last_error = None
         return responses[0]
 
-    def update_process_active_ranks(self, ranks: ProcessActiveRanksOutput):
+    def update_ft_dp_exit(self, event: FaultToleranceDPExitOutput):
         if self.fault_tolerance is not None:
-            active_ranks = self.fault_tolerance.observe_process_active_ranks(ranks)
+            active_ranks = self.fault_tolerance.observe_dp_exit(event)
             if active_ranks is not None:
                 self._dispatch_to_scheduler(active_ranks)
 

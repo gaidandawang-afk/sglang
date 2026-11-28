@@ -53,18 +53,20 @@ def rebalance_experts(
     ]:
         from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
+        num_gpus = num_physical_experts // num_local_physical_experts
+        state = ElasticEPStateManager.instance()
         return elasticity_aware.rebalance_experts(
             weight=tokens_per_expert.sum(dim=0),
             num_replicas=num_physical_experts,
             num_groups=num_groups,
             num_nodes=num_nodes,
-            num_gpus=num_physical_experts // num_local_physical_experts,
+            num_gpus=num_gpus,
             enable_hierarchical=(
                 algorithm == EplbAlgorithm.elasticity_aware_hierarchical
             ),
             active_ranks=(
-                ElasticEPStateManager.instance().active_ranks
-                if ElasticEPStateManager.instance() is not None
+                state.active_ranks[:num_gpus]
+                if state is not None
                 else ElasticEPStateManager.healthy_rank_state()
             ),
         )

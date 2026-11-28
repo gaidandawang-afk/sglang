@@ -16,6 +16,9 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 def scheduler(monkeypatch):
     parallel = SimpleNamespace(
         dp_rank=0,
+        launch_world_rank=0,
+        attn_tp_size=1,
+        attn_cp_size=1,
         attn_tp_rank=0,
         attn_cp_rank=0,
     )
@@ -35,6 +38,9 @@ def scheduler(monkeypatch):
     scheduler.pause_state = PauseState()
     scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=Mock())
     scheduler.tp_worker = SimpleNamespace(model_runner=Mock())
+    scheduler.tp_worker.model_runner.finish_fault_tolerance_scale_down.return_value = (
+        None
+    )
     scheduler.cur_batch_for_debug = None
     scheduler.last_batch = None
     scheduler.running_batch = SimpleNamespace(reqs=[])
@@ -140,17 +146,40 @@ def test_recovery_command_resumes_and_only_leader_acks(
     ft.get_parallel().attn_tp_rank = attn_tp_rank
     scheduler.pause_state.pause()
     scheduler._ft_pause_deadline = 130.0
+    runner = scheduler.tp_worker.model_runner
+    if command == "scale_down":
+        prepare = ft.FaultToleranceCommandReqInput(
+            request_id="recover-1",
+            command="scale_down_prepare",
+            target_ranks=[0],
+            active_mask=mask,
+        )
+        ready = scheduler.handle_fault_tolerance_command(prepare)
+        runner.finish_fault_tolerance_scale_down.assert_not_called()
+        assert scheduler.pause_state.paused
+        assert scheduler._ft_pause_deadline == 130.0
+        if attn_tp_rank == 0:
+            assert (ready.request_id, ready.command) == (
+                "recover-1",
+                "scale_down_prepare",
+            )
+        else:
+            assert ready is None
     req = ft.FaultToleranceCommandReqInput(
-        request_id="recover-1", command=command, target_ranks=[0], active_mask=mask
+        request_id="recover-1", command=command, target_ranks=[0]
     )
     result = scheduler.handle_fault_tolerance_command(req)
-    scheduler.tp_worker.model_runner.update_fault_tolerance_active_ranks.assert_called_once_with(
-        mask
-    )
+    runner.update_fault_tolerance_active_ranks.assert_called_once_with(mask)
+    if command == "scale_down":
+        runner.finish_fault_tolerance_scale_down.assert_called_once_with()
     assert not scheduler.pause_state.paused
     assert scheduler._ft_pause_deadline is None
     if attn_tp_rank == 0:
-        assert (result.request_id, result.rank) == ("recover-1", 0)
+        assert (result.request_id, result.command, result.rank) == (
+            "recover-1",
+            command,
+            0,
+        )
     else:
         assert result is None
 
@@ -161,6 +190,79 @@ def test_command_for_another_rank_does_nothing(scheduler):
     )
     assert scheduler.handle_fault_tolerance_command(req) is None
     scheduler.tp_worker.model_runner.update_fault_tolerance_active_ranks.assert_not_called()
+
+
+def test_joiner_acks_its_global_dp_slot(scheduler):
+    parallel = ft.get_parallel()
+    parallel.launch_world_rank = 4
+    parallel.attn_tp_size = 2
+    req = ft.FaultToleranceCommandReqInput(
+        request_id="retry-joiner", command="retry", target_ranks=[2]
+    )
+    result = scheduler.handle_fault_tolerance_command(req)
+    assert (result.request_id, result.rank) == ("retry-joiner", 2)
+
+
+def test_scale_down_reports_shorter_world_before_ack(scheduler):
+    scheduler.pause_state.pause()
+    scheduler.tp_worker.model_runner.finish_fault_tolerance_scale_down.return_value = 2
+    prepare = ft.FaultToleranceCommandReqInput(
+        request_id="scale-down",
+        command="scale_down_prepare",
+        target_ranks=[0, 1],
+        active_mask=[True, True, False],
+    )
+    scheduler.handle_fault_tolerance_command(prepare)
+    req = ft.FaultToleranceCommandReqInput(
+        request_id="scale-down", command="scale_down", target_ranks=[0, 1]
+    )
+    result = scheduler.handle_fault_tolerance_command(req)
+    report = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
+    assert (report.success, report.effective_ep_size, report.slot_count) == (True, 2, 0)
+    assert (result.request_id, result.rank) == ("scale-down", 0)
+
+
+def test_scale_down_replaces_mask_without_running_eplb_for_previous_round(scheduler):
+    runner = scheduler.tp_worker.model_runner
+    first = ft.FaultToleranceCommandReqInput(
+        request_id="first",
+        command="scale_down_prepare",
+        target_ranks=[0],
+        active_mask=[True, True, False],
+    )
+    assert scheduler.handle_fault_tolerance_command(first) is None
+    runner.update_fault_tolerance_active_ranks.assert_not_called()
+
+    scheduler.pause_state.pause()
+    scheduler.handle_fault_tolerance_command(first)
+    second = ft.FaultToleranceCommandReqInput(
+        request_id="second",
+        command="scale_down_prepare",
+        target_ranks=[0],
+        active_mask=[True, False, False],
+    )
+    scheduler.handle_fault_tolerance_command(second)
+    assert [
+        call.args[0]
+        for call in runner.update_fault_tolerance_active_ranks.call_args_list
+    ] == [
+        first.active_mask,
+        second.active_mask,
+    ]
+
+    execute_first = ft.FaultToleranceCommandReqInput(
+        request_id="first", command="scale_down", target_ranks=[0]
+    )
+    assert scheduler.handle_fault_tolerance_command(execute_first) is None
+    assert scheduler.pause_state.paused
+    runner.finish_fault_tolerance_scale_down.assert_not_called()
+    execute_second = ft.FaultToleranceCommandReqInput(
+        request_id="second", command="scale_down", target_ranks=[0]
+    )
+    result = scheduler.handle_fault_tolerance_command(execute_second)
+    assert (result.request_id, result.command) == ("second", "scale_down")
+    runner.finish_fault_tolerance_scale_down.assert_called_once_with()
+    assert not scheduler.pause_state.paused
 
 
 def test_pause_timeout_notifies_once(scheduler, monkeypatch):

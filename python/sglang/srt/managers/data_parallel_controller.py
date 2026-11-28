@@ -29,7 +29,6 @@ from multiprocessing.connection import Connection, wait
 import psutil
 import setproctitle
 import zmq
-
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_rank_to_dp_rank,
@@ -48,7 +47,6 @@ from sglang.srt.managers.io_struct import (
     BlockReqInput,
     ElasticScaleUpdateReq,
     FaultToleranceCommandReqInput,
-    ProcessActiveRanksOutput,
     ProfileReq,
     RouteUpdateAckOutput,
     TokenizedEmbeddingReqInput,
@@ -192,8 +190,8 @@ class DataParallelController:
         self.send_to_tokenizer = None
         if is_fault_tolerance_enabled():
             ft_tokenizer_endpoint = port_args.tokenizer_ipc_name
-            if get_exec().moe.ep_join_mode == "recover":
-                # Recover uses private ports, but FT reports go to the primary.
+            if get_exec().moe.is_ep_joiner:
+                # Joiners use private ports, but FT reports go to the primary.
                 primary_addr = NetworkAddress.parse(get_parallel().dist_init_addr)
                 num_derived_ports = (
                     6 + get_parallel().num_dp_ranks
@@ -291,15 +289,13 @@ class DataParallelController:
             self._scheduler_watchdog = DPCFaultToleranceWatchdog(
                 context=self.context,
                 tokenizer_endpoint=ft_tokenizer_endpoint,
-                node_rank=get_parallel().node_rank,
+                # Global scheduler slots distinguish elastic joiners that reuse
+                # a launch-local node_rank.
+                first_global_rank=min(self.scheduler_process_global_ranks),
                 processes=self.scheduler_procs,
                 process_dp_ranks=self.scheduler_process_dp_ranks,
-                process_global_ranks=self.scheduler_process_global_ranks,
             )
             self._scheduler_watchdog.start()
-            sock_send(self.send_to_tokenizer, self._scheduler_watchdog.heartbeat())
-            if get_exec().moe.ep_join_mode == "recover":
-                self._report_process_active_ranks(active=True)
 
         self.init_dispatcher()
 
@@ -333,15 +329,6 @@ class DataParallelController:
 
     def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
         self.send_to_target_workers(obj, obj.target_ranks)
-
-    def _report_process_active_ranks(self, *, active: bool) -> None:
-        sock_send(
-            self.send_to_tokenizer,
-            ProcessActiveRanksOutput(
-                ranks=sorted(self.scheduler_process_global_ranks),
-                active=active,
-            ),
-        )
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         if len(ranks.status) != self.max_dp_size:
@@ -866,15 +853,8 @@ class DataParallelController:
                             proc.start()
                         self.scheduler_procs.append(proc)
                 if is_fault_tolerance_enabled():
-                    self.scheduler_process_dp_ranks.append(dp_rank)
-                    rank_offset = (
-                        get_parallel().ep_join_rank_offset
-                        if get_exec().moe.is_ep_scale_joiner
-                        else 0
-                    )
-                    self.scheduler_process_global_ranks.append(
-                        rank_offset + get_parallel().tp_size * pp_rank + tp_rank
-                    )
+                    self.scheduler_process_dp_ranks.append(display_dp_rank)
+                    self.scheduler_process_global_ranks.append(display_tp_rank)
                 scheduler_pipe_readers.append(reader)
 
         # Wait for model to finish loading

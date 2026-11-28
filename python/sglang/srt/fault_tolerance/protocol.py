@@ -3,7 +3,7 @@ from typing import Annotated, Literal, Union
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 DPRank = Annotated[int, Field(strict=True, ge=0)]
-RequestId = Annotated[str, Field(strict=True)]
+RequestId = Annotated[str, Field(strict=True, min_length=1)]
 
 
 class RetryParams(BaseModel):
@@ -17,13 +17,13 @@ class ScaleDownParams(BaseModel):
 class RetryRequest(BaseModel):
     instruction: Literal["retry"]
     params: RetryParams = Field(default_factory=RetryParams)
-    request_id: RequestId = ""
+    request_id: RequestId
 
 
 class ScaleDownRequest(BaseModel):
     instruction: Literal["scale_down"]
     params: ScaleDownParams
-    request_id: RequestId = ""
+    request_id: RequestId
 
 
 FaultToleranceApplyRequest = Annotated[
@@ -41,6 +41,8 @@ def parse_apply_request(body: bytes) -> FaultToleranceApplyRequest:
         error = exc.errors()[0]
         if error["type"] == "union_tag_invalid":
             message = f"Invalid instruction: '{error['ctx']['tag']}'."
+        elif error["loc"][-1:] == ("request_id",):
+            message = "'request_id' must be a non-empty string."
         else:
             message = error["msg"]
         raise ValueError(message) from None
