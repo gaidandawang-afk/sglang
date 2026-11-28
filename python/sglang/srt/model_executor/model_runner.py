@@ -24,7 +24,6 @@ from typing import List, Optional, Union
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.beam_search.trie_output_head import configure_model_trie_output_heads
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import (
@@ -73,12 +72,14 @@ from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     append_trivial_expert_slots,
     broadcast_global_expert_location_metadata,
+    broadcast_global_expert_location_metadata_in_place,
     compute_initial_expert_location_metadata,
     format_expert_location_layout,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.fault_tolerance.utils import is_fault_tolerance_enabled
 from sglang.srt.kernel_plugins.amd.binding import (
     install_monokernel_forward,
 )
@@ -436,6 +437,7 @@ class ModelRunner:
         self.enable_elastic_ep = get_exec().moe.elastic_ep_backend is not None
         self.forward_pass_id = 0
         self._pending_elastic_scale_update = None
+        self._recovered_ep_ranks: List[int] = []
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         # HiSparse owns target KV only. Draft KV keeps its logical GPU page
@@ -1141,19 +1143,13 @@ class ModelRunner:
     def post_capture_elastic_ep_recover(self):
         join_process_groups()
 
-        global_ep_rank = get_parallel().tp_rank + get_parallel().ep_join_rank_offset
-        broadcast_global_expert_location_metadata(
-            model_config=self.model_config,
-            moe_ep_rank=global_ep_rank,
+        # Recovery updates the existing fixed-topology metadata in place.
+        # Keep the recorder too: captured graphs still write its GPU counters.
+        # Replacing it would free buffers whose addresses are held by the graph.
+        broadcast_global_expert_location_metadata_in_place(
             src_rank=get_healthy_expert_location_src_rank(
                 invoked_in_elastic_ep_rejoin_path=True
             ),
-        )
-        set_global_expert_distribution_recorder(
-            ExpertDistributionRecorder.init_new(
-                get_global_expert_location_metadata(),
-                rank=global_ep_rank,
-            )
         )
 
         ElasticEPStateManager.instance().reset()
@@ -2311,7 +2307,7 @@ class ModelRunner:
             recorder.start_record()
         self.eplb_manager.enable_rebalance()
 
-    def _reset_eplb_after_elastic_scale_failure(self) -> None:
+    def _reset_eplb_after_elastic_resize(self) -> None:
         if self.eplb_manager is None:
             return
         set_global_expert_distribution_recorder(
@@ -2502,10 +2498,9 @@ class ModelRunner:
             recovered = maybe_recover_ep_ranks(
                 tp_group=get_parallel().tp_group,
                 eplb_manager=self.eplb_manager,
-                model_config=self.model_config,
-                moe_ep_rank=self._elastic_global_rank(),
             )
             if recovered:
+                self._recovered_ep_ranks = recovered
                 self.forward_pass_id = 0
             return
 
@@ -2519,7 +2514,7 @@ class ModelRunner:
         if timeout.item():
             error = f"Timed out waiting for ranks to join target EP size {pending_size}"
             ElasticEPStateManager.fail_scale(error)
-            self._reset_eplb_after_elastic_scale_failure()
+            self._reset_eplb_after_elastic_resize()
             self._report_elastic_scale_failure(error, effective_size)
             if get_parallel().tp_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
                 logger.error("[Elastic EP] %s", error)
@@ -2535,7 +2530,7 @@ class ModelRunner:
                     f"joining cohort target {cohort.target_ep_size}"
                 )
                 ElasticEPStateManager.fail_scale(error)
-                self._reset_eplb_after_elastic_scale_failure()
+                self._reset_eplb_after_elastic_resize()
                 self._report_elastic_scale_failure(error, effective_size)
                 if (
                     get_parallel().tp_rank == 0
@@ -2548,7 +2543,7 @@ class ModelRunner:
             except ValueError as exc:
                 error = str(exc)
                 ElasticEPStateManager.fail_scale(error)
-                self._reset_eplb_after_elastic_scale_failure()
+                self._reset_eplb_after_elastic_resize()
                 self._report_elastic_scale_failure(error, effective_size)
                 if (
                     get_parallel().tp_rank == 0
@@ -2563,7 +2558,7 @@ class ModelRunner:
                     "configuration for Elastic EP scale-up"
                 )
                 ElasticEPStateManager.fail_scale(error)
-                self._reset_eplb_after_elastic_scale_failure()
+                self._reset_eplb_after_elastic_resize()
                 self._report_elastic_scale_failure(error, effective_size)
                 if (
                     get_parallel().tp_rank == 0
@@ -2576,7 +2571,7 @@ class ModelRunner:
             except ValueError as exc:
                 error = str(exc)
                 ElasticEPStateManager.fail_scale(error)
-                self._reset_eplb_after_elastic_scale_failure()
+                self._reset_eplb_after_elastic_resize()
                 self._report_elastic_scale_failure(error, effective_size)
                 if (
                     get_parallel().tp_rank == 0
@@ -2606,9 +2601,78 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors],
     ) -> ModelRunnerOutput:
+        state = ElasticEPStateManager.instance()
+        if (
+            is_fault_tolerance_enabled()
+            and get_exec().features.fault_tolerance_on_error_strategy == "pause"
+            and state is not None
+            and bool(
+                (state.last_active_ranks.bool() & ~state.active_ranks.bool()).any()
+            )
+        ):
+            raise RuntimeError("Elastic EP membership loss detected before EPLB")
         if maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager):
             output = self._forward_raw(forward_batch, pp_proxy_tensors)
         return output
+
+    def update_fault_tolerance_active_ranks(
+        self, active_mask: Optional[list[bool]] = None
+    ) -> None:
+        """Restore the last rank mask or write the candidate for FT scale-down."""
+        state = ElasticEPStateManager.instance()
+        active_ranks = state.last_active_ranks
+        if active_mask is not None:
+            active_ranks = torch.as_tensor(
+                active_mask,
+                dtype=state.active_ranks.dtype,
+                device=state.active_ranks.device,
+            )
+        state.active_ranks.copy_(active_ranks)
+        state.active_ranks_cpu.copy_(active_ranks.detach().cpu())
+
+    def finish_fault_tolerance_scale_down(self) -> Optional[int]:
+        maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager)
+        if ElasticEPStateManager.instance().has_scaled:
+            return self._finalize_ft_scale_down()
+        return None
+
+    def _finalize_ft_scale_down(self) -> Optional[int]:
+        state = ElasticEPStateManager.instance()
+        old_size = state.effective_ep_size
+        # WORLD keeps stable rank slots. Only the inactive suffix is removed.
+        new_size = 1 + max(
+            rank
+            for rank, active in enumerate(state.active_ranks_cpu.tolist())
+            if active
+        )
+        world_size = dist.get_world_size()
+        if new_size != world_size:
+            raise RuntimeError(
+                f"FT scale-down needs WORLD width {new_size}, got {world_size}."
+            )
+        if new_size == old_size:
+            return None
+
+        # EPLB already moved all required weights using the old layout.
+        metadata = get_global_expert_location_metadata()
+        expert_count = new_size * metadata.num_local_physical_experts
+        get_context().override("elastic_ep.scale", ep_size=new_size)
+        state.effective_ep_size = new_size
+        new_metadata = ExpertLocationMetadata.init_by_mapping(
+            self.model_config,
+            metadata.physical_to_logical_map[:, :expert_count].contiguous(),
+            moe_ep_rank=self._elastic_global_rank(),
+        )
+        set_global_expert_location_metadata(new_metadata, allow_overwrite=True)
+        ElasticEPStateManager.on_scale(old_size, new_size)
+        update_dp_attention_for_elastic_ep(
+            physical_ep_size=new_size, physical_ep_rank=self._elastic_global_rank()
+        )
+        self.eplb_manager.reset_generator()
+        self._reset_eplb_after_elastic_resize()
+        self._recapture_elastic_cuda_graphs()
+        dist.barrier(group=dist.group.WORLD)
+        return new_size
 
     def update_model_fields(
         self,

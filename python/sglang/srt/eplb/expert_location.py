@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
+    get_flags,
     get_parallel,
     get_resources,
 )
@@ -253,7 +254,10 @@ class ExpertLocationMetadata:
         num_physical_experts = base_num_physical_experts
         initial_ep_size = get_parallel().elastic_ep_initial_size
         if initial_ep_size is not None:
-            if get_exec().moe.ep_join_mode == "scale":
+            if (
+                get_exec().moe.ep_join_mode == "scale"
+                and not get_flags().dp.use_world_group_for_gather
+            ):
                 ep_size = max(
                     ep_size,
                     get_parallel().ep_join_rank_offset + get_parallel().tp_size,
@@ -574,6 +578,52 @@ def broadcast_global_expert_location_metadata(
     )
     set_global_expert_location_metadata(metadata, allow_overwrite=True)
     return metadata
+
+
+def broadcast_global_expert_location_metadata_in_place(
+    src_rank: int = 0, group: Optional[torch.distributed.ProcessGroup] = None
+):
+    """Broadcast the global ExpertLocationMetadata from src_rank to all ranks.
+
+    This is used in Elastic EP rank recovery to ensure that all ranks (including
+    newly recovered ones) share exactly the same expert location metadata.
+
+    Note: The caller must ensure src_rank is a healthy rank. In recovery scenarios,
+    this function is called after try_recover_ranks succeeds, at which point all
+    ranks (including src_rank=0) have recovered and are ready.
+    """
+    metadata = get_global_expert_location_metadata()
+    assert metadata is not None
+
+    # Ensure device tensors are contiguous before broadcasting in-place
+    metadata.physical_to_logical_map = metadata.physical_to_logical_map.contiguous()
+    metadata.logical_to_all_physical_map = (
+        metadata.logical_to_all_physical_map.contiguous()
+    )
+    metadata.logical_to_all_physical_map_num_valid = (
+        metadata.logical_to_all_physical_map_num_valid.contiguous()
+    )
+    if metadata.logical_to_rank_dispatch_physical_map is not None:
+        metadata.logical_to_rank_dispatch_physical_map = (
+            metadata.logical_to_rank_dispatch_physical_map.contiguous()
+        )
+
+    device_tensors = [
+        metadata.physical_to_logical_map,
+        metadata.logical_to_all_physical_map,
+        metadata.logical_to_all_physical_map_num_valid,
+    ]
+    if metadata.logical_to_rank_dispatch_physical_map is not None:
+        device_tensors.append(metadata.logical_to_rank_dispatch_physical_map)
+
+    for tensor in device_tensors:
+        torch.distributed.broadcast(tensor, src=src_rank, group=group)
+
+    # After broadcasting device tensors, refresh corresponding CPU copies
+    metadata.physical_to_logical_map_cpu = metadata.physical_to_logical_map.cpu()
+    metadata.logical_to_all_physical_map_cpu = (
+        metadata.logical_to_all_physical_map.cpu()
+    )
 
 
 def _compute_logical_to_all_physical_map(

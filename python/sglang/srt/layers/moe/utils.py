@@ -748,6 +748,7 @@ def is_deepep_class_backend() -> bool:
         b.is_deepep()
         or b.is_deepep_v2()
         or b.is_mooncake()
+        or b.is_nixl()
         or b.is_mori()
         or b.is_pplx()
     )

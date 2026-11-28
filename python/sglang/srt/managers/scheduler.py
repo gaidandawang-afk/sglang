@@ -38,6 +38,7 @@ from typing import (
     Union,
 )
 
+from sglang.srt.fault_tolerance.utils import is_fault_tolerance_enabled
 from sglang.srt.runtime_context import (
     SpawnRanks,
     attention_backends,
@@ -69,9 +70,8 @@ import torch
 import torch.distributed
 
 if TYPE_CHECKING:
-    from torch.cuda import Stream as CudaStream
-
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from torch.cuda import Stream as CudaStream
 
 try:
     from sglang.kernels.ops.mamba.triton_ops import (
@@ -170,6 +170,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
+    FaultToleranceCommandReqInput,
     FinishReasonDict,
     FlushCacheReqInput,
     FreezeGCReq,
@@ -335,6 +336,7 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
     RPC_METHODS,
     SchedulerWeightUpdaterManager,
 )
+from sglang.srt.managers.scheduler_ft_mixin import SchedulerFaultToleranceMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.shortest_prefill_load import ShortestPrefillLoadScaling
@@ -513,6 +515,7 @@ class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
     SchedulerPPMixin,
+    SchedulerFaultToleranceMixin,
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
 ):
@@ -1453,6 +1456,7 @@ class Scheduler(
 
     def init_pause_state(self):
         self.pause_state = PauseState()
+        self.init_fault_tolerance()
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
@@ -2097,6 +2101,7 @@ class Scheduler(
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (FaultToleranceCommandReqInput, self.handle_fault_tolerance_command),
                 (ConfigureLoggingReq, self.configure_logging),
                 (ScaleElasticEPReqInput, self.handle_scale_elastic_ep),
                 (DumperControlReqInput, self.handle_dumper_control),
@@ -2191,7 +2196,10 @@ class Scheduler(
         self._war_barrier_enabled = is_war_barrier_enabled()
         with self.device_module.StreamContext(self.schedule_stream):
             self.metrics_reporter.start_scheduler_time_accounting()
-            dispatch_event_loop(self)
+            if is_fault_tolerance_enabled():
+                self._run_event_loop_fault_tolerance(dispatch_event_loop)
+            else:
+                dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
         # WAR: keep later schedule_stream writes behind this forward's shared reads.
@@ -2226,6 +2234,7 @@ class Scheduler(
 
             # Receive requests
             self.ingest_requests()
+            self._check_ft_pause_deadline()
             if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -2271,6 +2280,7 @@ class Scheduler(
 
             # Receive requests
             self.ingest_requests()
+            self._check_ft_pause_deadline()
             if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -5787,6 +5797,7 @@ class Scheduler(
             collapse_physical_rank_status,
         )
 
+        model_runner = self.tp_worker.model_runner
         inst = ElasticEPStateManager.instance()
         if inst is not None and inst.active_ranks_cpu is not None:
             dp_status = collapse_physical_rank_status(
@@ -5794,13 +5805,16 @@ class Scheduler(
                 attn_replica_size(),
             )
             self.ipc_channels.send_to_tokenizer.send_output(
-                ActiveRanksOutput(status=dp_status)
+                ActiveRanksOutput(
+                    status=dp_status,
+                    recovered_ep_ranks=model_runner._recovered_ep_ranks or None,
+                )
             )
+            model_runner._recovered_ep_ranks = []
         else:
             logger.debug("[Elastic EP] active rank state is unavailable")
             return
 
-        model_runner = self.tp_worker.model_runner
         pending = model_runner._pending_elastic_scale_update
         if pending is not None:
             self.ipc_channels.send_to_tokenizer.send_output(pending)
@@ -6801,6 +6815,8 @@ class Scheduler(
         self.kv_events_publisher.publish_kv_events()
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
+        if self._ft_pause_deadline is not None:
+            return
         if recv_req.torch_empty_cache:
             before_mb = torch.cuda.memory_reserved() / (1024 * 1024)
             current_platform.empty_cache()

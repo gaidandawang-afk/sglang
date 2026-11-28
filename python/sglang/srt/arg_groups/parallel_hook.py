@@ -895,3 +895,29 @@ def validate_prefill_cp_platform(server_args: Any):
         raise ValueError(
             "Prefill CP on MUSA is deprecated; CP support will be refactored soon."
         )
+
+
+def handle_fault_tolerance(server_args: Any):
+    cfg = resolving_view(server_args)
+    if not cfg.enable_fault_tolerance:
+        return
+    assert attn_dp_enabled_of(cfg), (
+        "Fault tolerance requires --attn-dp-size greater than 1 or an Elastic EP scale joiner."
+    )
+    assert cfg.disaggregation_mode == "null", (
+        "Fault tolerance does not support disaggregation."
+    )
+    assert cfg.fault_tolerance_on_error_strategy in ("pause", "continue")
+    assert cfg.fault_tolerance_timeout > 0 and cfg.fault_tolerance_pause_timeout > 0
+
+    assert cfg.elastic_ep_backend is not None, (
+        "Fault tolerance requires --elastic-ep-backend."
+    )
+    assert cfg.pp_size == 1, "Fault tolerance requires --pp-size 1."
+    assert cfg.enable_eplb, "Fault tolerance requires --enable-eplb."
+
+    declare_resolution(
+        server_args,
+        "_handle_fault_tolerance",
+        enable_dp_attention_local_control_broadcast=True,
+    )

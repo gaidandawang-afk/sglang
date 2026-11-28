@@ -51,7 +51,6 @@ import torch
 import zmq
 import zmq.asyncio
 from pydantic import PlainValidator
-
 from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
@@ -2168,6 +2167,24 @@ class ContinueGenerationReqInput(BaseReq, kw_only=True):
     torch_empty_cache: bool = True
 
 
+class FaultToleranceCommandReqInput(BaseReq, kw_only=True):
+    request_id: str
+    command: Literal["retry", "scale_down", "scale_down_prepare"]
+    target_ranks: List[int]
+    active_mask: Optional[List[bool]] = None
+
+
+class FaultToleranceCommandReqOutput(BaseReq, kw_only=True):
+    request_id: str
+    command: str
+    rank: int
+
+
+class FaultToleranceRankFaultOutput(BaseReq, kw_only=True):
+    rank: int
+    message: str = ""
+
+
 class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
     """Sent by each tokenizer worker on startup to register its IPC name with the router."""
 
@@ -2566,6 +2583,21 @@ class EncoderDispatchErrorReq(BaseReq, kw_only=True):
 
 class ActiveRanksOutput(BaseReq, kw_only=True):
     status: List[bool]
+    request_id: Optional[str] = None
+    recovered_ep_ranks: Optional[List[int]] = None
+
+
+class FaultToleranceDPExitOutput(BaseReq, kw_only=True):
+    dp_rank: int
+
+
+class FaultToleranceWatchdogHeartbeatOutput(BaseReq, kw_only=True):
+    first_global_rank: int
+    dp_ranks: List[int]
+
+
+class RouteUpdateAckOutput(BaseReq, kw_only=True):
+    request_id: str
 
 
 class ElasticScaleUpdateReq(BaseReq, kw_only=True):

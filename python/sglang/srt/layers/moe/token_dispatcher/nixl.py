@@ -80,8 +80,13 @@ class NixlEPBuffer:
 
     @classmethod
     def on_scale(cls, from_ep_size: int, to_ep_size: int) -> None:
-        """Schedule connections for newly admitted ranks."""
+        """Update the peer range used by dispatch."""
         state = cls._state()
+        if state.connected_ep_size is not None and to_ep_size < state.connected_ep_size:
+            state.buffer.disconnect_ranks(
+                list(range(to_ep_size, state.connected_ep_size))
+            )
+            state.connected_ep_size = to_ep_size
         state.scale_to = to_ep_size
         state.dispatch_ep_size = to_ep_size
         logger.debug(
